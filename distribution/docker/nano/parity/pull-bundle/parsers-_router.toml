@@ -1,0 +1,26 @@
+# Auto-generated dynamic router for deployed parsers
+# DO NOT EDIT - changes will be overwritten by parser deployment
+# Generated at: 2026-08-17T23:27:00.443396+00:00
+
+# =============================================================================
+# Dynamic Source Type Router
+# =============================================================================
+# Accepts input from HTTP pipeline, Vector native protocol, and source configurations.
+[transforms.source_router]
+type = "route"
+inputs = ["nano_pull_000000000000000000000000000000a1_stamp", "nano_pull_000000000000000000000000000000a2_stamp", "nano_pull_000000000000000000000000000000a3_stamp", "nano_pull_000000000000000000000000000000a4_stamp", "nano_pull_000000000000000000000000000000a6_stamp", "nano_pull_000000000000000000000000000000a7_stamp"]
+
+[transforms.source_router.route]
+generic = '!includes(["audit"], .source_type) && !starts_with(downcase(to_string(.source_type) ?? ""), "nano_enrich")'
+
+# =============================================================================
+# Placeholder Transforms
+# =============================================================================
+
+# =============================================================================
+# Placeholder Combiner
+# =============================================================================
+[transforms.placeholder_combiner]
+type = "filter"
+inputs = ["source_router.generic"]
+condition = "false"

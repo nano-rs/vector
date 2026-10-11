@@ -75,7 +75,7 @@ bronze_shard = mod!(bronze_hash_value, bronze_shards)
 [sinks.ocsf_parquet_bronze]
 type = "aws_s3"
 inputs = ["ocsf_output_guard"]
-bucket = "parity-bronze"
+bucket = "parity-nano-lake-bronze-bucket"
 region = "us-east-1"
 endpoint = "https://objects.parity.invalid"
 force_path_style = true

@@ -1,5 +1,6 @@
 # Build context for distribution/docker/nano/Dockerfile (BuildKit reads <Dockerfile>.dockerignore
-# instead of the root .dockerignore): upstream's list plus config/examples for /etc/vector/examples.
+# instead of the root .dockerignore): upstream's list plus config/examples for /etc/vector/examples
+# and the FEATURES file the build reads.
 *
 !benches
 !lib
@@ -17,3 +18,4 @@
 target
 
 !config/examples
+!distribution/docker/nano/FEATURES

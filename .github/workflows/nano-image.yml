@@ -36,9 +36,6 @@ env:
   IMAGE: ghcr.io/nano-rs/vector
   # timberio/vector:0.59.0-debian (index). Bump together with the upstream base of nano/vX.Y.
   UPSTREAM_IMAGE: docker.io/timberio/vector:0.59.0-debian@sha256:98e7b4dfe50750e61470697bbd2fbeca643d12bea97f351005038ef506eab630
-  # The fork's components that upstream does not ship, as <kind>/<name> from `vector list
-  # --format json`; the fork's list must equal upstream's plus exactly these.
-  FORK_COMPONENTS: sources/azure_event_hubs
 
 jobs:
   meta:
@@ -227,7 +224,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   parity:
-    name: Parity with upstream (amd64)
+    name: Parity (amd64)
     needs: [meta, merge]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -258,8 +255,9 @@ jobs:
           set -euo pipefail
           out="$(docker run --rm "$IMAGE@$DIGEST" --version)"
           echo "$out"
-          case "$out" in "vector ${UPSTREAM_VERSION} "*) ;; *)
-            echo "::error::expected 'vector ${UPSTREAM_VERSION} ...', got '$out'"; exit 1 ;; esac
+          # ^vector <upstream version><space>: the crate version is upstream's, unsuffixed.
+          printf '%s\n' "$out" | grep -Eq "^vector ${UPSTREAM_VERSION//./\\.} " || {
+            echo "::error::expected '^vector ${UPSTREAM_VERSION} ', got '$out'"; exit 1; }
           # Invariant: the binary reports the plain upstream version (the nano suffix lives only in
           # image tags). nanosiem's VECTOR_VERSION_RE refuses anything else.
           printf '%s\n' "$out" | grep -Pq '^vector \d+\.\d+\.\d+(\s|$)' || {
@@ -279,39 +277,30 @@ jobs:
             echo "::error::/etc/vector differs from upstream (diff above: - upstream, + fork)"; exit 1
           fi
           echo "/etc/vector: identical to upstream ($(grep -c '^f ' "$RUNNER_TEMP/etc-fork.txt") files)" | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: vector list = upstream + fork components
+      - name: vector list = COMPONENTS
         env:
           DIGEST: ${{ needs.merge.outputs.digest }}
+        # The image builds only nano's component set (FEATURES); COMPONENTS is its exact
+        # `vector list`. A difference means FEATURES and COMPONENTS disagree, or a feature
+        # pulled in (or dropped) a component transitively.
         run: |
           set -euo pipefail
-          # shellcheck disable=SC2016 # jq program, not shell
-          flat='to_entries[] | .key as $kind | .value[] | "\($kind)/\(.)"'
-          docker run --rm "$UPSTREAM_IMAGE" list --format json | jq -r "$flat" | sort > "$RUNNER_TEMP/upstream.txt"
-          docker run --rm "$IMAGE@$DIGEST" list --format json | jq -r "$flat" | sort > "$RUNNER_TEMP/fork.txt"
-          [ "$(wc -l < "$RUNNER_TEMP/upstream.txt")" -gt 100 ] || { echo "::error::upstream vector list looks empty"; exit 1; }
-          missing="$(comm -23 "$RUNNER_TEMP/upstream.txt" "$RUNNER_TEMP/fork.txt")"
-          extra="$(comm -13 "$RUNNER_TEMP/upstream.txt" "$RUNNER_TEMP/fork.txt")"
-          expected="$(tr ' ' '\n' <<< "$FORK_COMPONENTS" | sed '/^$/d' | sort)"
-          ok=true
-          if [ -n "$missing" ]; then
-            echo "::error::components missing from the fork image:"; echo "$missing"; ok=false
+          docker run --rm "$IMAGE@$DIGEST" list > "$RUNNER_TEMP/list.txt"
+          if ! diff -u distribution/docker/nano/COMPONENTS "$RUNNER_TEMP/list.txt"; then
+            echo "::error::vector list differs from distribution/docker/nano/COMPONENTS (- expected, + image)"; exit 1
           fi
-          if [ "$extra" != "$expected" ]; then
-            echo "::error::fork-only components are not exactly FORK_COMPONENTS ($FORK_COMPONENTS):"; echo "$extra"; ok=false
-          fi
-          $ok
-          echo "vector list: $(wc -l < "$RUNNER_TEMP/upstream.txt") upstream components, all present; fork adds: $extra" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "vector list: equals COMPONENTS ($(grep -c '^- ' "$RUNNER_TEMP/list.txt") components)" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: vector validate --no-environment (parity configs)
         env:
           DIGEST: ${{ needs.merge.outputs.digest }}
-        # Each top-level *.toml in the parity dir is one config; each subdirectory is one config
+        # Each top-level *.toml / *.yaml in the parity dir is one config; each subdirectory is one config
         # made of all its *.toml files. --no-environment parses, wires and compiles VRL without
         # building components, so no sink or source is contacted.
         run: |
           set -euo pipefail
           dir=distribution/docker/nano/parity
           units=()
-          for f in "$dir"/*.toml; do [ -e "$f" ] && units+=("$f"); done
+          for f in "$dir"/*.toml "$dir"/*.yaml; do [ -e "$f" ] && units+=("$f"); done
           for d in "$dir"/*/; do units+=("${d%/}"); done
           [ "${#units[@]}" -gt 0 ] || { echo "::error::no parity configs"; exit 1; }
           failed=0
@@ -332,6 +321,16 @@ jobs:
             fi
           done
           exit "$failed"
+      - name: vector validate (enrichment tables load, NAN-3489)
+        env:
+          DIGEST: ${{ needs.merge.outputs.digest }}
+        # Full validate builds the components, so the CSV file, mmdb and geoip tables are opened from
+        # the committed fixtures and get_enrichment_table_record compiles against the loaded schemas.
+        # Only this unit: the others name endpoints that a full validate would health-check.
+        run: |
+          set -euo pipefail
+          dir=distribution/docker/nano/parity
+          docker run --rm -v "$PWD/$dir:/parity:ro" "$IMAGE@$DIGEST" validate /parity/enrichment/enrichment.toml
 
   promote:
     name: Tag version

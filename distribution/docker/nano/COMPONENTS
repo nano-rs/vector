@@ -1,0 +1,48 @@
+Sources:
+- aws_s3
+- aws_sqs
+- azure_event_hubs
+- demo_logs
+- file
+- gcp_pubsub
+- http_client
+- http_server
+- internal_logs
+- internal_metrics
+- kubernetes_logs
+- opentelemetry
+- splunk_hec
+- stdin
+- syslog
+- unit_test
+- unit_test_stream
+- vector
+
+Transforms:
+- dedupe
+- filter
+- metric_to_log
+- reduce
+- remap
+- route
+- sample
+- throttle
+- trace_to_log
+
+Sinks:
+- aws_s3
+- azure_blob
+- blackhole
+- clickhouse
+- console
+- http
+- prometheus_exporter
+- prometheus_remote_write
+- unit_test
+- unit_test_stream
+
+Enrichment tables:
+- file
+- geoip
+- memory
+- mmdb

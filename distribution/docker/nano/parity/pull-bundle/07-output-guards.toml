@@ -1,0 +1,8 @@
+# Serialized JSON bytes per event; raw discard fence retains oversize input.
+
+[transforms.ocsf_output_guard]
+type = "remap"
+inputs = ["ocsf_lake_storage_prepare"]
+drop_on_abort = true
+drop_on_error = true
+source = 'if length(encode_json(.)) > 134217728 { abort }'

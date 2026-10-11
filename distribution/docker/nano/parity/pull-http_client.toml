@@ -1,0 +1,31 @@
+# Parity config (NAN-3604): http_client poll, the thin-puller shape NAN-3489 routes through the
+# tenant Vector (vendor API -> remap stamp -> Bronze). Not rendered by nanosiem or nano-main yet;
+# built because sources-http_client is in FEATURES. Sanitised: .invalid host, inert token.
+
+[sources.nano_pull_http]
+type = "http_client"
+endpoint = "https://vendor.parity.invalid/api/v1/events"
+method = "GET"
+scrape_interval_secs = 60
+scrape_timeout_secs = 30
+headers.Accept = ["application/json"]
+query.limit = ["1000"]
+auth.strategy = "bearer"
+auth.token = "parity-not-a-secret"
+decoding.codec = "json"
+
+[transforms.nano_pull_http_stamp]
+type = "remap"
+inputs = ["nano_pull_http"]
+source = '''
+.source_type = "parity_http_feed"
+%source_type = "parity_http_feed"
+%tenant_id = "00000000-0000-4000-8000-000000000001"
+.content_format = "nano_pull_http_client"
+.routing_timestamp = now()
+if !exists(.message) { .message = "" }
+'''
+
+[sinks.parity_out]
+type = "blackhole"
+inputs = ["nano_pull_http_stamp"]

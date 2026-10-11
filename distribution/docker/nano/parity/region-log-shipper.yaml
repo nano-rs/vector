@@ -1,0 +1,57 @@
+# Rendered by nano-main (NAN-2676). Do not edit by hand: re-run the region observability stage.
+data_dir: /var/lib/vector
+api:
+  enabled: false
+sources:
+  lake_pods:
+    type: kubernetes_logs
+    extra_namespace_label_selector: "kubernetes.io/metadata.name notin (kube-system,nano-log-shipping)"
+    glob_minimum_cooldown_ms: 5000
+transforms:
+  shape:
+    type: remap
+    inputs: [lake_pods]
+    source: |
+      .source_type = "nano-lake-workload"
+      .nano_region = "parity-region"
+      .nano_cluster_id = "parity-cluster"
+      .nano_cluster = "parity-cluster"
+      .namespace = .kubernetes.pod_namespace
+      .pod = .kubernetes.pod_name
+      .container = .kubernetes.container_name
+      .node = .kubernetes.pod_node_name
+      del(.kubernetes)
+      del(.file)
+      parsed, err = parse_json(.message)
+      if err == null && is_object(parsed) { .log = parsed }
+  cap:
+    type: throttle
+    inputs: [shape]
+    threshold: 100
+    window_secs: 1
+sinks:
+  org:
+    type: http
+    inputs: [cap]
+    uri: "https://org.parity.invalid/ingest"
+    method: post
+    compression: gzip
+    encoding:
+      codec: json
+    framing:
+      method: newline_delimited
+    auth:
+      strategy: bearer
+      token: "parity-not-a-secret"
+    request:
+      timeout_secs: 30
+      headers:
+        X-Source-Type: "nano-lake-workload"
+    batch:
+      max_bytes: 1000000
+      timeout_secs: 2
+    buffer:
+      type: memory
+      max_events: 10000
+      when_full: drop_newest
+
