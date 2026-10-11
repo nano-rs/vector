@@ -1,0 +1,363 @@
+# Auto-generated Vector configuration for parser: Windows Event Log (OCSF)
+# DO NOT EDIT - changes will be overwritten
+# Generated at: 2026-08-17T23:27:00.442020+00:00
+
+
+[transforms.windows_event_log__ocsf__parse]
+type = "remap"
+inputs = ["source_router.windows_event_log__ocsf_"]
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = true
+source = '''
+# Windows Security Event Log JSON -> OCSF 1.9.0. Emits the COMPLETE record on root.
+raw_log = string!(.message)
+parsed, err = parse_json(raw_log)
+
+if err != null || !is_object(parsed) {
+    . = {
+        "class_uid": 3002,
+        "category_uid": 3,
+        "activity_id": 99,
+        "type_uid": 300299,
+        "severity_id": 1,
+        "status_id": 0,
+        "time": 0,
+        "raw_data": raw_log,
+        # 3002 requires `user` plus one of service/dst_endpoint, even on the
+        # unparseable path.
+        "user": { "name": "" },
+        "dst_endpoint": { "hostname": "" },
+        "metadata": {
+            "version": "1.9.0",
+            "profiles": ["host"],
+            "uid": uuid_v4(),
+            "log_level": "error",
+            "product": { "name": "Windows", "vendor_name": "Microsoft" }
+        }
+    }
+} else {
+    p = object!(parsed)
+    ed = object(p.event_data) ?? {}
+    eid = to_int(p.event_id) ?? 0
+
+    computer = downcase(string(p.computer) ?? string(p.host) ?? "")
+
+    # human-readable Windows message if present, else the raw JSON
+    msg = string(p.message) ?? ""
+    if msg == "" { msg = raw_log }
+
+    # ---- event time (top-level ISO8601) -> epoch ms ----
+    time_ms = 0
+    ts_str = string(p.timestamp) ?? ""
+    if ts_str != "" {
+        t, terr = parse_timestamp(ts_str, "%+")
+        if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+    }
+
+    ocsf = {}
+
+    if eid == 4688 {
+        # Process Creation -> Process Activity 1007 (Launch)
+        npn = string(ed.NewProcessName) ?? ""
+        proc_name = ""
+        nm, nmerr = parse_regex(npn, r'(?P<b>[^\\/]+)$')
+        if nmerr == null { proc_name = string(nm.b) ?? "" }
+        ppn = string(ed.ParentProcessName) ?? ""
+        parent_name = ""
+        pm, pmerr = parse_regex(ppn, r'(?P<b>[^\\/]+)$')
+        if pmerr == null { parent_name = string(pm.b) ?? "" }
+
+        ocsf.class_uid = 1007
+        ocsf.class_name = "Process Activity"
+        ocsf.category_uid = 1
+        ocsf.category_name = "System Activity"
+        ocsf.activity_id = 1
+        ocsf.activity_name = "Launch"
+        # OCSF 1007: top-level `process` (REQUIRED) = the SUBJECT (the new
+        # process); `actor.process` = the PARENT/initiator.
+        ocsf.process = {
+            "name": proc_name,
+            "cmd_line": string(ed.CommandLine) ?? "",
+            "pid": parse_int(string(ed.NewProcessId) ?? "0") ?? 0,
+            "file": { "name": proc_name, "path": npn, "type_id": 1 }
+        }
+        actor_user = {
+            "name": downcase(string(ed.SubjectUserName) ?? ""),
+            "domain": downcase(string(ed.SubjectDomainName) ?? ""),
+            "uid": string(ed.SubjectUserSid) ?? ""
+        }
+        ocsf.actor = {
+            "process": {
+                "name": parent_name,
+                "pid": parse_int(string(ed.ProcessId) ?? "0") ?? 0,
+                "file": { "name": parent_name, "path": ppn, "type_id": 1 }
+            },
+            "user": actor_user
+        }
+        ocsf.device = { "hostname": computer }
+        ocsf.status_id = 1
+        ocsf.status = "Success"
+        ocsf.severity_id = 1
+        ocsf.severity = "Informational"
+    } else if eid == 4672 {
+        # Special Privileges Assigned -> Authorize Session 3003 (IAM),
+        # activity 1 (Assign Privileges). Required: user + at_least_one of
+        # (privileges, groups, iam_roles); we populate privileges from PrivilegeList.
+        ocsf.class_uid = 3003
+        ocsf.class_name = "Authorize Session"
+        ocsf.category_uid = 3
+        ocsf.category_name = "Identity & Access Management"
+        ocsf.activity_id = 1
+        ocsf.activity_name = "Assign Privileges"
+        ocsf.status_id = 1
+        ocsf.status = "Success"
+        ocsf.severity_id = 1
+        ocsf.severity = "Informational"
+        ocsf.user = { "name": downcase(string(ed.SubjectUserName) ?? ""), "domain": downcase(string(ed.SubjectDomainName) ?? ""), "uid": string(ed.SubjectUserSid) ?? "" }
+        priv_raw = strip_whitespace(string(ed.PrivilegeList) ?? "")
+        privileges = []
+        if priv_raw != "" { privileges = split(priv_raw, r'\s+') }
+        ocsf.privileges = privileges
+        ocsf.device = { "hostname": computer }
+        ocsf.session = { "uid": string(ed.SubjectLogonId) ?? "" }
+    } else {
+        # Authentication family -> 3002
+        ocsf.class_uid = 3002
+        ocsf.class_name = "Authentication"
+        ocsf.category_uid = 3
+        ocsf.category_name = "Identity & Access Management"
+
+        activity_id = 99
+        activity_name = "Other"
+        status_id = 1
+        status_str = "Success"
+        severity_id = 1
+        severity = "Informational"
+        if eid == 4624 { activity_id = 1; activity_name = "Logon" }
+        if eid == 4625 { activity_id = 1; activity_name = "Logon"; status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low" }
+        if eid == 4634 { activity_id = 2; activity_name = "Logoff" }
+
+        # logon events carry the principal in Target*
+        uname = string(ed.TargetUserName) ?? ""
+        udom = string(ed.TargetDomainName) ?? ""
+        usid = string(ed.TargetUserSid) ?? ""
+
+        # auth package -> auth_protocol(_id)
+        pkg = string(ed.AuthenticationPackageName) ?? ""
+        pkg_l = downcase(pkg)
+        auth_protocol_id = 0
+        if pkg_l == "ntlm" { auth_protocol_id = 1 }
+        if pkg_l == "kerberos" { auth_protocol_id = 2 }
+        if pkg != "" && auth_protocol_id == 0 { auth_protocol_id = 99 }
+
+        ocsf.activity_id = activity_id
+        ocsf.activity_name = activity_name
+        ocsf.status_id = status_id
+        ocsf.status = status_str
+        ocsf.severity_id = severity_id
+        ocsf.severity = severity
+        ocsf.user = { "name": downcase(uname), "domain": downcase(udom), "uid": usid }
+        logon_id = string(ed.TargetLogonId) ?? string(ed.SubjectLogonId) ?? ""
+        if logon_id != "" { ocsf.session = { "uid": logon_id } }
+        if auth_protocol_id != 0 {
+            ocsf.auth_protocol_id = auth_protocol_id
+            ocsf.auth_protocol = pkg
+        }
+
+        # source endpoint (network logons carry IpAddress/IpPort/Workstation)
+        ip = string(ed.IpAddress) ?? ""
+        ws = string(ed.WorkstationName) ?? ""
+        if ip != "" || ws != "" {
+            ocsf.src_endpoint = {
+                "ip": downcase(ip),
+                "port": to_int(ed.IpPort) ?? 0,
+                "hostname": downcase(ws)
+            }
+        }
+        # Authentication 3002 requires at_least_one(service, dst_endpoint):
+        # the logon TARGET is the reporting machine.
+        ocsf.dst_endpoint = { "hostname": computer }
+        ocsf.device = { "hostname": computer }
+
+        logon_type_raw = string(ed.LogonType) ?? ""
+        logon_type_id = to_int(ed.LogonType) ?? 0
+        logon_type = "Unknown"
+        if logon_type_id == 1 { logon_type = "System" }
+        if logon_type_id == 2 { logon_type = "Interactive" }
+        if logon_type_id == 3 { logon_type = "Network" }
+        if logon_type_id == 4 { logon_type = "Batch" }
+        if logon_type_id == 5 { logon_type = "OS Service" }
+        if logon_type_id == 7 { logon_type = "Unlock" }
+        if logon_type_id == 8 { logon_type = "Network Cleartext" }
+        if logon_type_id == 9 { logon_type = "New Credentials" }
+        if logon_type_id == 10 { logon_type = "Remote Interactive" }
+        if logon_type_id == 11 { logon_type = "Cached Interactive" }
+        if logon_type_id == 12 { logon_type = "Cached Remote Interactive" }
+        if logon_type_id == 13 { logon_type = "Cached Unlock" }
+        if logon_type_raw != "" {
+            if logon_type_id != 1 && logon_type_id != 2 && logon_type_id != 3 && logon_type_id != 4 && logon_type_id != 5 && logon_type_id != 7 && logon_type_id != 8 && logon_type_id != 9 && logon_type_id != 10 && logon_type_id != 11 && logon_type_id != 12 && logon_type_id != 13 {
+                logon_type_id = 99
+                logon_type = logon_type_raw
+            }
+            ocsf.logon_type_id = logon_type_id
+            ocsf.logon_type = logon_type
+            ocsf.is_remote = logon_type_id == 3 || logon_type_id == 8 || logon_type_id == 10 || logon_type_id == 12
+            ocsf.is_cleartext = logon_type_id == 8
+        }
+
+        if eid == 4625 {
+            ocsf.status_code = string(ed.Status) ?? ""
+            ocsf.status_detail = string(ed.FailureReason) ?? ""
+            ocsf.unmapped = { "sub_status": string(ed.SubStatus) ?? null }
+        }
+    }
+
+    # ---- common envelope ----
+    ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+    ocsf.time = time_ms
+    ocsf.message = msg
+    ocsf.raw_data = raw_log
+    # Windows record_id is only unique within a host/channel stream and can be
+    # reused after a log reset. Include the source event time so replaying the
+    # same event stays idempotent while a later reused RecordID cannot collide.
+    record_id = to_string(p.record_id) ?? ""
+    log_name = downcase(string(p.channel) ?? "Security")
+    log_provider = downcase(string(p.provider_name) ?? "Microsoft-Windows-Security-Auditing")
+    record_uid = ""
+    if record_id != "" && computer != "" && ts_str != "" {
+        record_uid = join!(["windows_event", computer, log_name, log_provider, record_id, ts_str], "|")
+    }
+    if record_uid == "" { record_uid = uuid_v4() }
+    if is_object(ocsf.device) { ocsf.device.type_id = 0 }
+    ocsf.metadata = {
+        "version": "1.9.0",
+        "profiles": ["host"],
+        "uid": record_uid,
+        "original_event_uid": record_uid,
+        "event_code": to_string(eid),
+        "log_name": string(p.channel) ?? "Security",
+        "log_provider": string(p.provider_name) ?? "Microsoft-Windows-Security-Auditing",
+        "product": { "name": "Windows", "vendor_name": "Microsoft" }
+    }
+
+    . = ocsf
+}
+'''
+
+[transforms.windows_event_log__ocsf__ocsf_split]
+type = "route"
+inputs = ["windows_event_log__ocsf__parse"]
+[transforms.windows_event_log__ocsf__ocsf_split.route]
+# Explicit parser failures must stay on the UDM recovery path so
+# metadata.parse_error remains searchable and countable.
+ocsf = 'exists(.class_uid) && !exists(.parse_error) && !exists(.metadata.parse_error)'
+
+[transforms.windows_event_log__ocsf__ocsf_prepare]
+type = "remap"
+inputs = ["windows_event_log__ocsf__ocsf_split.ocsf"]
+source = '''
+ocsf_event = .
+time_ms = to_int(.time) ?? 0
+ts = now()
+if time_ms > 0 { ts = from_unix_timestamp!(time_ms, unit: "milliseconds") }
+src_type = downcase(to_string(%source_type) ?? "unknown")
+if src_type == "" { src_type = "unknown" }
+. = { "event": ocsf_event, "timestamp": format_timestamp!(ts, "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type }
+# Protected identity for the pre-sampling parser-health branch.
+# The OCSF ClickHouse sink ignores this internal field.
+._nano_parser_id = "ed638b86-b34f-44a2-9f9a-c8842cd6f920"
+._nano_parser_failure = false
+'''
+
+[transforms.windows_event_log__ocsf__output]
+type = "remap"
+inputs = ["windows_event_log__ocsf__ocsf_split._unmatched", "windows_event_log__ocsf__parse.dropped"]
+source = '''
+# Flatten for ClickHouse - standard NanoSIEM format
+# Spread all .udm fields to top level, preserve .ext
+# The clickhouse_mapping transform handles final column assignment and ext capture
+
+# Handle timestamp - use udm.timestamp if set, otherwise now()
+ts_val = .udm.timestamp
+if ts_val == null {
+ts_val = now()
+}
+
+# Handle metadata - ensure it's an object
+meta_val = .metadata
+if !is_object(meta_val) {
+meta_val = {}
+}
+# Vector annotates rerouted runtime failures under
+# `.metadata.dropped`. Preserve the full diagnostic and promote
+# stable fields that ClickHouse health queries can aggregate.
+if exists(.metadata.dropped.message) {
+meta_val.parse_failure = true
+meta_val.parse_error = to_string(.metadata.dropped.message) ?? "Parser runtime error"
+meta_val.parse_stage = to_string(.metadata.dropped.component_id) ?? "parser"
+} else if exists(.parse_error) {
+meta_val.parse_failure = true
+meta_val.parse_error = to_string(.parse_error) ?? "Unknown parse error"
+} else if exists(.metadata.parse_error) {
+meta_val.parse_failure = true
+}
+# Protected deployment identity: parser-authored VRL cannot spoof
+# attribution because this is assigned after the parser runs.
+meta_val.parser_id = "ed638b86-b34f-44a2-9f9a-c8842cd6f920"
+meta_val.parser_name = "Windows Event Log (OCSF)"
+parse_failure_val = to_bool(meta_val.parse_failure) ?? false
+
+# Handle ext - preserve source-specific queryable fields
+# Parser sets fields like .ext.principal_id, .ext.bucket_name
+ext_val = .ext
+if ext_val == null {
+ext_val = {}
+}
+
+# Handle source_type - use .source_type if set, otherwise default
+st_val = .source_type
+if st_val == null {
+st_val = "windows_event_log__ocsf_"
+}
+
+# Preserve message and udm object
+msg_val = .message
+udm_val = .udm
+if udm_val == null {
+udm_val = {}
+}
+
+# Start with base fields
+. = {
+"timestamp": ts_val,
+"message": msg_val,
+"metadata": encode_json(meta_val),
+"_nano_parser_failure": parse_failure_val,
+"ext": ext_val,
+"source_type": st_val
+}
+
+# Inject vendor, product, and category from log_sources metadata
+# These are configured in the UI and don't require parser VRL to set them
+.vendor = "Microsoft"
+.product = "Windows"
+.vendor_product = "Microsoft Windows"
+.category = "endpoint"
+.namespace = "default"
+
+# Spread ALL .udm fields to top level for clickhouse_mapping
+# This includes src_ip, action, user, category, user_type, etc.
+# Note: category from udm will override the default if parser sets it
+udm_keys, err = keys(udm_val)
+if err == null {
+for_each(udm_keys) -> |_idx, key| {
+if key != "timestamp" && key != "message" {
+val, get_err = get(udm_val, [key])
+if get_err == null && val != null {
+. = set!(., [key], val)
+}
+}
+}
+}
+'''
