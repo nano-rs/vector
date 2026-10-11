@@ -411,12 +411,12 @@ route.legacy = 'get_env_var!("NANO_LOG_QUERY_BACKEND") != "lake"'
 type = "clickhouse"
 inputs = ["otlp_traces_backend.legacy"]
 
-endpoint = "http://clickhouse.parity.invalid:8123"
-database = "nanosiem"
-table = "otel_spans_raw"
+endpoint = "http://parity.invalid"
+database = "parity-clickhouse-database"
+table = "parity-clickhouse-otel-spans-table"
 
 auth.strategy = "basic"
-auth.user = "parity"
+auth.user = "parity-clickhouse-user"
 auth.password = "parity-not-a-secret"
 
 compression = "gzip"
@@ -478,12 +478,12 @@ enabled = false
 type = "clickhouse"
 inputs = ["otlp_metrics_prep"]
 
-endpoint = "http://clickhouse.parity.invalid:8123"
-database = "nanosiem"
-table = "otel_metrics_raw"
+endpoint = "http://parity.invalid"
+database = "parity-clickhouse-database"
+table = "parity-clickhouse-otel-metrics-table"
 
 auth.strategy = "basic"
-auth.user = "parity"
+auth.user = "parity-clickhouse-user"
 auth.password = "parity-not-a-secret"
 
 compression = "gzip"

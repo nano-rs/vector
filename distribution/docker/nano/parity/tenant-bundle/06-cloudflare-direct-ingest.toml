@@ -1,0 +1,55 @@
+# NAN-2361 hosted shared-tenant ingress. This file is added only to the
+# generated Cloudflare archive; it is not an open-core parser/config edit.
+[sources.cloudflare_direct_ingest]
+type = "http_server"
+address = "0.0.0.0:8081"
+strict_path = false
+path = "/"
+headers = ["Authorization", "X-Source-Type", "X-Api-Key", "Content-Type", "X-Forwarded-For", "X-Real-IP", "X-Nano-Tenant-ID", "X-Nano-Ingress-Protocol", "X-Nano-Credential-Id"]
+max_body_size = 52428800
+acknowledgements.enabled = true
+
+[sources.cloudflare_direct_ingest.framing]
+method = "newline_delimited"
+
+[sources.cloudflare_direct_ingest.decoding]
+codec = "bytes"
+
+[transforms.cloudflare_direct_auth]
+type = "remap"
+inputs = ["cloudflare_direct_ingest"]
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = true
+source = '''
+auth_header = to_string(.Authorization) ?? to_string(.authorization) ?? ""
+expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
+if expected_token == "" || auth_header != "Bearer " + expected_token {
+    log("Cloudflare shared-ingest authentication failed", level: "warn")
+    abort
+}
+tenant_id = downcase(to_string(."X-Nano-Tenant-ID") ?? to_string(."x-nano-tenant-id") ?? "")
+expected_tenant_id = downcase(get_env_var("NANO_TENANT_ID") ?? "")
+if tenant_id == "" || tenant_id != expected_tenant_id { abort }
+%tenant_id = tenant_id
+source_type = downcase(to_string(."X-Source-Type") ?? to_string(."x-source-type") ?? "unknown")
+if source_type == "" { source_type = "unknown" }
+.source_type = source_type
+.request_path = to_string(.path) ?? "/"
+.auth_status = "authenticated"
+del(.Authorization)
+del(.authorization)
+del(."X-Nano-Tenant-ID")
+del(."x-nano-tenant-id")
+# NAN-2596: the sending credential, from the Worker's own delivery header.
+nano_credential_id = downcase(to_string(."X-Nano-Credential-Id") ?? to_string(."x-nano-credential-id") ?? "")
+if !match(nano_credential_id, r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') { nano_credential_id = "" }
+%nano_credential_id = nano_credential_id
+del(."X-Nano-Credential-Id")
+del(."x-nano-credential-id")
+'''
+
+[sinks.cloudflare_direct_auth_dropped]
+type = "blackhole"
+inputs = ["cloudflare_direct_auth.dropped"]
+print_interval_secs = 0
