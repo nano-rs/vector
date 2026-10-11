@@ -123,14 +123,20 @@ if !is_object(.metadata) { .metadata = {} }
 # Pull source 00000000-0000-0000-0000-0000000000a4 (azure_event_hubs) -> lane windows_sysmon.
 [sources.nano_pull_000000000000000000000000000000a4]
 type = "azure_event_hubs"
+# Token: entra.internal managed-identity handler (http://entra.internal/msi/token).
 namespace = "parity-ns.servicebus.windows.net"
 event_hub_name = "parity-nano-pull-000000000000000000000000000000a4-eh-name"
 consumer_group = "parity-nano-pull-000000000000000000000000000000a4-eh-consumer-group"
+start_position = "earliest"
+checkpoint_interval_secs = 5
 acknowledgements.enabled = true
+decoding.codec = "bytes"
+framing.method = "bytes"
 
 [sources.nano_pull_000000000000000000000000000000a4.auth]
 azure_credential_kind = "managed_identity"
 user_assigned_managed_identity_id = "00000000-0000-4000-8000-000000000003"
+user_assigned_managed_identity_id_type = "client_id"
 
 [sources.nano_pull_000000000000000000000000000000a4.checkpoint_store]
 type = "azure_blob"
@@ -140,6 +146,8 @@ container_name = "parity-nano-pull-000000000000000000000000000000a4-checkpoint-c
 [sources.nano_pull_000000000000000000000000000000a4.checkpoint_store.auth]
 azure_credential_kind = "managed_identity"
 user_assigned_managed_identity_id = "00000000-0000-4000-8000-000000000003"
+user_assigned_managed_identity_id_type = "client_id"
+
 [transforms.nano_pull_000000000000000000000000000000a4_stamp]
 type = "remap"
 inputs = ["nano_pull_000000000000000000000000000000a4"]
@@ -154,6 +162,31 @@ source = '''
 if !exists(.message) { .message = "" }
 if !is_object(.metadata) { .metadata = {} }
 .metadata.forwarded_via = "pull"
+# NAN-3604: Event Hubs message -> one event per record ({"records": [...]} or a bare array).
+nano_pull_parsed, nano_pull_error = parse_json(string(.message) ?? "")
+nano_pull_is_batch = false
+nano_pull_records = []
+if nano_pull_error == null {
+  if is_array(nano_pull_parsed) {
+    nano_pull_is_batch = true
+    nano_pull_records = array(nano_pull_parsed) ?? []
+  } else if is_object(nano_pull_parsed) {
+    nano_pull_envelope = object(nano_pull_parsed) ?? {}
+    if is_array(nano_pull_envelope.records) {
+      nano_pull_is_batch = true
+      nano_pull_records = array(nano_pull_envelope.records) ?? []
+    }
+  }
+}
+if nano_pull_is_batch {
+  del(.message)
+  nano_pull_event = .
+  . = map_values(nano_pull_records) -> |nano_pull_record| {
+    nano_pull_one = nano_pull_event
+    nano_pull_one.message = string(nano_pull_record) ?? encode_json(nano_pull_record)
+    nano_pull_one
+  }
+}
 '''
 
 # Pull source 00000000-0000-0000-0000-0000000000a6 (aws_s3) -> lane apache_access.

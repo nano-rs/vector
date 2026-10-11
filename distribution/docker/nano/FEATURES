@@ -28,6 +28,12 @@ sources-aws_s3
 sources-aws_sqs
 sources-azure_event_hubs
 sources-gcp_pubsub
+# Classic / open-core Kafka sources (nanosiem source_configs generate_kafka_source, emitted at
+# runtime; SASL PLAIN / SCRAM-SHA-256/512 over SASL_SSL). librdkafka is built from source with
+# cmake, as upstream's Linux release targets do. GSSAPI is NOT enabled (no nano config offers
+# it), so libsasl2 is not linked. Hosted pull no longer renders kafka (NAN-3604).
+sources-kafka
+rdkafka?/cmake_build
 # Push ingest (platform base, cells, open core).
 sources-http_server
 sources-opentelemetry
