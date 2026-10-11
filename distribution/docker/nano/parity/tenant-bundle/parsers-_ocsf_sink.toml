@@ -1,0 +1,118 @@
+# Auto-generated canonical OCSF object-lake sink (NAN-2361)
+# DO NOT EDIT - regenerated on every parser deploy.
+# Vector performs real source parsing, then durably writes Parquet
+# bronze objects. The coordinator compacts and commits them to the
+# tenant's Iceberg table; no ClickHouse event copy is written.
+[transforms.ocsf_lake_storage_prepare]
+type = "remap"
+inputs = ["apache_http_server__ocsf__ocsf_prepare", "aws_cloudtrail__ocsf__ocsf_prepare", "conduit_mitm_proxy__ocsf__ocsf_prepare", "microsoft_sysmon__ocsf__ocsf_prepare", "opentelemetry_logs__ocsf__ocsf_prepare", "windows_event_log__ocsf__ocsf_prepare", "generic_ocsf_prepare", "tenant__acme_fw_ocsf_prepare", "tenant__acme_app_ocsf_prepare"]
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = true
+source = '''
+source_type = downcase(to_string(.source_type) ?? to_string(%source_type) ?? "unknown")
+if source_type == "" { source_type = "unknown" }
+tenant_id = downcase(to_string(%tenant_id) ?? "")
+if tenant_id == "" { tenant_id = downcase(get_env_var("NANO_TENANT_ID") ?? "") }
+if tenant_id == "" { abort }
+event = .event
+if is_object(event) { . = event }
+del(._nano_parser_id)
+del(._nano_parser_failure)
+# Preserve the verbatim source payload in canonical OCSF 1.9.
+# The imported parsers currently carry it in `message`; future
+# parsers can provide `raw_data` directly and retain precedence.
+raw_data = to_string(.raw_data) ?? ""
+if raw_data == "" { raw_data = to_string(.message) ?? "" }
+if raw_data != "" {
+.raw_data = raw_data
+.raw_data_size = length(raw_data)
+}
+time_ms = to_int(.time) ?? 0
+event_time = now()
+if time_ms > 0 { event_time = from_unix_timestamp!(time_ms, unit: "milliseconds") }
+metadata = .metadata
+if !is_object(metadata) { metadata = {} }
+benchmark_uid = to_string(%nano_ingest_id) ?? ""
+prior_uid = to_string(metadata.uid) ?? ""
+if benchmark_uid != "" {
+  if prior_uid != "" && prior_uid != benchmark_uid { metadata.original_event_uid = prior_uid }
+  metadata.uid = benchmark_uid
+}
+metadata.version = "1.9.0"
+metadata.log_source = source_type
+metadata.tenant_uid = tenant_id
+# NAN-2596: per-credential attribution (design §2.4).
+nano_credential_id = to_string(%nano_credential_id) ?? ""
+if nano_credential_id != "" { metadata.nano_credential_id = nano_credential_id }
+processed_time = to_unix_timestamp(now(), unit: "milliseconds")
+metadata.processed_time = processed_time
+metadata.logged_time = processed_time
+if (to_string(metadata.uid) ?? "") == "" { metadata.uid = uuid_v4() }
+bronze_shards = 1
+if bronze_shards < 1 || bronze_shards > 128 { abort }
+._nano_bronze_partition = if bronze_shards > 1 {
+bronze_digest = sha2!(to_string!(metadata.uid), variant: "SHA-256")
+bronze_hash_prefix = slice!(bronze_digest, 0, 8)
+bronze_hash_value = parse_int!(bronze_hash_prefix, base: 16)
+bronze_shard = mod!(bronze_hash_value, bronze_shards)
+"shard=" + to_string!(bronze_shard) + "/"
+} else {
+""
+}
+.metadata = metadata
+.time = event_time
+%tenant_id = tenant_id
+%source_type = source_type
+%class_uid = to_int(.class_uid) ?? 0
+%event_day = format_timestamp!(event_time, "%Y%m%d")
+# Bronze is the durable handoff, not the serving partition layout.
+# Each selected Bronze partition remains lexically append-only;
+# Vector's timestamped filenames preserve arrival order and the Rust publisher writes
+# canonical event-hour Iceberg partitions.
+'''
+
+[sinks.ocsf_parquet_bronze]
+type = "aws_s3"
+inputs = ["ocsf_output_guard"]
+bucket = "parity-nano-lake-bronze-bucket"
+region = "us-east-1"
+endpoint = "https://objects.parity.invalid"
+force_path_style = true
+auth.access_key_id = "parity-not-a-secret"
+auth.secret_access_key = "parity-not-a-secret"
+key_prefix = "bronze-v2/{{ _nano_bronze_partition }}tenant_id={{ %tenant_id }}/"
+filename_extension = "parquet"
+filename_append_uuid = true
+acknowledgements.enabled = true
+
+[sinks.ocsf_parquet_bronze.encoding]
+codec = "json"
+except_fields = ["_nano_bronze_partition"]
+
+[sinks.ocsf_parquet_bronze.batch]
+max_bytes = 33554432
+max_events = 10000
+# The byte/event thresholds still produce sized objects under load. The
+# short timeout bounds low-rate source visibility; it is not a tenant EPS cap.
+# Leave room inside the Worker's 8s direct deadline for Parquet encoding and the completed PUT.
+timeout_secs = 1
+
+[sinks.ocsf_parquet_bronze.batch_encoding]
+codec = "parquet"
+schema_mode = "auto_infer"
+
+[sinks.ocsf_parquet_bronze.batch_encoding.compression]
+algorithm = "zstd"
+level = 6
+
+[sinks.ocsf_parquet_bronze.buffer]
+type = "memory"
+max_events = 20000
+when_full = "block"
+
+[sinks.ocsf_parquet_bronze.request]
+concurrency = "adaptive"
+timeout_secs = 120
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 300

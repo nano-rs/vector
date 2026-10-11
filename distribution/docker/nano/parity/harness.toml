@@ -1,0 +1,33 @@
+# Parity config (NAN-3604): the shapes nano's test harnesses run this image with
+# (nanosiem tenant_bundle/pipe_native_tests.rs: stdin -> route -> blackhole;
+# scripts/verify-vector-generation-rollback.sh: demo_logs -> remap -> blackhole;
+# nanosiem-lake-worker fixture regeneration: stdin -> remap -> console).
+[sources.events]
+type = "stdin"
+
+[sources.sentinel]
+type = "demo_logs"
+format = "shuffle"
+lines = ["generation-sentinel"]
+interval = 1.0
+
+[transforms.source_router]
+type = "route"
+inputs = ["events"]
+
+[transforms.source_router.route]
+tenant__pipe_native = "true"
+
+[transforms.stamp]
+type = "remap"
+inputs = ["sentinel"]
+source = '.generation = "parity"'
+
+[sinks.test]
+type = "blackhole"
+inputs = ["source_router.tenant__pipe_native", "stamp"]
+
+[sinks.out]
+type = "console"
+inputs = ["source_router._unmatched"]
+encoding.codec = "json"

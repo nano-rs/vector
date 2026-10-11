@@ -1,0 +1,257 @@
+# NAN-3369: platform pull sources, rendered by the parser-bundle build from the
+# server's pull-source rows. Platform-owned: DO NOT EDIT. Coordinates come from
+# the container env the Worker sets (NANO_PULL_<ID>_*); credentials never do.
+# End-to-end acknowledgements: a source deletes/acks only after the Bronze
+# sink's edge-log commit.
+
+# Pull source 00000000-0000-0000-0000-0000000000a1 (aws_s3) -> lane aws_cloudtrail.
+[sources.nano_pull_000000000000000000000000000000a1]
+type = "aws_s3"
+region = "us-east-1"
+endpoint = "http://aws.internal"
+compression = "auto"
+acknowledgements.enabled = true
+
+[sources.nano_pull_000000000000000000000000000000a1.auth]
+access_key_id = "nano-pull-inert"
+secret_access_key = "nano-pull-inert"
+
+[sources.nano_pull_000000000000000000000000000000a1.sqs]
+queue_url = "https://sqs.us-east-1.amazonaws.com/000000000000/parity-queue"
+delete_message = true
+delete_failed_message = false
+visibility_timeout_secs = 900
+client_concurrency = 6
+max_number_of_messages = 2
+
+[transforms.nano_pull_000000000000000000000000000000a1_stamp]
+type = "remap"
+inputs = ["nano_pull_000000000000000000000000000000a1"]
+source = '''
+.source_type = "aws_cloudtrail"
+%source_type = "aws_cloudtrail"
+%tenant_id = "b12e5ee2-0000-4000-8000-000000000042"
+%nano_credential_id = "pull:00000000-0000-0000-0000-0000000000a1"
+.auth_status = "authenticated"
+.content_format = "nano_pull_aws_s3"
+.routing_timestamp = now()
+if !exists(.message) { .message = "" }
+if !is_object(.metadata) { .metadata = {} }
+.metadata.forwarded_via = "pull"
+# NAN-3371: CloudTrail file -> one event per record; digest files are not events.
+nano_pull_object = string(.object) ?? ""
+if starts_with(nano_pull_object, "CloudTrail-Digest/") || contains(nano_pull_object, "/CloudTrail-Digest/") {
+  . = []
+} else {
+  nano_pull_parsed, nano_pull_error = parse_json(string(.message) ?? "")
+  nano_pull_is_envelope = false
+  nano_pull_records = []
+  if nano_pull_error == null && is_object(nano_pull_parsed) {
+    nano_pull_envelope = object(nano_pull_parsed) ?? {}
+    if is_array(nano_pull_envelope.Records) {
+      nano_pull_is_envelope = true
+      nano_pull_records = array(nano_pull_envelope.Records) ?? []
+    }
+  }
+  if nano_pull_is_envelope {
+    del(.message)
+    nano_pull_event = .
+    . = map_values(nano_pull_records) -> |nano_pull_record| {
+      nano_pull_one = nano_pull_event
+      nano_pull_one.message = encode_json(nano_pull_record)
+      nano_pull_one
+    }
+  }
+}
+'''
+
+# Pull source 00000000-0000-0000-0000-0000000000a2 (aws_sqs) -> lane apache_access.
+[sources.nano_pull_000000000000000000000000000000a2]
+type = "aws_sqs"
+region = "us-east-1"
+endpoint = "http://aws.internal"
+queue_url = "https://sqs.us-east-1.amazonaws.com/000000000000/parity-queue"
+delete_message = true
+visibility_timeout_secs = 900
+acknowledgements.enabled = true
+
+[sources.nano_pull_000000000000000000000000000000a2.auth]
+access_key_id = "nano-pull-inert"
+secret_access_key = "nano-pull-inert"
+
+[transforms.nano_pull_000000000000000000000000000000a2_stamp]
+type = "remap"
+inputs = ["nano_pull_000000000000000000000000000000a2"]
+source = '''
+.source_type = "apache_access"
+%source_type = "apache_access"
+%tenant_id = "b12e5ee2-0000-4000-8000-000000000042"
+%nano_credential_id = "pull:00000000-0000-0000-0000-0000000000a2"
+.auth_status = "authenticated"
+.content_format = "nano_pull_aws_sqs"
+.routing_timestamp = now()
+if !exists(.message) { .message = "" }
+if !is_object(.metadata) { .metadata = {} }
+.metadata.forwarded_via = "pull"
+'''
+
+# Pull source 00000000-0000-0000-0000-0000000000a3 (gcp_pubsub) -> lane windows_sysmon.
+[sources.nano_pull_000000000000000000000000000000a3]
+type = "gcp_pubsub"
+# Token: metadata.google.internal handler, 3600 s tokens (D-L).
+project = "parity-nano-pull-000000000000000000000000000000a3-gcp-project"
+subscription = "parity-nano-pull-000000000000000000000000000000a3-gcp-subscription"
+ack_deadline_secs = 600
+acknowledgements.enabled = true
+
+[transforms.nano_pull_000000000000000000000000000000a3_stamp]
+type = "remap"
+inputs = ["nano_pull_000000000000000000000000000000a3"]
+source = '''
+.source_type = "windows_sysmon"
+%source_type = "windows_sysmon"
+%tenant_id = "b12e5ee2-0000-4000-8000-000000000042"
+%nano_credential_id = "pull:00000000-0000-0000-0000-0000000000a3"
+.auth_status = "authenticated"
+.content_format = "nano_pull_gcp_pubsub"
+.routing_timestamp = now()
+if !exists(.message) { .message = "" }
+if !is_object(.metadata) { .metadata = {} }
+.metadata.forwarded_via = "pull"
+'''
+
+# Pull source 00000000-0000-0000-0000-0000000000a4 (azure_event_hubs) -> lane windows_sysmon.
+[sources.nano_pull_000000000000000000000000000000a4]
+type = "azure_event_hubs"
+namespace = "parity-ns.servicebus.windows.net"
+event_hub_name = "parity-nano-pull-000000000000000000000000000000a4-eh-name"
+consumer_group = "parity-nano-pull-000000000000000000000000000000a4-eh-consumer-group"
+acknowledgements.enabled = true
+
+[sources.nano_pull_000000000000000000000000000000a4.auth]
+azure_credential_kind = "managed_identity"
+user_assigned_managed_identity_id = "00000000-0000-4000-8000-000000000003"
+
+[sources.nano_pull_000000000000000000000000000000a4.checkpoint_store]
+type = "azure_blob"
+account_name = "parity-nano-pull-000000000000000000000000000000a4-checkpoint-account"
+container_name = "parity-nano-pull-000000000000000000000000000000a4-checkpoint-container"
+
+[sources.nano_pull_000000000000000000000000000000a4.checkpoint_store.auth]
+azure_credential_kind = "managed_identity"
+user_assigned_managed_identity_id = "00000000-0000-4000-8000-000000000003"
+[transforms.nano_pull_000000000000000000000000000000a4_stamp]
+type = "remap"
+inputs = ["nano_pull_000000000000000000000000000000a4"]
+source = '''
+.source_type = "windows_sysmon"
+%source_type = "windows_sysmon"
+%tenant_id = "b12e5ee2-0000-4000-8000-000000000042"
+%nano_credential_id = "pull:00000000-0000-0000-0000-0000000000a4"
+.auth_status = "authenticated"
+.content_format = "nano_pull_azure_event_hubs"
+.routing_timestamp = now()
+if !exists(.message) { .message = "" }
+if !is_object(.metadata) { .metadata = {} }
+.metadata.forwarded_via = "pull"
+'''
+
+# Pull source 00000000-0000-0000-0000-0000000000a6 (aws_s3) -> lane apache_access.
+[sources.nano_pull_000000000000000000000000000000a6]
+type = "aws_s3"
+region = "us-east-1"
+endpoint = "http://aws.internal"
+compression = "auto"
+acknowledgements.enabled = true
+
+[sources.nano_pull_000000000000000000000000000000a6.auth]
+access_key_id = "nano-pull-inert"
+secret_access_key = "nano-pull-inert"
+
+[sources.nano_pull_000000000000000000000000000000a6.sqs]
+queue_url = "https://sqs.us-east-1.amazonaws.com/000000000000/parity-queue"
+delete_message = true
+delete_failed_message = false
+visibility_timeout_secs = 900
+client_concurrency = 4
+max_number_of_messages = 1
+
+[transforms.nano_pull_000000000000000000000000000000a6_stamp]
+type = "remap"
+inputs = ["nano_pull_000000000000000000000000000000a6"]
+source = '''
+.source_type = "apache_access"
+%source_type = "apache_access"
+%tenant_id = "b12e5ee2-0000-4000-8000-000000000042"
+%nano_credential_id = "pull:00000000-0000-0000-0000-0000000000a6"
+.auth_status = "authenticated"
+.content_format = "nano_pull_aws_s3"
+.routing_timestamp = now()
+if !exists(.message) { .message = "" }
+if !is_object(.metadata) { .metadata = {} }
+.metadata.forwarded_via = "pull"
+'''
+
+# Pull source 00000000-0000-0000-0000-0000000000a7 (aws_s3) -> lane windows_sysmon.
+[sources.nano_pull_000000000000000000000000000000a7]
+type = "aws_s3"
+region = "us-east-1"
+endpoint = "http://aws.internal"
+compression = "auto"
+acknowledgements.enabled = true
+
+[sources.nano_pull_000000000000000000000000000000a7.auth]
+access_key_id = "nano-pull-inert"
+secret_access_key = "nano-pull-inert"
+
+[sources.nano_pull_000000000000000000000000000000a7.sqs]
+queue_url = "https://sqs.us-east-1.amazonaws.com/000000000000/parity-queue"
+delete_message = true
+delete_failed_message = false
+visibility_timeout_secs = 900
+client_concurrency = 8
+max_number_of_messages = 1
+
+[transforms.nano_pull_000000000000000000000000000000a7_stamp]
+type = "remap"
+inputs = ["nano_pull_000000000000000000000000000000a7"]
+source = '''
+.source_type = "windows_sysmon"
+%source_type = "windows_sysmon"
+%tenant_id = "b12e5ee2-0000-4000-8000-000000000042"
+%nano_credential_id = "pull:00000000-0000-0000-0000-0000000000a7"
+.auth_status = "authenticated"
+.content_format = "nano_pull_aws_s3"
+.routing_timestamp = now()
+if !exists(.message) { .message = "" }
+if !is_object(.metadata) { .metadata = {} }
+.metadata.forwarded_via = "pull"
+'''
+
+# NAN-3371/NAN-3372 loss accounting (nano-pull-loss-fence-v1): a discard the source
+# keeps for the customer's DLQ is not loss. The pull Worker scrapes only this
+# exporter (scrapes are metered egress); the rule is pull.rs LOSS_FENCE_CONTRACT.
+[sources.nano_pull_loss_metrics]
+type = "internal_metrics"
+scrape_interval_secs = 10
+namespace = "nanosiem_pull"
+
+[transforms.nano_pull_loss_select]
+type = "filter"
+inputs = ["nano_pull_loss_metrics"]
+condition = '''
+component = to_string(.tags.component_id) ?? ""
+pull = starts_with(component, "nano_pull_") && !starts_with(component, "nano_pull_loss_")
+.name == "component_discarded_events_total" ||
+  (component == "nano_pull_loss_metrics" && .name == "component_sent_events_total") ||
+  (pull && includes(["component_received_events_total", "component_errors_total",
+    "sqs_message_received_messages_total", "sqs_message_delete_succeeded_total",
+    "sqs_message_delete_failed_total", "sqs_message_processing_succeeded_total"], .name)) ||
+  (component == "ocsf_parquet_bronze" && includes(["component_sent_events_total", "component_errors_total"], .name))
+'''
+
+[sinks.nano_pull_loss_exporter]
+type = "prometheus_exporter"
+inputs = ["nano_pull_loss_select"]
+address = "0.0.0.0:9597"
+default_namespace = "nanosiem_pull"
