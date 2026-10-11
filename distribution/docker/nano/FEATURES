@@ -16,6 +16,11 @@ tikv-jemallocator
 vrl/stdlib
 # Parquet batch encoding of the Bronze sink (ocsf_parquet_bronze); brings codecs-arrow.
 codecs-parquet
+# Enrichment tables, kept for NAN-3489 (all enrichment traverses Vector; the lake-lane IPinfo
+# MMDB lookup is a candidate to move into VRL). The `file` (CSV) table is always built in.
+enrichment-tables-geoip
+enrichment-tables-mmdb
+enrichment-tables-memory
 
 # --- sources ---
 # Pull sources (nanosiem tenant_bundle/pull.rs, nano-main pull-bundle.ts).
@@ -33,6 +38,11 @@ sources-internal_logs
 sources-internal_metrics
 # Region log shipper DaemonSet (nano-main hosted-shared-region-log-shipping.ts).
 sources-kubernetes_logs
+# The base bundle's opt-in templates (sources/{file,syslog}.toml.disabled).
+sources-file
+sources-syslog
+# NAN-3489 thin pullers (vendor API polling through the tenant Vector).
+sources-http_client
 # Test harnesses that run this image (pipe_native_tests.rs, verify-vector-generation-rollback.sh).
 sources-demo_logs
 sources-stdin

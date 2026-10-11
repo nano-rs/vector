@@ -195,7 +195,7 @@ Files in `distribution/docker/nano/`:
 | `FEATURES` | The cargo features (one per line, comments allowed) the Dockerfile builds with `--no-default-features`. |
 | `COMPONENTS` | The exact `vector list` of that build. |
 | `materialise-parity.py` | Regenerates the bundle-derived parity units from nanosiem and nano-main. |
-| `parity/` | One config per renderer family (see `materialise-parity.py`), plus hand-written `pull-*.toml` and `harness.toml`. |
+| `parity/` | One config per renderer family (see `materialise-parity.py`), the base's opt-in templates (`opt-in-templates/`), plus hand-written `pull-*.toml`, `harness.toml` and `enrichment/` (with tiny fixture data in `enrichment/data/`). |
 
 Adding a component (nano starts rendering a new type):
 
@@ -205,8 +205,10 @@ python3 distribution/docker/nano/scan-components.py \
   parsers=<parsers clone>@origin/main vector=.@HEAD --check distribution/docker/nano/COMPONENTS
 ```
 
-`--check` fails on any shipped type missing from `COMPONENTS`, and on any renderer that emits
-a type from a variable the scanner cannot resolve (`RENDERED_DYNAMIC`). Then:
+`--check` fails on any shipped or kept type missing from `COMPONENTS`, on any renderer that
+emits a type from a variable the scanner cannot resolve (`RENDERED_DYNAMIC`), and on any
+`RETIRED` type rendered outside the frozen fixtures in `RETIRED_FIXTURES` (a retired type must
+fail at render/build time, never at runtime in the image). Then:
 
 1. Add the feature to `FEATURES` (Cargo.toml names: `sources-<x>`, `transforms-<x>`,
    `sinks-<x>`; one feature can enable several components, e.g. `sinks-prometheus` gives
@@ -218,17 +220,33 @@ a type from a variable the scanner cannot resolve (`RENDERED_DYNAMIC`). Then:
 4. Update the vendored `COMPONENTS` copies in nanosiem and nano-main (their guard tests pin
    this repository's commit; see the comment at the top of each copy).
 
+Built on purpose although no product config renders them yet:
+
+- Enrichment tables `geoip`, `mmdb`, `memory` and the built-in `file` (CSV) table: kept for
+  NAN-3489 (all enrichment traverses the tenant Vector; the lake lane's IPinfo MMDB lookup may
+  move into VRL). `KEPT` in the scanner; `parity/enrichment/` loads each from committed fixtures
+  and reads it with `get_enrichment_table_record` (the workflow runs a full `vector validate`
+  on that unit so the tables are actually opened).
+- `file`, `syslog` sources: the base bundle's opt-in templates (`sources/*.toml.disabled`, an
+  operator enables one by renaming it). The scanner counts `*.toml.disabled` as shipped;
+  `parity/opt-in-templates/` enables them.
+- `http_client` source: NAN-3489 thin pullers (`parity/pull-http_client.toml`). Note the base's
+  `sources/http.toml.disabled` template is `http_server`, not `http_client`.
+
 Deliberately left out, though something still mentions them:
 
 - `kafka` source: the never-shipped Azure-over-Kafka pull kind, replaced by `azure_event_hubs`
   (`RETIRED` in the scanner). Building it needs librdkafka (cmake) and vendored SASL/GSSAPI.
-- `file`, `syslog` sources and the other `*.toml.disabled` templates in the base bundle: never
-  loaded.
+  Rendering it is a `--check` ERROR, so the nanosiem and nano-main guards stay red until the
+  renderers drop it: nanosiem `PullSourceKind::Kafka` (the NAN-3604 azure-pull core PR) and
+  nano-main `PULL_SOURCE_KINDS` / `renderSource`. The nano-main `nan3381-pull-bundle` golden
+  fixtures still contain it (byte-exact pre-NAN-3604 builder output); they are tolerated via
+  `RETIRED_FIXTURES` until regenerated, and `parity/pull-bundle/` rewrites that kind to
+  `azure_event_hubs`.
 - Customer-side Vector (sender templates, Ludus lab agents and aggregator), which run upstream
   images.
-- `secrets` (AWS Secrets Manager backend), enrichment tables (geoip, mmdb, memory), `dnstap`
-  (and its `parse_dnstap` VRL function): no nano config uses them. The `file` and `exec` secret
-  backends and the `file` enrichment table are built in regardless.
+- `secrets` (AWS Secrets Manager backend), `dnstap` (and its `parse_dnstap` VRL function): no
+  nano config uses them. The `file` and `exec` secret backends are built in regardless.
 
 Parity configs are sanitised (no secrets, env references replaced by literals). When moving to
 a new upstream release, update `UPSTREAM_IMAGE` (tag and index digest) in the workflow; it is

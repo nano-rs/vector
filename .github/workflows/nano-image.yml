@@ -321,6 +321,16 @@ jobs:
             fi
           done
           exit "$failed"
+      - name: vector validate (enrichment tables load, NAN-3489)
+        env:
+          DIGEST: ${{ needs.merge.outputs.digest }}
+        # Full validate builds the components, so the CSV file, mmdb and geoip tables are opened from
+        # the committed fixtures and get_enrichment_table_record compiles against the loaded schemas.
+        # Only this unit: the others name endpoints that a full validate would health-check.
+        run: |
+          set -euo pipefail
+          dir=distribution/docker/nano/parity
+          docker run --rm -v "$PWD/$dir:/parity:ro" "$IMAGE@$DIGEST" validate /parity/enrichment/enrichment.toml
 
   promote:
     name: Tag version

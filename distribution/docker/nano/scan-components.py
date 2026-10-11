@@ -25,8 +25,10 @@ Usage (each repo as NAME=PATH@REF; NAME selects the include/exclude rules below)
   REF may be WORKTREE to read the checked-out files instead of a commit.
 
   --json      machine-readable output
-  --check F   exit 1 if a shipped component (source/transform/sink/enrichment_table) is
-              missing from COMPONENTS file F (the fork's expected `vector list` output)
+  --check F   exit 1 if a shipped or KEPT component (source/transform/sink/enrichment_table)
+              is missing from COMPONENTS file F (the fork's expected `vector list` output), if a
+              RETIRED type is rendered outside RETIRED_FIXTURES, or if a dynamic type is
+              unresolved
 
 Python 3 standard library only.
 """
@@ -86,7 +88,8 @@ EXCLUDE = {
     "vector": [],
 }
 
-# Configs that are written but never loaded (Vector loads *.toml only).
+# Opt-in templates shipped in the base bundle (`sources/file.toml.disabled`): an operator
+# enables one by renaming it, so their types are shipped like any other config.
 DISABLED_SUFFIXES = (".disabled",)
 
 TEXT_EXT = (
@@ -120,11 +123,24 @@ RENDERED_DYNAMIC = [
     },
 ]
 
-# Types a renderer can still emit but that this image deliberately does not build. Reported
-# separately; --check prints them as warnings instead of failing.
+# Types this image deliberately does not build. Rendering one is an ERROR under --check (it must
+# fail at render/build time, never at runtime), except inside the frozen golden fixtures listed
+# in RETIRED_FIXTURES, which are reported but tolerated until they are regenerated.
 RETIRED = {
     ("source", "kafka"): "never-shipped Azure-over-Kafka pull kind, replaced by azure_event_hubs "
-                         "(NAN-3604); kept by renderers for verification only",
+                         "(NAN-3604)",
+}
+RETIRED_FIXTURES = (
+    # Byte-exact outputs of the pre-NAN-3604 Rust builder; regenerate from the NAN-3604 builder.
+    "nano-main@*:apps/api/src/services/shared-infrastructure/test-fixtures/nan3381-pull-bundle/",
+)
+
+# Built although no scanned config uses them yet. Listed so the inventory says why.
+KEPT = {
+    ("enrichment_table", "file"): "kept for NAN-3489 (all enrichment traverses Vector); built in",
+    ("enrichment_table", "geoip"): "kept for NAN-3489 (all enrichment traverses Vector)",
+    ("enrichment_table", "mmdb"): "kept for NAN-3489 (lake-lane IPinfo MMDB lookup may move into VRL)",
+    ("enrichment_table", "memory"): "kept for NAN-3489 (all enrichment traverses Vector)",
 }
 
 DYNAMIC_VALUES: dict = {}
@@ -397,9 +413,8 @@ def scan_blob(label: str, path: str, data: bytes, results, depth=0):
     except UnicodeDecodeError:
         return
     if lower.endswith(DISABLED_SUFFIXES):
-        hits = {(k, n) for k, n in scan_text(text, False)}
-        for kind, n in hits:
-            results[("disabled", kind, n)].add(f"{label}:{path}")
+        for kind, n in scan_text(text, False):
+            results[(None, kind, n)].add(f"{label}:{path} (opt-in template)")
         return
     is_code = lower.endswith((".rs", ".ts", ".js", ".mjs", ".cjs", ".py", ".sh"))
     hits = scan_text(text, is_code)
@@ -445,6 +460,23 @@ def scan_repo(spec: str, results, excluded):
     return label
 
 
+LIST_SECTIONS = {"Sources:": "source", "Transforms:": "transform", "Sinks:": "sink",
+                 "Enrichment tables:": "enrichment_table"}
+
+
+def read_components(path: str) -> set:
+    """(kind, name) pairs from a `vector list` text file; `#` lines are comments."""
+    out, kind = set(), None
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line in LIST_SECTIONS:
+                kind = LIST_SECTIONS[line]
+            elif line.startswith("- ") and kind:
+                out.add((kind, line[2:].strip()))
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("repos", nargs="+", help="NAME=PATH@REF")
@@ -458,9 +490,8 @@ def main() -> int:
     labels = [scan_repo(spec, results, excluded) for spec in args.repos]
 
     shipped: dict = defaultdict(set)
-    disabled: dict = defaultdict(set)
-    for (flag, kind, n), locs in results.items():
-        (disabled if flag == "disabled" else shipped)[(kind, n)] |= locs
+    for (_, kind, n), locs in results.items():
+        shipped[(kind, n)] |= locs
 
     # Expand known dynamic renderers; report unknown dynamic sites.
     unresolved = []
@@ -476,14 +507,25 @@ def main() -> int:
                     shipped[(kind, v)].add(f"{loc} (rendered; values from {entry[2]})")
             else:
                 unresolved.append((kind, loc))
-    retired = {key: shipped.pop(key) for key in list(shipped) if key in RETIRED}
+    retired: dict = {}
+    retired_fixture: dict = {}
+    for key in [k for k in shipped if k in RETIRED]:
+        for loc in shipped.pop(key):
+            label, _, path = loc.partition(":")
+            tolerated = any(
+                label.split("@")[0] == f.split("@")[0] and path.startswith(f.split(":", 1)[1])
+                for f in RETIRED_FIXTURES
+            )
+            (retired_fixture if tolerated else retired).setdefault(key, set()).add(loc)
 
     if args.json:
         json.dump(
             {
                 "repos": labels,
                 "shipped": [{"kind": k, "name": n, "seen_in": sorted(l)} for (k, n), l in sorted(shipped.items())],
-                "disabled": [{"kind": k, "name": n, "seen_in": sorted(l)} for (k, n), l in sorted(disabled.items())],
+                "kept": [{"kind": k, "name": n, "why": w, "seen_in": sorted(shipped.get((k, n), ()))}
+                         for (k, n), w in sorted(KEPT.items())],
+                "retired_fixture": [{"kind": k, "name": n, "seen_in": sorted(l)} for (k, n), l in sorted(retired_fixture.items())],
                 "excluded": [{"reason": r, "kind": k, "name": n, "seen_in": sorted(l)} for (r, k, n), l in sorted(excluded.items())],
                 "retired": [{"kind": k, "name": n, "why": RETIRED[(k, n)], "seen_in": sorted(l)} for (k, n), l in sorted(retired.items())],
                 "unresolved_dynamic": [{"kind": k, "seen_in": l} for k, l in unresolved],
@@ -506,13 +548,18 @@ def main() -> int:
             print("\n[UNRESOLVED dynamic types: add the renderer to RENDERED_DYNAMIC]")
             for kind, loc in unresolved:
                 print(f"  {kind:12} {loc}")
+        print("\n[kept: built on purpose even where no product config uses them yet]")
+        for (kind, n), why in sorted(KEPT.items()):
+            print(f"  {kind}/{n}  {len(shipped.get((kind, n), ()))} files: {why}")
         if retired:
-            print("\n[retired: still rendered somewhere, deliberately NOT in the image]")
+            print("\n[RETIRED but still rendered: ERROR, the image does not build these]")
             for (kind, n), locs in sorted(retired.items()):
-                print(f"  {kind}/{n}  {len(locs)} files: {RETIRED[(kind, n)]}")
-        if disabled:
-            print("\n[not loaded: *.disabled files]")
-            for (kind, n), locs in sorted(disabled.items()):
+                print(f"  {kind}/{n}: {RETIRED[(kind, n)]}")
+                for loc in sorted(locs):
+                    print(f"      {loc}")
+        if retired_fixture:
+            print("\n[retired, tolerated in frozen golden fixtures (RETIRED_FIXTURES)]")
+            for (kind, n), locs in sorted(retired_fixture.items()):
                 print(f"  {kind}/{n}  {len(locs)} files")
         if excluded:
             print("\n[excluded: not run by this image]")
@@ -520,19 +567,26 @@ def main() -> int:
                 print(f"  {why}: {kind}/{n}  {len(locs)} files")
 
     if args.check:
-        with open(args.check) as f:
-            listed = {line.strip()[2:] for line in f if line.strip().startswith("- ")}
+        listed = read_components(args.check)
         component_kinds = {"source", "transform", "sink", "enrichment_table"}
-        missing = sorted(
-            f"{kind}/{n}" for (kind, n) in shipped if kind in component_kinds and n not in listed
-        )
-        for (kind, n) in sorted(retired):
-            print(f"WARNING retired {kind}/{n} is still rendered: {RETIRED[(kind, n)]}", file=sys.stderr)
-        if missing or unresolved:
-            for m in missing:
-                print(f"MISSING from {args.check}: {m}", file=sys.stderr)
-            for kind, loc in unresolved:
-                print(f"UNRESOLVED dynamic {kind} at {loc}", file=sys.stderr)
+        missing = sorted({
+            f"{kind}/{n}" for (kind, n) in list(shipped) + list(KEPT)
+            if kind in component_kinds and (kind, n) not in listed
+        })
+        for (kind, n), locs in sorted(retired_fixture.items()):
+            print(f"note: retired {kind}/{n} tolerated in {len(locs)} frozen fixture file(s)", file=sys.stderr)
+        failed = False
+        for m in missing:
+            print(f"MISSING from {args.check}: {m}", file=sys.stderr)
+            failed = True
+        for (kind, n), locs in sorted(retired.items()):
+            for loc in sorted(locs):
+                print(f"RETIRED {kind}/{n} is rendered at {loc}: {RETIRED[(kind, n)]}", file=sys.stderr)
+            failed = True
+        for kind, loc in unresolved:
+            print(f"UNRESOLVED dynamic {kind} at {loc}", file=sys.stderr)
+            failed = True
+        if failed:
             return 1
     return 0
 

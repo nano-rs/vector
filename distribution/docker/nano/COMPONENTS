@@ -3,7 +3,9 @@ Sources:
 - aws_sqs
 - azure_event_hubs
 - demo_logs
+- file
 - gcp_pubsub
+- http_client
 - http_server
 - internal_logs
 - internal_metrics
@@ -11,6 +13,7 @@ Sources:
 - opentelemetry
 - splunk_hec
 - stdin
+- syslog
 - unit_test
 - unit_test_stream
 - vector
@@ -40,3 +43,6 @@ Sinks:
 
 Enrichment tables:
 - file
+- geoip
+- memory
+- mmdb
