@@ -1280,6 +1280,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-lc-rs"
+version = "1.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
+dependencies = [
+ "aws-lc-sys",
+ "zeroize",
+]
+
+[[package]]
+name = "aws-lc-sys"
+version = "0.45.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
+dependencies = [
+ "cc",
+ "cmake",
+ "dunce",
+ "fs_extra",
+ "pkg-config",
+]
+
+[[package]]
 name = "aws-runtime"
 version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2106,9 +2129,32 @@ dependencies = [
  "rustc_version",
  "serde",
  "serde_json",
+ "tokio",
  "tracing 0.1.44",
  "typespec",
  "typespec_client_core",
+]
+
+[[package]]
+name = "azure_core_amqp"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4d270c927b83dbee3c6f5fb5340b38c6019452eeb6ea097f40148ec164fafe1"
+dependencies = [
+ "async-trait",
+ "azure_core",
+ "fe2o3-amqp",
+ "fe2o3-amqp-cbs",
+ "fe2o3-amqp-ext",
+ "fe2o3-amqp-management",
+ "fe2o3-amqp-types",
+ "serde",
+ "serde_amqp",
+ "serde_bytes",
+ "tokio",
+ "tracing 0.1.44",
+ "typespec",
+ "typespec_macros",
 ]
 
 [[package]]
@@ -2143,6 +2189,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "azure_messaging_eventhubs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f59256600b5c426cffd1e8ea4fb3d325581a1b32b6ac2314c6639457254bf46"
+dependencies = [
+ "async-lock 3.4.0",
+ "async-stream",
+ "async-trait",
+ "azure_core",
+ "azure_core_amqp",
+ "futures",
+ "rand 0.10.2",
+ "rand_chacha 0.10.0",
+ "rustc_version",
+ "tracing 0.1.44",
+]
+
+[[package]]
+name = "azure_messaging_eventhubs_checkpointstore_blob"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06239be0b6c12ebc81cc623b47c9b569a434b2756933318cee86fa96400a9fcf"
+dependencies = [
+ "async-trait",
+ "azure_core",
+ "azure_messaging_eventhubs",
+ "azure_storage_blob",
+ "futures",
+ "serde",
+ "serde_json",
+ "time",
+ "tracing 0.1.44",
+]
+
+[[package]]
 name = "azure_storage_blob"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2158,6 +2239,7 @@ dependencies = [
  "serde",
  "serde_json",
  "time",
+ "tokio",
 ]
 
 [[package]]
@@ -4183,6 +4265,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4567,6 +4655,79 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
+name = "fe2o3-amqp"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a579ef4f1fb186f04bcdc9caf0c335adedebe879227c96d56876d473aa3d20a"
+dependencies = [
+ "bytes",
+ "fe2o3-amqp-types",
+ "futures-util",
+ "getrandom 0.3.4",
+ "native-tls",
+ "parking_lot",
+ "pin-project-lite",
+ "serde",
+ "serde_amqp",
+ "serde_bytes",
+ "slab",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-stream",
+ "tokio-util",
+ "url",
+ "uuid",
+ "wasmtimer",
+]
+
+[[package]]
+name = "fe2o3-amqp-cbs"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6cae904b214ffa3c9bae26e4129d300fe79189d2ef70503071fb25ff9127531e"
+dependencies = [
+ "fe2o3-amqp",
+ "fe2o3-amqp-management",
+ "trait-variant",
+]
+
+[[package]]
+name = "fe2o3-amqp-ext"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6362c13b91a80dca77360eecdfbe85425e6dff1523f16c3a79fac541c47cf27d"
+dependencies = [
+ "fe2o3-amqp-types",
+ "serde_amqp",
+]
+
+[[package]]
+name = "fe2o3-amqp-management"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0582084762bdf022540c37868a0808e9f54dbcc51fe56f6212da59c167569cda"
+dependencies = [
+ "fe2o3-amqp",
+ "fe2o3-amqp-types",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "fe2o3-amqp-types"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bcc8d13ed13fbb2fb664a6df114bcc32f8ca85c9cb6b89d4e7576c47f583706"
+dependencies = [
+ "ordered-float 5.3.0",
+ "serde",
+ "serde_amqp",
+ "serde_bytes",
+ "serde_repr",
+]
+
+[[package]]
 name = "ff"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4770,6 +4931,12 @@ dependencies = [
  "lazy_static",
  "num",
 ]
+
+[[package]]
+name = "fs_extra"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsevent-sys"
@@ -8362,6 +8529,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7d950ca161dc355eaf28f82b11345ed76c6e1f6eb1f4f4479e0323b9e2fbd0e"
 dependencies = [
  "num-traits",
+ "rand 0.8.6",
+ "serde",
 ]
 
 [[package]]
@@ -9628,6 +9797,7 @@ version = "0.11.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "getrandom 0.4.2",
  "lru-slab",
@@ -9719,6 +9889,7 @@ dependencies = [
  "libc",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
+ "serde",
 ]
 
 [[package]]
@@ -9763,12 +9934,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_chacha"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e6af7f3e25ded52c41df4e0b1af2d047e45896c2f3281792ed68a1c243daedb"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.10.0",
+]
+
+[[package]]
 name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.15",
+ "serde",
 ]
 
 [[package]]
@@ -10266,6 +10448,7 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
+ "quinn",
  "rustls 0.23.45",
  "rustls-pki-types",
  "rustls-platform-verifier",
@@ -10586,6 +10769,7 @@ version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
+ "aws-lc-rs",
  "log",
  "once_cell",
  "ring",
@@ -10692,6 +10876,7 @@ version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
+ "aws-lc-rs",
  "ring",
  "rustls-pki-types",
  "untrusted",
@@ -10934,6 +11119,35 @@ checksum = "f3a1a3341211875ef120e117ea7fd5228530ae7e7036a779fdc9117be6b3282c"
 dependencies = [
  "ordered-float 2.10.1",
  "serde",
+]
+
+[[package]]
+name = "serde_amqp"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffc615f24778bb6d92510fe82afc74f99fb03e6ddbfd75927356fe681c1b6037"
+dependencies = [
+ "bytes",
+ "indexmap 2.14.2",
+ "ordered-float 5.3.0",
+ "serde",
+ "serde_amqp_derive",
+ "serde_bytes",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "serde_amqp_derive"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ed6d00fd958e85ba2419add81456008b253de3fb60fda81b5c53c1687ab7f7c"
+dependencies = [
+ "convert_case 0.12.0",
+ "darling 0.24.1",
+ "proc-macro2 1.0.107",
+ "quote 1.0.47",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -12800,15 +13014,20 @@ version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
 dependencies = [
+ "async-compression",
  "base64 0.22.1",
  "bitflags 2.13.2",
  "bytes",
+ "futures-core",
  "futures-util",
  "http 1.5.0",
  "http-body 1.0.1",
+ "http-body-util",
  "iri-string",
  "mime",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
@@ -13000,6 +13219,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "trait-variant"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b19a4867a870f6edc4c283f2b455804b1879c0baf0e642f26b03ed8ee262d9d3"
+dependencies = [
+ "proc-macro2 1.0.107",
+ "quote 1.0.47",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "triomphe"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13104,6 +13334,7 @@ dependencies = [
  "serde",
  "serde_json",
  "time",
+ "tokio",
  "tracing 0.1.44",
  "typespec",
  "typespec_macros",
@@ -13354,7 +13585,17 @@ dependencies = [
  "js-sys",
  "rand 0.10.2",
  "serde_core",
+ "uuid-rng-internal",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "uuid-rng-internal"
+version = "1.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e1d7ccff5e453092983b2a5ec27ebdd52745f40bef229e92051a054a37c662b"
+dependencies = [
+ "getrandom 0.4.2",
 ]
 
 [[package]]
@@ -13454,7 +13695,10 @@ dependencies = [
  "aws-types",
  "axum 0.6.20",
  "azure_core",
+ "azure_core_amqp",
  "azure_identity",
+ "azure_messaging_eventhubs",
+ "azure_messaging_eventhubs_checkpointstore_blob",
  "azure_storage_blob",
  "base64 0.23.1",
  "bloomy",

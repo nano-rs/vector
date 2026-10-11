@@ -344,6 +344,11 @@ azure_identity = { version = "1.0", default-features = false, features = ["clien
 # Azure Storage
 azure_storage_blob = { version = "1.0", default-features = false, optional = true }
 
+# Azure Event Hubs
+azure_core_amqp = { version = "1.0", optional = true }
+azure_messaging_eventhubs = { version = "0.15", optional = true }
+azure_messaging_eventhubs_checkpointstore_blob = { version = "0.9", optional = true }
+
 # OpenDAL
 # Use native-tls for the HTTP transport so we do not enable rustls's aws-lc-rs
 # provider alongside Vector's existing ring-based rustls users (e.g. sqlx).
@@ -713,6 +718,7 @@ sources-logs = [
   "sources-aws_kinesis_firehose",
   "sources-aws_s3",
   "sources-aws_sqs",
+  "sources-azure_event_hubs",
   "sources-datadog_agent",
   "sources-demo_logs",
   "sources-docker_logs",
@@ -766,6 +772,7 @@ sources-aws_ecs_metrics = ["sources-utils-http-client"]
 sources-aws_kinesis_firehose = ["dep:base64", "sources-http_server", "sources-utils-http-encoding"]
 sources-aws_s3 = ["aws-core", "dep:aws-sdk-sqs", "dep:aws-sdk-s3", "dep:async-compression", "sources-aws_sqs", "tokio-util/io"]
 sources-aws_sqs = ["aws-core", "dep:aws-sdk-sqs"]
+sources-azure_event_hubs = ["sinks-azure_blob", "dep:azure_core_amqp", "dep:azure_messaging_eventhubs", "dep:azure_messaging_eventhubs_checkpointstore_blob", "dep:base64"]
 sources-datadog_agent = ["sources-utils-http-encoding", "dep:datadog-proto", "dep:prost"]
 sources-demo_logs = ["dep:fakedata"]
 sources-dnstap = ["sources-utils-net-tcp", "dep:base64", "dep:dnsmsg-parser", "dep:dnstap-parser", "protobuf-build", "dep:prost", "vector-vrl-functions/dnstap"]
@@ -1081,6 +1088,7 @@ aws-integration-tests = [
 
 azure-integration-tests = [
   "azure-blob-integration-tests",
+  "azure-event-hubs-integration-tests",
   "azure-logs-ingestion-integration-tests",
 ]
 
@@ -1095,6 +1103,7 @@ aws-sqs-integration-tests = ["sinks-aws_sqs"]
 aws-sns-integration-tests = ["sinks-aws_sns"]
 axiom-integration-tests = ["sinks-axiom"]
 azure-blob-integration-tests = ["sinks-azure_blob"]
+azure-event-hubs-integration-tests = ["sources-azure_event_hubs"]
 azure-logs-ingestion-integration-tests = ["sinks-azure_logs_ingestion"]
 clickhouse-integration-tests = ["sinks-clickhouse"]
 databend-integration-tests = ["sinks-databend"]
