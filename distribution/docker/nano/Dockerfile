@@ -11,6 +11,10 @@
 # Differences from the upstream image: the binary is built here instead of from the release
 # .deb, and release LTO defaults to thin with 16 codegen units (override with LTO=fat
 # CODEGEN_UNITS=1 for an upstream-identical profile).
+#
+# Platforms: linux/amd64 and linux/arm64, built natively (no QEMU, no cross). FEATURES defaults
+# to upstream's release feature set for the build platform's GNU target, the same
+# `--no-default-features --features target-<triple>` that upstream's publish workflow uses.
 
 ARG RUST_VERSION=1.96.1
 ARG DEBIAN_DIGEST=sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
@@ -20,10 +24,15 @@ FROM docker.io/rust:${RUST_VERSION}-trixie AS builder
 COPY scripts/environment/install-debian-build-deps.sh scripts/environment/install-protoc.sh /tmp/
 RUN bash /tmp/install-debian-build-deps.sh && bash /tmp/install-protoc.sh /usr/local/bin
 
-ARG FEATURES=target-x86_64-unknown-linux-gnu
+# Empty = target-x86_64-unknown-linux-gnu on amd64, target-aarch64-unknown-linux-gnu on arm64.
+ARG FEATURES=
+ARG TARGETARCH
 ARG LTO=thin
 ARG CODEGEN_UNITS=16
 ARG CARGO_BUILD_JOBS=4
+# Shown in `vector --version` after the target triple (upstream puts its git sha and date there).
+# The version itself stays the plain crate version: see REBASE.md, "Invariants".
+ARG VECTOR_BUILD_DESC=
 
 # Mirrors the [env] section of .cargo/config.toml, which .dockerignore keeps out of the context.
 ENV JEMALLOC_SYS_WITH_LG_PAGE=16 \
@@ -37,9 +46,18 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/vector/target \
-    cargo build --release --locked --no-default-features --features "${FEATURES}" --bin vector \
+    set -eu; \
+    [ -n "${VECTOR_BUILD_DESC}" ] || unset VECTOR_BUILD_DESC; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) triple=x86_64-unknown-linux-gnu ;; \
+      arm64) triple=aarch64-unknown-linux-gnu ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    features="${FEATURES:-target-${triple}}"; \
+    echo "building vector for ${triple} with features: ${features}"; \
+    cargo build --release --locked --no-default-features --features "${features}" --bin vector \
     && install -m 0755 target/release/vector /usr/bin/vector \
-    && mkdir -p /var/lib/vector /etc/vector
+    && mkdir -p /var/lib/vector
 
 FROM docker.io/debian:trixie-slim@${DEBIAN_DIGEST}
 
@@ -53,25 +71,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 COPY --from=builder /usr/bin/vector /usr/bin/vector
 COPY --from=builder /var/lib/vector /var/lib/vector
-COPY --from=builder /etc/vector /etc/vector
 
-# Same minimal default as the upstream package's /etc/vector/vector.yaml: a demo source to console.
-RUN cat > /etc/vector/vector.yaml <<'YAML'
-sources:
-  dummy_logs:
-    type: demo_logs
-    format: syslog
-    interval: 1
-sinks:
-  print:
-    type: console
-    inputs: [dummy_logs]
-    encoding:
-      codec: json
-YAML
+# /etc/vector matches the upstream image exactly: only the package's examples/, no default
+# config. nano's entrypoints run `--config-dir /etc/vector`, so any file here would be loaded.
+# (Dockerfile.dockerignore next to this file admits config/examples into the build context.)
+COPY config/examples/*.yaml /etc/vector/examples/
+RUN chmod 0755 /etc/vector /etc/vector/examples && chmod 0644 /etc/vector/examples/*.yaml
 
 # Smoke test
 RUN ["vector", "--version"]
-RUN vector list | grep -qx 'azure_event_hubs'
+RUN vector list | grep -qx -- '- azure_event_hubs'
 
 ENTRYPOINT ["/usr/bin/vector"]

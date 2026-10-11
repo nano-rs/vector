@@ -1,0 +1,389 @@
+# nano-rs/vector: build the fork image and push it to ghcr.io/nano-rs/vector (NAN-3604).
+#
+# Runs only on demand: a pushed tag `image-<upstream version>-nano.<n>` (for example
+# `image-0.59.0-nano.1`) or a manual dispatch with `nano_rev`. Never on branch pushes or PRs.
+# The tag prefix `image-` deliberately does not match upstream's release tag filters (`v0.*`).
+#
+# Flow: meta -> build (amd64 + arm64, native runners, pushed by digest, untagged)
+#       -> merge (multi-arch index, tagged sha-<short> only) -> parity (amd64)
+#       -> promote (adds `<version>` and `<version>-debian` to the parity-checked index).
+# Consumers pin the index digest printed in the promote job summary, never a tag.
+#
+# Only GITHUB_TOKEN is used; no other secrets. No build cache is exported: the expensive
+# cargo build is one RUN step whose target dir is a BuildKit cache mount, so a layer cache
+# (type=gha) would hold only the final binary and miss on every source change.
+name: nano image
+
+on:
+  push:
+    tags:
+      - "image-*-nano.*"
+  workflow_dispatch:
+    inputs:
+      nano_rev:
+        description: "Image revision n (the image tag becomes <upstream version>-nano.<n>)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nano-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/nano-rs/vector
+  # timberio/vector:0.59.0-debian (index). Bump together with the upstream base of nano/vX.Y.
+  UPSTREAM_IMAGE: docker.io/timberio/vector:0.59.0-debian@sha256:98e7b4dfe50750e61470697bbd2fbeca643d12bea97f351005038ef506eab630
+  # The fork's components that upstream does not ship, as <kind>/<name> from `vector list
+  # --format json`; the fork's list must equal upstream's plus exactly these.
+  FORK_COMPONENTS: sources/azure_event_hubs
+
+jobs:
+  meta:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      upstream_version: ${{ steps.v.outputs.upstream_version }}
+      sha_tag: ${{ steps.v.outputs.sha_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve image version
+        id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          NANO_REV: ${{ inputs.nano_rev }}
+        run: |
+          set -euo pipefail
+          upstream="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          [ -n "$upstream" ] || { echo "::error::no version in Cargo.toml"; exit 1; }
+          if [ "$EVENT" = "push" ]; then
+            version="${REF_NAME#image-}"
+          else
+            version="${upstream}-nano.${NANO_REV}"
+          fi
+          if ! printf '%s' "$version" | grep -Eq "^${upstream//./\\.}-nano\.[1-9][0-9]*$"; then
+            echo "::error::image version '$version' must be ${upstream}-nano.<n> (n >= 1, Cargo.toml version ${upstream})"
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "upstream_version=$upstream"
+            echo "sha_tag=sha-${GITHUB_SHA::12}"
+          } >> "$GITHUB_OUTPUT"
+          echo "image version: $version (commit $GITHUB_SHA)"
+      - name: Refuse to overwrite an existing version tag
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "::error::$IMAGE:$VERSION already exists; bump n instead of re-tagging"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Free runner disk
+        run: |
+          set -euo pipefail
+          df -h / /mnt 2>/dev/null || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          docker image prune --all --force
+          df -h / /mnt 2>/dev/null || true
+      - name: Move Docker storage to /mnt when it has more room
+        run: |
+          set -euo pipefail
+          root_free=$(df --output=avail -B1G / | tail -n1 | tr -d ' ')
+          mnt_free=$(df --output=avail -B1G /mnt 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+          echo "free: / ${root_free}G, /mnt ${mnt_free:-0}G"
+          if [ "${mnt_free:-0}" -gt "$root_free" ] && [ "${mnt_free:-0}" -ge 40 ]; then
+            sudo systemctl stop docker docker.socket
+            sudo mkdir -p /mnt/docker
+            conf=/etc/docker/daemon.json
+            { sudo cat "$conf" 2>/dev/null || echo '{}'; } | jq '. + {"data-root": "/mnt/docker"}' > "$RUNNER_TEMP/daemon.json"
+            sudo install -m 0644 "$RUNNER_TEMP/daemon.json" "$conf"
+            sudo systemctl start docker
+            docker info --format 'Docker root: {{.DockerRootDir}}'
+          fi
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up buildx
+        run: docker buildx create --name nano --driver docker-container --use --bootstrap
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build and push by digest
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform "$PLATFORM" \
+            --file distribution/docker/nano/Dockerfile \
+            --provenance=false --sbom=false \
+            --build-arg "VECTOR_BUILD_DESC=nano ${VERSION} ${GITHUB_SHA::12}" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --output "type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file "$RUNNER_TEMP/metadata.json" \
+            --progress plain \
+            .
+          digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/metadata.json")"
+          case "$digest" in sha256:*) ;; *) echo "::error::no digest in build metadata"; exit 1 ;; esac
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$digest" > "$RUNNER_TEMP/digests/${{ matrix.arch }}"
+          echo "${PLATFORM}: ${IMAGE}@${digest}" | tee -a "$GITHUB_STEP_SUMMARY"
+          df -h / /mnt 2>/dev/null || true
+      - name: Upload digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+  merge:
+    name: Multi-arch index
+    needs: [meta, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+      amd64: ${{ steps.index.outputs.amd64 }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Create index (tag sha-<short> only)
+        id: index
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          SHA_TAG: ${{ needs.meta.outputs.sha_tag }}
+        run: |
+          set -euo pipefail
+          amd64="$(cat "$RUNNER_TEMP/digests/amd64")"
+          arm64="$(cat "$RUNNER_TEMP/digests/arm64")"
+          docker buildx imagetools create \
+            --tag "$IMAGE:$SHA_TAG" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --annotation "index:org.opencontainers.image.version=${VERSION}" \
+            --annotation "index:org.opencontainers.image.description=Vector, nano-rs fork (adds the azure_event_hubs source)" \
+            "$IMAGE@$amd64" "$IMAGE@$arm64"
+          digest="$(docker buildx imagetools inspect "$IMAGE:$SHA_TAG" --format '{{json .Manifest}}' | jq -r .digest)"
+          case "$digest" in sha256:*) ;; *) echo "::error::could not read index digest"; exit 1 ;; esac
+          { echo "digest=$digest"; echo "amd64=$amd64"; } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Index (pre-parity): \`$IMAGE:$SHA_TAG\`"
+            echo "- index: \`$IMAGE@$digest\`"
+            echo "- linux/amd64: \`$IMAGE@$amd64\`"
+            echo "- linux/arm64: \`$IMAGE@$arm64\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  parity:
+    name: Parity with upstream (amd64)
+    needs: [meta, merge]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Pull images by digest
+        env:
+          DIGEST: ${{ needs.merge.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/amd64 "$IMAGE@$DIGEST"
+          docker pull --platform linux/amd64 "$UPSTREAM_IMAGE"
+      - name: vector --version
+        env:
+          DIGEST: ${{ needs.merge.outputs.digest }}
+          UPSTREAM_VERSION: ${{ needs.meta.outputs.upstream_version }}
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm "$IMAGE@$DIGEST" --version)"
+          echo "$out"
+          case "$out" in "vector ${UPSTREAM_VERSION} "*) ;; *)
+            echo "::error::expected 'vector ${UPSTREAM_VERSION} ...', got '$out'"; exit 1 ;; esac
+          # Invariant: the binary reports the plain upstream version (the nano suffix lives only in
+          # image tags). nanosiem's VECTOR_VERSION_RE refuses anything else.
+          printf '%s\n' "$out" | grep -Pq '^vector \d+\.\d+\.\d+(\s|$)' || {
+            echo "::error::'$out' does not match nanosiem VECTOR_VERSION_RE ^vector \d+\.\d+\.\d+(\s|$)"; exit 1; }
+      - name: /etc/vector equals upstream
+        env:
+          DIGEST: ${{ needs.merge.outputs.digest }}
+        # nano's entrypoints untar the bundle into /etc/vector and run --config-dir /etc/vector,
+        # so the image must not add (or drop) anything there.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016 # runs in the container
+          probe='cd /etc/vector && find . -printf "%y %m %u %p\n" | sort -k4 && find . -type f -exec sha256sum {} + | sort -k2'
+          docker run --rm --entrypoint sh "$UPSTREAM_IMAGE" -c "$probe" > "$RUNNER_TEMP/etc-upstream.txt"
+          docker run --rm --entrypoint sh "$IMAGE@$DIGEST" -c "$probe" > "$RUNNER_TEMP/etc-fork.txt"
+          if ! diff -u "$RUNNER_TEMP/etc-upstream.txt" "$RUNNER_TEMP/etc-fork.txt"; then
+            echo "::error::/etc/vector differs from upstream (diff above: - upstream, + fork)"; exit 1
+          fi
+          echo "/etc/vector: identical to upstream ($(grep -c '^f ' "$RUNNER_TEMP/etc-fork.txt") files)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: vector list = upstream + fork components
+        env:
+          DIGEST: ${{ needs.merge.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016 # jq program, not shell
+          flat='to_entries[] | .key as $kind | .value[] | "\($kind)/\(.)"'
+          docker run --rm "$UPSTREAM_IMAGE" list --format json | jq -r "$flat" | sort > "$RUNNER_TEMP/upstream.txt"
+          docker run --rm "$IMAGE@$DIGEST" list --format json | jq -r "$flat" | sort > "$RUNNER_TEMP/fork.txt"
+          [ "$(wc -l < "$RUNNER_TEMP/upstream.txt")" -gt 100 ] || { echo "::error::upstream vector list looks empty"; exit 1; }
+          missing="$(comm -23 "$RUNNER_TEMP/upstream.txt" "$RUNNER_TEMP/fork.txt")"
+          extra="$(comm -13 "$RUNNER_TEMP/upstream.txt" "$RUNNER_TEMP/fork.txt")"
+          expected="$(tr ' ' '\n' <<< "$FORK_COMPONENTS" | sed '/^$/d' | sort)"
+          ok=true
+          if [ -n "$missing" ]; then
+            echo "::error::components missing from the fork image:"; echo "$missing"; ok=false
+          fi
+          if [ "$extra" != "$expected" ]; then
+            echo "::error::fork-only components are not exactly FORK_COMPONENTS ($FORK_COMPONENTS):"; echo "$extra"; ok=false
+          fi
+          $ok
+          echo "vector list: $(wc -l < "$RUNNER_TEMP/upstream.txt") upstream components, all present; fork adds: $extra" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: vector validate --no-environment (parity configs)
+        env:
+          DIGEST: ${{ needs.merge.outputs.digest }}
+        # Each top-level *.toml in the parity dir is one config; each subdirectory is one config
+        # made of all its *.toml files. --no-environment parses, wires and compiles VRL without
+        # building components, so no sink or source is contacted.
+        run: |
+          set -euo pipefail
+          dir=distribution/docker/nano/parity
+          units=()
+          for f in "$dir"/*.toml; do [ -e "$f" ] && units+=("$f"); done
+          for d in "$dir"/*/; do units+=("${d%/}"); done
+          [ "${#units[@]}" -gt 0 ] || { echo "::error::no parity configs"; exit 1; }
+          failed=0
+          for u in "${units[@]}"; do
+            rel="${u#"$dir"/}"
+            if [ -d "$u" ]; then
+              mapfile -t files < <(cd "$dir" && ls "$rel"/*.toml)
+            else
+              files=("$rel")
+            fi
+            args=()
+            for f in "${files[@]}"; do args+=("/parity/$f"); done
+            echo "::group::validate $rel (${#files[@]} files)"
+            if docker run --rm -v "$PWD/$dir:/parity:ro" "$IMAGE@$DIGEST" validate --no-environment "${args[@]}"; then
+              echo "::endgroup::"; echo "ok: $rel" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::endgroup::"; echo "::error::validate failed: $rel"; failed=1
+            fi
+          done
+          exit "$failed"
+
+  promote:
+    name: Tag version
+    needs: [meta, merge, parity]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Add version tags to the parity-checked index
+        env:
+          DIGEST: ${{ needs.merge.outputs.digest }}
+          AMD64: ${{ needs.merge.outputs.amd64 }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          SHA_TAG: ${{ needs.meta.outputs.sha_tag }}
+        run: |
+          set -euo pipefail
+          # A single index source is copied verbatim, so the digest does not change.
+          docker buildx imagetools create \
+            --tag "$IMAGE:$VERSION" --tag "$IMAGE:$VERSION-debian" \
+            "$IMAGE@$DIGEST"
+          for t in "$VERSION" "$VERSION-debian"; do
+            got="$(docker buildx imagetools inspect "$IMAGE:$t" --format '{{json .Manifest}}' | jq -r .digest)"
+            [ "$got" = "$DIGEST" ] || { echo "::error::$IMAGE:$t is $got, expected $DIGEST"; exit 1; }
+          done
+          raw="$(docker buildx imagetools inspect "$IMAGE@$DIGEST" --raw)"
+          listed="$(echo "$raw" | jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest')"
+          [ "$listed" = "$AMD64" ] || { echo "::error::index lists amd64 $listed, build pushed $AMD64"; exit 1; }
+          {
+            echo "## ghcr.io/nano-rs/vector $VERSION"
+            echo
+            echo "Multi-arch index (GHCR, Kubernetes): pin"
+            echo
+            echo '```'
+            echo "$IMAGE@$DIGEST"
+            echo '```'
+            echo
+            echo "linux/amd64 single-platform manifest (Cloudflare Containers: nano-main copies and pins this one):"
+            echo
+            echo '```'
+            echo "$IMAGE@$AMD64"
+            echo '```'
+            echo
+            echo "| ref | digest |"
+            echo "| --- | --- |"
+            echo "| index: \`$VERSION\`, \`$VERSION-debian\`, \`$SHA_TAG\` | \`$DIGEST\` |"
+            echo "$raw" | jq -r '.manifests[] | "| \(.platform.os)/\(.platform.architecture) | `\(.digest)` |"'
+            echo
+            echo "Commit: \`$GITHUB_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
