@@ -12,8 +12,10 @@ Configs are found in TOML and YAML files, inside .tar.gz bundles (recursively), 
 string literals of renderer code and tests (Rust, TS/JS, Python, shell): the scanner reads
 config-shaped lines (`[sinks.x]`, `type = "remap"`, `type: http`) wherever they appear, and
 ignores assertion lines such as `contains("type = \\"kafka\\"")`. A type rendered from a
-variable (`type = "{}"`) is reported as dynamic with its location; its values must be listed
-in FEATURES by hand (see RENDERED_DYNAMIC below).
+variable (`type = "{}"`) is reported as dynamic with its location; its values are
+resolved from the enum/list that drives the renderer (RENDERED_DYNAMIC below). The classic
+open-core source generator builds its configs at runtime with toml::Table, so its types are
+read from the generator code itself (CLASSIC_SOURCES below).
 
 Usage (each repo as NAME=PATH@REF; NAME selects the include/exclude rules below):
 
@@ -27,8 +29,9 @@ Usage (each repo as NAME=PATH@REF; NAME selects the include/exclude rules below)
   --json      machine-readable output
   --check F   exit 1 if a shipped or KEPT component (source/transform/sink/enrichment_table)
               is missing from COMPONENTS file F (the fork's expected `vector list` output), if a
-              RETIRED type is rendered outside RETIRED_FIXTURES, or if a dynamic type is
-              unresolved
+              RETIRED type is rendered inside its retired scope (hosted pull renderers and
+              fixtures; RETIRED_FIXTURES excepted), or if a dynamic or classic-generator type
+              is unresolved
 
 Python 3 standard library only.
 """
@@ -123,17 +126,61 @@ RENDERED_DYNAMIC = [
     },
 ]
 
-# Types this image deliberately does not build. Rendering one is an ERROR under --check (it must
-# fail at render/build time, never at runtime), except inside the frozen golden fixtures listed
-# in RETIRED_FIXTURES, which are reported but tolerated until they are regenerated.
+# Classic (open-core) source generator: types emitted at RUNTIME from toml::Table code
+# (`source.insert("type".into(), "kafka".into())`), never committed as TOML. Read from code so a
+# new generator or variant cannot be missed:
+#   emit   every match of `pattern` inside `scope` is a shipped `kind` type;
+#   cover  every match must be an emitted type, a system intermediary (`system` scope: a source
+#          declared in config/vector/*.toml), or a CLASSIC_ALIASES key; otherwise UNRESOLVED.
+# A listed file that exists but whose scope no longer matches is UNRESOLVED too.
+CLASSIC_SOURCES = [
+    {
+        "repo": "nanosiem", "mode": "emit", "kind": "source",
+        "file": "nanosiem-core/src/source_configs/service.rs",
+        "scope": r"\n    (?:async )?fn generate_\w+_source\b.*?(?=\n    (?:pub(?:\(\w+\))? )?(?:async )?fn |\Z)",
+        "pattern": r'\.insert\(\s*"type"\.into\(\),\s*"([a-z0-9_]+)"\.into\(\)\s*\)',
+    },
+    {
+        # Credential providers a classic source can be bound to: each is a Vector source type.
+        "repo": "nanosiem", "mode": "emit", "kind": "source",
+        "file": "nanosiem-core/src/enterprise_shared_sources_credentials.rs",
+        "scope": r"SUPPORTED_PROVIDERS\s*:[^=]*=\s*&\[[^\]]*\]",
+        "pattern": r'"([a-z0-9_]+)"',
+    },
+    {
+        "repo": "nanosiem", "mode": "system", "kind": "source",
+        "file": "nanosiem-core/src/source_configs/service.rs",
+        "scope": r"fn system_intermediary_source\b.*?\n    }",
+        "pattern": r'"([a-z0-9_]+)"\s*(?:\||=>)',
+    },
+    {
+        "repo": "nanosiem", "mode": "cover", "kind": "source",
+        "file": "nanosiem-core/src/log_sources/types.rs",
+        "scope": r"impl SourceType \{.*?fn as_str\(&self\)[^{]*\{.*?\n    }",
+        "pattern": r'Self::\w+\s*=>\s*"([a-z0-9_]+)"',
+    },
+]
+# SourceType values that are not a generator config_type of their own.
+CLASSIC_ALIASES = {"routed": "http (system listener, config/vector)"}
+CLASSIC: dict = {}   # label -> {"emit": {name: file}, "system": set, "cover": {name: file}, "broken": [..]}
+
+# Types this image does not build for a given renderer family. Retirement is SCOPED: rendering
+# one inside a listed scope is an ERROR under --check (it must fail at render/build time, never at
+# config load), while the same type elsewhere (e.g. the classic open-core generator) is shipped.
 RETIRED = {
-    ("source", "kafka"): "never-shipped Azure-over-Kafka pull kind, replaced by azure_event_hubs "
-                         "(NAN-3604)",
+    ("source", "kafka"): {
+        "why": "hosted pull: the never-shipped Azure-over-Kafka kind, replaced by azure_event_hubs "
+               "(NAN-3604). Classic/open-core Kafka sources still ship.",
+        "scopes": (
+            ("nanosiem", "nanosiem-core/src/parsers/tenant_bundle/pull"),
+            ("nano-main", "apps/api/src/services/shared-infrastructure/pull-bundle"),
+            ("nano-main", "apps/api/src/services/shared-infrastructure/test-fixtures/nan3381-pull-bundle/"),
+        ),
+    },
 }
-RETIRED_FIXTURES = (
-    # Byte-exact outputs of the pre-NAN-3604 Rust builder; regenerate from the NAN-3604 builder.
-    "nano-main@*:apps/api/src/services/shared-infrastructure/test-fixtures/nan3381-pull-bundle/",
-)
+# Frozen fixtures in a retired scope that are tolerated until regenerated. Empty: nano-main#2131
+# regenerated the nan3381 hosted pull fixtures without kafka.
+RETIRED_FIXTURES: tuple = ()
 
 # Built although no scanned config uses them yet. Listed so the inventory says why.
 KEPT = {
@@ -432,6 +479,23 @@ def scan_repo(spec: str, results, excluded):
         label = f"{name}@worktree"
     else:
         label = f"{name}@{git(repo, 'rev-parse', '--short=12', ref).decode().strip()}"
+    classic = CLASSIC.setdefault(label, {"emit": {}, "system": set(), "cover": {}, "broken": []})
+    for entry in CLASSIC_SOURCES:
+        if entry["repo"] != name:
+            continue
+        try:
+            text = read_blob(repo, ref, entry["file"]).decode()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+        scopes = re.findall(entry["scope"], text, re.S)
+        values = [v for sc in scopes for v in re.findall(entry["pattern"], sc)]
+        if not values:
+            classic["broken"].append(f'{label}:{entry["file"]} ({entry["mode"]} scope matched nothing)')
+        for v in values:
+            if entry["mode"] == "system":
+                classic["system"].add(v)
+            else:
+                classic[entry["mode"]].setdefault(v, entry["file"])
     for entry in RENDERED_DYNAMIC:
         if entry["repo"] != name:
             continue
@@ -507,16 +571,29 @@ def main() -> int:
                     shipped[(kind, v)].add(f"{loc} (rendered; values from {entry[2]})")
             else:
                 unresolved.append((kind, loc))
+    # Classic generator: emitted types are shipped; every SourceType value must be covered.
+    for label, c in CLASSIC.items():
+        for v, f in c["emit"].items():
+            shipped[("source", v)].add(f"{label}:{f} (classic generator, runtime)")
+        for v, f in c["cover"].items():
+            if v not in c["emit"] and v not in c["system"] and v not in CLASSIC_ALIASES:
+                unresolved.append(("source", f"{label}:{f} SourceType value {v!r} has no generator"))
+        for b in c["broken"]:
+            unresolved.append(("source", f"{b}: update CLASSIC_SOURCES"))
+
     retired: dict = {}
     retired_fixture: dict = {}
     for key in [k for k in shipped if k in RETIRED]:
-        for loc in shipped.pop(key):
+        for loc in sorted(shipped[key]):
             label, _, path = loc.partition(":")
-            tolerated = any(
-                label.split("@")[0] == f.split("@")[0] and path.startswith(f.split(":", 1)[1])
-                for f in RETIRED_FIXTURES
-            )
+            repo = label.split("@")[0]
+            if not any(repo == r and path.startswith(pre) for r, pre in RETIRED[key]["scopes"]):
+                continue
+            shipped[key].discard(loc)
+            tolerated = any(repo == r and path.startswith(pre) for r, pre in RETIRED_FIXTURES)
             (retired_fixture if tolerated else retired).setdefault(key, set()).add(loc)
+        if not shipped[key]:
+            del shipped[key]
 
     if args.json:
         json.dump(
@@ -527,7 +604,7 @@ def main() -> int:
                          for (k, n), w in sorted(KEPT.items())],
                 "retired_fixture": [{"kind": k, "name": n, "seen_in": sorted(l)} for (k, n), l in sorted(retired_fixture.items())],
                 "excluded": [{"reason": r, "kind": k, "name": n, "seen_in": sorted(l)} for (r, k, n), l in sorted(excluded.items())],
-                "retired": [{"kind": k, "name": n, "why": RETIRED[(k, n)], "seen_in": sorted(l)} for (k, n), l in sorted(retired.items())],
+                "retired": [{"kind": k, "name": n, "why": RETIRED[(k, n)]["why"], "seen_in": sorted(l)} for (k, n), l in sorted(retired.items())],
                 "unresolved_dynamic": [{"kind": k, "seen_in": l} for k, l in unresolved],
             },
             sys.stdout,
@@ -554,7 +631,7 @@ def main() -> int:
         if retired:
             print("\n[RETIRED but still rendered: ERROR, the image does not build these]")
             for (kind, n), locs in sorted(retired.items()):
-                print(f"  {kind}/{n}: {RETIRED[(kind, n)]}")
+                print(f"  {kind}/{n}: {RETIRED[(kind, n)]['why']}")
                 for loc in sorted(locs):
                     print(f"      {loc}")
         if retired_fixture:
@@ -581,7 +658,7 @@ def main() -> int:
             failed = True
         for (kind, n), locs in sorted(retired.items()):
             for loc in sorted(locs):
-                print(f"RETIRED {kind}/{n} is rendered at {loc}: {RETIRED[(kind, n)]}", file=sys.stderr)
+                print(f"RETIRED {kind}/{n} is rendered at {loc}: {RETIRED[(kind, n)]['why']}", file=sys.stderr)
             failed = True
         for kind, loc in unresolved:
             print(f"UNRESOLVED dynamic {kind} at {loc}", file=sys.stderr)

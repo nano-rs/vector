@@ -1,0 +1,34 @@
+# Parity config (NAN-3604): the classic / open-core source generator output
+# (nanosiem-core source_configs/service.rs generate_source_block + routing transform), rendered at
+# runtime from toml::Table. Synthetic placeholders only: .invalid hosts, inert credentials.
+# generate_aws_s3_source with static access keys (aws_auth_table) and an S3-compatible endpoint.
+
+[sources.parity_s3_source]
+type = "aws_s3"
+region = "us-east-1"
+compression = "gzip"
+endpoint = "https://s3.parity.invalid"
+
+[sources.parity_s3_source.sqs]
+queue_url = "https://sqs.us-east-1.amazonaws.com/000000000000/parity-queue"
+poll_secs = 15
+delete_message = true
+# Vector's knob is sqs.client_concurrency. nanosiem generate_aws_s3_source (NAN-2188) emits it at
+# the source top level, which 0.59 rejects ("unknown field `client_concurrency`"): reported.
+client_concurrency = 8
+
+[sources.parity_s3_source.auth]
+access_key_id = "AKIAPARITY0000000000"
+secret_access_key = "parity-not-a-secret"
+region = "us-east-1"
+
+[transforms.parity_s3_route]
+type = "remap"
+inputs = ["parity_s3_source"]
+source = '''
+.source_type = "parity_s3_feed"
+'''
+
+[sinks.parity_out]
+type = "blackhole"
+inputs = ["parity_s3_route"]

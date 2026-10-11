@@ -206,9 +206,10 @@ python3 distribution/docker/nano/scan-components.py \
 ```
 
 `--check` fails on any shipped or kept type missing from `COMPONENTS`, on any renderer that
-emits a type from a variable the scanner cannot resolve (`RENDERED_DYNAMIC`), and on any
-`RETIRED` type rendered outside the frozen fixtures in `RETIRED_FIXTURES` (a retired type must
-fail at render/build time, never at runtime in the image). Then:
+emits a type from a variable the scanner cannot resolve (`RENDERED_DYNAMIC`), on a classic
+generator it cannot fully enumerate (`CLASSIC_SOURCES`), and on any `RETIRED` type rendered
+inside its retired scope (a retired type must fail at render/build time, never at config load
+in the image). Then:
 
 1. Add the feature to `FEATURES` (Cargo.toml names: `sources-<x>`, `transforms-<x>`,
    `sinks-<x>`; one feature can enable several components, e.g. `sinks-prometheus` gives
@@ -219,6 +220,19 @@ fail at render/build time, never at runtime in the image). Then:
 3. Add or refresh a parity unit that uses the type.
 4. Update the vendored `COMPONENTS` copies in nanosiem and nano-main (their guard tests pin
    this repository's commit; see the comment at the top of each copy).
+
+Types emitted at runtime, not committed as TOML. The classic / open-core source generator
+(nanosiem `source_configs/service.rs` `generate_*_source`) builds configs with `toml::Table`,
+so the scanner reads it from code (`CLASSIC_SOURCES`): every `.insert("type".into(), "<t>".into())`
+in a `generate_*_source` function and every `SUPPORTED_PROVIDERS` credential provider is a
+shipped source type, and every `SourceType::as_str` value must map to one of those, to a system
+listener (`system_intermediary_source`), or to `CLASSIC_ALIASES` (`routed` = http); otherwise
+`--check` fails, so a new variant cannot be missed. That is why `kafka` is built: open-core
+compose runs this image, and a user's classic Kafka source (SASL PLAIN / SCRAM over SASL_SSL)
+would otherwise die with "unknown component type". Parity: `classic-kafka-sasl_ssl.toml`,
+`classic-aws_s3-static.toml`, `classic-gcp_pubsub-credentials.toml`. librdkafka is built with
+cmake (`rdkafka?/cmake_build` in `FEATURES`, as upstream's Linux targets; cmake is in
+`install-debian-build-deps.sh`). GSSAPI is not enabled (nothing offers it), so no libsasl2 link.
 
 Built on purpose although no product config renders them yet:
 
@@ -233,16 +247,16 @@ Built on purpose although no product config renders them yet:
 - `http_client` source: NAN-3489 thin pullers (`parity/pull-http_client.toml`). Note the base's
   `sources/http.toml.disabled` template is `http_server`, not `http_client`.
 
+Retired in one scope only (`RETIRED`, scoped; still built for the classic generator):
+
+- `kafka` in HOSTED pull: the never-shipped Azure-over-Kafka pull kind, replaced by
+  `azure_event_hubs`. Rendering kafka from nanosiem `tenant_bundle/pull*.rs`, nano-main
+  `pull-bundle.ts` or the nano-main `nan3381-pull-bundle` fixtures is a `--check` ERROR.
+  `RETIRED_FIXTURES` is empty: nano-main#2131 dropped kafka from hosted pull and regenerated
+  those fixtures, and must merge before the guards (nanosiem#6187, nano-main#2127) go green.
+
 Deliberately left out, though something still mentions them:
 
-- `kafka` source: the never-shipped Azure-over-Kafka pull kind, replaced by `azure_event_hubs`
-  (`RETIRED` in the scanner). Building it needs librdkafka (cmake) and vendored SASL/GSSAPI.
-  Rendering it is a `--check` ERROR, so the nanosiem and nano-main guards stay red until the
-  renderers drop it: nanosiem `PullSourceKind::Kafka` (the NAN-3604 azure-pull core PR) and
-  nano-main `PULL_SOURCE_KINDS` / `renderSource`. The nano-main `nan3381-pull-bundle` golden
-  fixtures still contain it (byte-exact pre-NAN-3604 builder output); they are tolerated via
-  `RETIRED_FIXTURES` until regenerated, and `parity/pull-bundle/` rewrites that kind to
-  `azure_event_hubs`.
 - Customer-side Vector (sender templates, Ludus lab agents and aggregator), which run upstream
   images.
 - `secrets` (AWS Secrets Manager backend), `dnstap` (and its `parse_dnstap` VRL function): no
