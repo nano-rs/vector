@@ -133,11 +133,9 @@ only by pushing an image tag or by a manual dispatch.
 `distribution/docker/nano/Dockerfile` builds a drop-in replacement for
 `timberio/vector:<version>-debian`: same Debian base and runtime packages, `/usr/bin/vector`
 as the entrypoint, `/var/lib/vector` present, and `/etc/vector` holding exactly upstream's
-`examples/` and nothing else. It compiles upstream's release
-feature set for the platform (`target-x86_64-unknown-linux-gnu` on amd64,
-`target-aarch64-unknown-linux-gnu` on arm64), which includes our sources, with thin LTO and 16
-codegen units (`LTO=fat CODEGEN_UNITS=1` reproduces upstream's profile). It fails if
-`vector list` lacks `azure_event_hubs`.
+`examples/` and nothing else. It compiles only nano's component set (`FEATURES`, see
+"Component set" below) with thin LTO and 16 codegen units (`LTO=fat CODEGEN_UNITS=1`
+reproduces upstream's profile). It fails if `vector list` lacks `azure_event_hubs`.
 
 Version scheme: `<upstream version>-nano.<n>`, for example `0.59.0-nano.1`. `<n>` starts at 1
 and increments for every image cut from the same upstream version; the workflow refuses a
@@ -159,11 +157,11 @@ of upstream's release tag filters (`v0.*`), which still exist on mirrored branch
    build per arch (pushed untagged, by digest) -> multi-arch index tagged `sha-<12-char sha>`
    -> parity on amd64 -> promote, which adds `<version>` and `<version>-debian` to the same
    index. Parity checks that `vector --version` is the plain upstream version (see
-   "Invariants"), that `/etc/vector` is identical to upstream's, that `vector list`
-   equals upstream `timberio/vector:<version>-debian` plus exactly `sources/azure_event_hubs`,
-   and that every config under `distribution/docker/nano/parity/` passes
-   `vector validate --no-environment` (each top-level `*.toml` alone, each subdirectory as one
-   config; this parses, wires and compiles VRL but contacts no source or sink).
+   "Invariants"), that `/etc/vector` is identical to upstream's, that `vector list` equals
+   `distribution/docker/nano/COMPONENTS` exactly, and that every config under
+   `distribution/docker/nano/parity/` passes `vector validate --no-environment` (each
+   top-level `*.toml` / `*.yaml` alone, each subdirectory as one config; this parses, wires
+   and compiles VRL but contacts no source or sink).
 4. Read the digests from the promote job's summary. Never consume a tag; tags are only for
    humans.
    - GHCR / Kubernetes: the multi-arch index, `ghcr.io/nano-rs/vector@sha256:…`.
@@ -184,14 +182,57 @@ that step and its credentials belong to nano-main, not to this repository.
 - `/etc/vector` in the image equals upstream's (only `examples/`). nano's entrypoints untar
   the config bundle there and run `--config-dir /etc/vector`, so a default config in the image
   would run alongside every tenant pipeline.
-- `vector list` is upstream's plus exactly the fork's components (`FORK_COMPONENTS` in the
-  workflow); add a component there in the same PR that adds it to the fork.
+- `vector list` equals `COMPONENTS` exactly. The image is NOT a superset of upstream (Dan,
+  2026-10-11): it builds only what nano ships or renders.
 
-Parity configs are sanitised copies of nanosiem's Vector configs (the platform base bundle in
-`platform-base/`, and pull sources shaped like `tenant_bundle/pull.rs` output in `pull-*.toml`):
-no secrets, env references replaced with literals. Refresh them when the platform bundle grows
-a component type that is not covered. When moving to a new upstream release, update
-`UPSTREAM_IMAGE` (tag and index digest) in the workflow.
+## Component set
+
+Files in `distribution/docker/nano/`:
+
+| File | What |
+| --- | --- |
+| `scan-components.py` | Inventories every component type, codec, framing, compression and buffer in nano's Vector configs: nanosiem (`config/vector`, base bundles, renderer code and tests, compose, deploy), nano-main (pull bundle, region log shipper, fixtures), nano-rs/parsers lanes, and `parity/`. Reads git trees at given refs; never checks anything out. |
+| `FEATURES` | The cargo features (one per line, comments allowed) the Dockerfile builds with `--no-default-features`. |
+| `COMPONENTS` | The exact `vector list` of that build. |
+| `materialise-parity.py` | Regenerates the bundle-derived parity units from nanosiem and nano-main. |
+| `parity/` | One config per renderer family (see `materialise-parity.py`), plus hand-written `pull-*.toml` and `harness.toml`. |
+
+Adding a component (nano starts rendering a new type):
+
+```sh
+python3 distribution/docker/nano/scan-components.py \
+  nanosiem=~/Projects/nanosiem@origin/main nano-main=~/Projects/nano-main@origin/main \
+  parsers=<parsers clone>@origin/main vector=.@HEAD --check distribution/docker/nano/COMPONENTS
+```
+
+`--check` fails on any shipped type missing from `COMPONENTS`, and on any renderer that emits
+a type from a variable the scanner cannot resolve (`RENDERED_DYNAMIC`). Then:
+
+1. Add the feature to `FEATURES` (Cargo.toml names: `sources-<x>`, `transforms-<x>`,
+   `sinks-<x>`; one feature can enable several components, e.g. `sinks-prometheus` gives
+   `prometheus_exporter` and `prometheus_remote_write`).
+2. Regenerate `COMPONENTS` from a build:
+   `cargo-slot build --no-default-features --features "$(sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' distribution/docker/nano/FEATURES | paste -sd, -)" --bin vector`
+   (a dev build with `CARGO_PROFILE_DEV_DEBUG=0` is enough), then `target/debug/vector list > distribution/docker/nano/COMPONENTS`.
+3. Add or refresh a parity unit that uses the type.
+4. Update the vendored `COMPONENTS` copies in nanosiem and nano-main (their guard tests pin
+   this repository's commit; see the comment at the top of each copy).
+
+Deliberately left out, though something still mentions them:
+
+- `kafka` source: the never-shipped Azure-over-Kafka pull kind, replaced by `azure_event_hubs`
+  (`RETIRED` in the scanner). Building it needs librdkafka (cmake) and vendored SASL/GSSAPI.
+- `file`, `syslog` sources and the other `*.toml.disabled` templates in the base bundle: never
+  loaded.
+- Customer-side Vector (sender templates, Ludus lab agents and aggregator), which run upstream
+  images.
+- `secrets` (AWS Secrets Manager backend), enrichment tables (geoip, mmdb, memory), `dnstap`
+  (and its `parse_dnstap` VRL function): no nano config uses them. The `file` and `exec` secret
+  backends and the `file` enrichment table are built in regardless.
+
+Parity configs are sanitised (no secrets, env references replaced by literals). When moving to
+a new upstream release, update `UPSTREAM_IMAGE` (tag and index digest) in the workflow; it is
+still used for the `/etc/vector` comparison.
 
 One-time setup per repository: Actions enabled with an allow-list that
 covers the actions the workflow pins, and the `vector` package's visibility set to public

@@ -1,0 +1,143 @@
+# Auto-generated Vector configuration for parser: tenant__acme_app
+# DO NOT EDIT - changes will be overwritten
+# Generated at: content-addressed tenant parser bundle (NAN-2604)
+
+
+[transforms.tenant__acme_app_parse]
+type = "remap"
+inputs = ["source_router.tenant__acme_app"]
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = true
+source = '''
+parts = split(string!(.message), " ")
+. = {
+  "class_uid": 4002,
+  "category_uid": 4,
+  "activity_id": 99,
+  "time": 1700000000000,
+  "http_request": { "http_method": string(parts[0]) ?? "GET", "url": { "path": string(parts[1]) ?? "/" } },
+  "message": "acme"
+}
+'''
+
+[transforms.tenant__acme_app_ocsf_split]
+type = "route"
+inputs = ["tenant__acme_app_parse"]
+[transforms.tenant__acme_app_ocsf_split.route]
+# Explicit parser failures must stay on the UDM recovery path so
+# metadata.parse_error remains searchable and countable.
+ocsf = 'exists(.class_uid) && !exists(.parse_error) && !exists(.metadata.parse_error)'
+
+[transforms.tenant__acme_app_ocsf_prepare]
+type = "remap"
+inputs = ["tenant__acme_app_ocsf_split.ocsf"]
+source = '''
+ocsf_event = .
+time_ms = to_int(.time) ?? 0
+ts = now()
+if time_ms > 0 { ts = from_unix_timestamp!(time_ms, unit: "milliseconds") }
+src_type = downcase(to_string(%source_type) ?? "unknown")
+if src_type == "" { src_type = "unknown" }
+. = { "event": ocsf_event, "timestamp": format_timestamp!(ts, "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type }
+# Protected identity for the pre-sampling parser-health branch.
+# The OCSF ClickHouse sink ignores this internal field.
+._nano_parser_id = "00000000-0000-4000-8000-000000000002"
+._nano_parser_failure = false
+'''
+
+[transforms.tenant__acme_app_output]
+type = "remap"
+inputs = ["tenant__acme_app_ocsf_split._unmatched", "tenant__acme_app_parse.dropped"]
+source = '''
+# Flatten for ClickHouse - standard NanoSIEM format
+# Spread all .udm fields to top level, preserve .ext
+# The clickhouse_mapping transform handles final column assignment and ext capture
+
+# Handle timestamp - use udm.timestamp if set, otherwise now()
+ts_val = .udm.timestamp
+if ts_val == null {
+ts_val = now()
+}
+
+# Handle metadata - ensure it's an object
+meta_val = .metadata
+if !is_object(meta_val) {
+meta_val = {}
+}
+# Vector annotates rerouted runtime failures under
+# `.metadata.dropped`. Preserve the full diagnostic and promote
+# stable fields that ClickHouse health queries can aggregate.
+if exists(.metadata.dropped.message) {
+meta_val.parse_failure = true
+meta_val.parse_error = to_string(.metadata.dropped.message) ?? "Parser runtime error"
+meta_val.parse_stage = to_string(.metadata.dropped.component_id) ?? "parser"
+} else if exists(.parse_error) {
+meta_val.parse_failure = true
+meta_val.parse_error = to_string(.parse_error) ?? "Unknown parse error"
+} else if exists(.metadata.parse_error) {
+meta_val.parse_failure = true
+}
+# Protected deployment identity: parser-authored VRL cannot spoof
+# attribution because this is assigned after the parser runs.
+meta_val.parser_id = "00000000-0000-4000-8000-000000000002"
+meta_val.parser_name = "tenant__acme_app"
+parse_failure_val = to_bool(meta_val.parse_failure) ?? false
+
+# Handle ext - preserve source-specific queryable fields
+# Parser sets fields like .ext.principal_id, .ext.bucket_name
+ext_val = .ext
+if ext_val == null {
+ext_val = {}
+}
+
+# Pinned source_type: parser VRL cannot choose its storage label
+st_val = "acme_app"
+
+# Preserve message and udm object
+msg_val = .message
+udm_val = .udm
+if udm_val == null {
+udm_val = {}
+}
+
+# Start with base fields
+. = {
+"timestamp": ts_val,
+"message": msg_val,
+"metadata": encode_json(meta_val),
+"_nano_parser_failure": parse_failure_val,
+"ext": ext_val,
+"source_type": st_val
+}
+
+# Inject vendor, product, and category from log_sources metadata
+# These are configured in the UI and don't require parser VRL to set them
+.vendor = "Acme"
+.product = "Widget"
+.vendor_product = "Acme Widget"
+.category = ""
+.namespace = "default"
+
+# Spread ALL .udm fields to top level for clickhouse_mapping
+# This includes src_ip, action, user, category, user_type, etc.
+# Note: category from udm will override the default if parser sets it
+udm_keys, err = keys(udm_val)
+if err == null {
+for_each(udm_keys) -> |_idx, key| {
+if key != "timestamp" && key != "message" {
+val, get_err = get(udm_val, [key])
+if get_err == null && val != null {
+. = set!(., [key], val)
+}
+}
+}
+}
+'''
+
+[transforms.tenant__acme_app_sample]
+type = "sample"
+inputs = ["tenant__acme_app_output"]
+ratio = 0.5
+exclude = "to_bool(._nano_parser_failure) ?? false"
+

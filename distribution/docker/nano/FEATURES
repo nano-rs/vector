@@ -1,0 +1,56 @@
+# Cargo features for the nano-rs/vector image (NAN-3604): only the components nano ships or
+# renders, plus the runtime pieces they need. Built with --no-default-features.
+#
+# Derived from `scan-components.py` (see REBASE.md, "Component set"). The image's `vector list`
+# must equal COMPONENTS exactly; the nano-image workflow's parity job checks it.
+# One feature per line; `#` starts a comment. The Dockerfile joins the lines with commas.
+
+# --- runtime (the non-component part of upstream's target-<triple>-unknown-linux-gnu set) ---
+# GraphQL API + health endpoint: [api] enabled in the platform base; `vector top` / `vector tap`.
+api
+api-client
+# Allocator, as upstream's Linux release targets.
+tikv-jemallocator
+# Full VRL standard library (crypto, env, network, system functions): tenant parser VRL may use
+# any stdlib function, and the platform VRL uses get_env_var and sha2.
+vrl/stdlib
+# Parquet batch encoding of the Bronze sink (ocsf_parquet_bronze); brings codecs-arrow.
+codecs-parquet
+
+# --- sources ---
+# Pull sources (nanosiem tenant_bundle/pull.rs, nano-main pull-bundle.ts).
+sources-aws_s3
+sources-aws_sqs
+sources-azure_event_hubs
+sources-gcp_pubsub
+# Push ingest (platform base, cells, open core).
+sources-http_server
+sources-opentelemetry
+sources-splunk_hec
+sources-vector
+# Self-observability.
+sources-internal_logs
+sources-internal_metrics
+# Region log shipper DaemonSet (nano-main hosted-shared-region-log-shipping.ts).
+sources-kubernetes_logs
+# Test harnesses that run this image (pipe_native_tests.rs, verify-vector-generation-rollback.sh).
+sources-demo_logs
+sources-stdin
+
+# --- transforms ---
+transforms-dedupe
+transforms-filter
+transforms-metric_to_log
+transforms-remap
+transforms-route
+transforms-sample
+transforms-throttle
+transforms-trace_to_log
+
+# --- sinks ---
+sinks-aws_s3
+sinks-blackhole
+sinks-clickhouse
+sinks-console
+sinks-http
+sinks-prometheus
