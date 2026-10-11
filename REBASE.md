@@ -173,6 +173,10 @@ Cloudflare Containers cannot pull from GHCR. nano-main's roll step copies the pi
 digest into `registry.cloudflare.com` (`crane copy ghcr.io/nano-rs/vector@sha256:<amd64> …`);
 that step and its credentials belong to nano-main, not to this repository.
 
+Superseded images (tags kept, never consume):
+
+- `0.59.0-nano.2` = superseded (no kafka); do not use.
+
 ## Invariants
 
 - The crate version stays the upstream version (`0.59.0`); the nano suffix exists only in
