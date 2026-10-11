@@ -1,0 +1,35 @@
+# Parity config (NAN-3604): the classic / open-core source generator output
+# (nanosiem-core source_configs/service.rs generate_source_block + routing transform), rendered at
+# runtime from toml::Table. Synthetic placeholders only: .invalid hosts, inert credentials.
+# generate_kafka_source with SASL SCRAM + TLS (security.protocol = SASL_SSL) and a custom CA.
+
+[sources.parity_kafka_source]
+type = "kafka"
+bootstrap_servers = "broker-1.parity.invalid:9093,broker-2.parity.invalid:9093"
+topics = ["logs"]
+group_id = "nanosiem-01parity00000000000000000"
+auto_offset_reset = "latest"
+
+[sources.parity_kafka_source.sasl]
+enabled = true
+mechanism = "SCRAM-SHA-512"
+username = "parity-user"
+password = "parity-not-a-secret"
+
+[sources.parity_kafka_source.tls]
+enabled = true
+ca_file = "/etc/vector/source-creds/parity-kafka-ca.pem"
+
+[sources.parity_kafka_source.librdkafka_options]
+"security.protocol" = "SASL_SSL"
+
+[transforms.parity_kafka_route]
+type = "remap"
+inputs = ["parity_kafka_source"]
+source = '''
+.source_type = "parity_kafka_feed"
+'''
+
+[sinks.parity_out]
+type = "blackhole"
+inputs = ["parity_kafka_route"]

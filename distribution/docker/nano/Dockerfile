@@ -22,6 +22,8 @@ ARG DEBIAN_DIGEST=sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b
 
 FROM docker.io/rust:${RUST_VERSION}-trixie AS builder
 
+# cmake builds librdkafka from source for the kafka source (`rdkafka?/cmake_build` in FEATURES);
+# SASL PLAIN/SCRAM need only OpenSSL. libsasl2-dev is installed but GSSAPI is not enabled.
 COPY scripts/environment/install-debian-build-deps.sh scripts/environment/install-protoc.sh /tmp/
 RUN bash /tmp/install-debian-build-deps.sh && bash /tmp/install-protoc.sh /usr/local/bin
 
@@ -84,6 +86,6 @@ RUN chmod 0755 /etc/vector /etc/vector/examples && chmod 0644 /etc/vector/exampl
 
 # Smoke test
 RUN ["vector", "--version"]
-RUN vector list | grep -qx -- '- azure_event_hubs'
+RUN vector list | grep -qx -- '- azure_event_hubs' && vector list | grep -qx -- '- kafka'
 
 ENTRYPOINT ["/usr/bin/vector"]
