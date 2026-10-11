@@ -1,0 +1,77 @@
+# Parity config (NAN-3604): shaped like nanosiem tenant_bundle/pull.rs output. Sanitised:
+# coordinates that the Worker passes as env are literals here; credentials are inert.
+# Fork-only component: upstream Vector rejects this file (unknown source type).
+
+# Auth: managed identity; the container's IDENTITY_ENDPOINT handler serves broker-minted tokens.
+[sources.nano_pull_azure]
+type = "azure_event_hubs"
+namespace = "parity-ns.servicebus.windows.net"
+event_hub_name = "parity-hub"
+consumer_group = "nano"
+acknowledgements.enabled = true
+
+[sources.nano_pull_azure.auth]
+azure_credential_kind = "managed_identity"
+user_assigned_managed_identity_id = "00000000-0000-4000-8000-000000000003"
+
+[sources.nano_pull_azure.checkpoint_store]
+type = "azure_blob"
+account_name = "paritycheckpoints"
+container_name = "nano-checkpoints"
+
+[sources.nano_pull_azure.checkpoint_store.auth]
+azure_credential_kind = "managed_identity"
+user_assigned_managed_identity_id = "00000000-0000-4000-8000-000000000003"
+
+[transforms.nano_pull_azure_stamp]
+type = "remap"
+inputs = ["nano_pull_azure"]
+source = '''
+.source_type = "azure_activity"
+%source_type = "azure_activity"
+%tenant_id = "00000000-0000-4000-8000-000000000001"
+%nano_credential_id = "00000000-0000-4000-8000-000000000002"
+.auth_status = "authenticated"
+.content_format = "nano_pull_azure_event_hubs"
+.routing_timestamp = now()
+if !exists(.message) { .message = "" }
+if !is_object(.metadata) { .metadata = {} }
+.metadata.forwarded_via = "pull"
+'''
+
+# Bronze handoff, shaped like the platform base's ocsf_parquet_bronze sink (S3-compatible
+# object store, Parquet batches, end-to-end acknowledgements).
+[sinks.ocsf_parquet_bronze]
+type = "aws_s3"
+inputs = ["nano_pull_azure_stamp"]
+bucket = "parity-bronze"
+region = "auto"
+endpoint = "https://objects.parity.invalid"
+force_path_style = true
+auth.access_key_id = "parity-not-a-secret"
+auth.secret_access_key = "parity-not-a-secret"
+key_prefix = "bronze-v2/tenant_id={{ %tenant_id }}/"
+filename_extension = "parquet"
+filename_append_uuid = true
+acknowledgements.enabled = true
+encoding.codec = "json"
+batch.max_bytes = 33554432
+batch.max_events = 10000
+batch.timeout_secs = 1
+batch_encoding.codec = "parquet"
+batch_encoding.schema_mode = "auto_infer"
+batch_encoding.compression.algorithm = "zstd"
+batch_encoding.compression.level = 6
+request.retry_max_duration_secs = 300
+
+# Loss-accounting probe (nanosiem pull.rs render_loss_probe).
+[sources.nano_pull_loss_metrics]
+type = "internal_metrics"
+scrape_interval_secs = 10
+namespace = "nanosiem_pull"
+
+[sinks.nano_pull_loss_exporter]
+type = "prometheus_exporter"
+inputs = ["nano_pull_loss_metrics"]
+address = "0.0.0.0:9599"
+default_namespace = "nanosiem_pull"

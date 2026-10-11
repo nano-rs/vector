@@ -26,7 +26,8 @@ Every patch is a self-contained commit (squash-merge each PR), in this order:
    `changelog.d/4261_azure_event_hubs_source.feature.md`, emulator test config in
    `tests/integration/azure/config/`, and small hunks in `Cargo.toml` (dependencies and
    features), `src/sources/mod.rs` and `src/internal_events/mod.rs`.
-2. `chore(nano): fork tooling`: this file and `distribution/docker/nano/`.
+2. `chore(nano): fork tooling`: this file and `distribution/docker/nano/`; NAN-3604 added
+   `.github/workflows/nano-image.yml` and `distribution/docker/nano/parity/`.
 3. `chore(nano): neutralise upstream workflows` (NAN-3604): deletes every upstream file in
    `.github/workflows/` and `.github/dependabot.yml`. See "Upstream CI is removed".
 
@@ -125,17 +126,80 @@ mirrored branches; see the repository's Actions policy for how that is contained
 
 ## Cutting an image
 
+Images are built by GitHub Actions (`.github/workflows/nano-image.yml`) and pushed to
+`ghcr.io/nano-rs/vector`. Nothing builds on branch pushes or pull requests; an image is cut
+only by pushing an image tag or by a manual dispatch.
+
 `distribution/docker/nano/Dockerfile` builds a drop-in replacement for
 `timberio/vector:<version>-debian`: same Debian base and runtime packages, `/usr/bin/vector`
-as the entrypoint, `/etc/vector` and `/var/lib/vector` present. It compiles the upstream release
-feature set (`target-x86_64-unknown-linux-gnu`), which includes our sources.
+as the entrypoint, `/var/lib/vector` present, and `/etc/vector` holding exactly upstream's
+`examples/` and nothing else. It compiles upstream's release
+feature set for the platform (`target-x86_64-unknown-linux-gnu` on amd64,
+`target-aarch64-unknown-linux-gnu` on arm64), which includes our sources, with thin LTO and 16
+codegen units (`LTO=fat CODEGEN_UNITS=1` reproduces upstream's profile). It fails if
+`vector list` lacks `azure_event_hubs`.
+
+Version scheme: `<upstream version>-nano.<n>`, for example `0.59.0-nano.1`. `<n>` starts at 1
+and increments for every image cut from the same upstream version; the workflow refuses a
+version that does not start with the `Cargo.toml` version or that already exists in GHCR.
+The git tag is `image-<version>` (`image-0.59.0-nano.1`). The `image-` prefix keeps it clear
+of upstream's release tag filters (`v0.*`), which still exist on mirrored branches.
+
+1. Pick `n`: one more than the newest `0.59.0-nano.*` tag at
+   https://github.com/nano-rs/vector/pkgs/container/vector.
+2. Start the build, either way:
+
+   ```sh
+   git tag image-0.59.0-nano.2 origin/nano/v0.59 && git push origin image-0.59.0-nano.2
+   # or
+   gh workflow run nano-image.yml --repo nano-rs/vector --ref nano/v0.59 -f nano_rev=2
+   ```
+
+3. Wait (about 2-4 h; amd64 and arm64 build in parallel on native runners). The jobs:
+   build per arch (pushed untagged, by digest) -> multi-arch index tagged `sha-<12-char sha>`
+   -> parity on amd64 -> promote, which adds `<version>` and `<version>-debian` to the same
+   index. Parity checks that `vector --version` is the plain upstream version (see
+   "Invariants"), that `/etc/vector` is identical to upstream's, that `vector list`
+   equals upstream `timberio/vector:<version>-debian` plus exactly `sources/azure_event_hubs`,
+   and that every config under `distribution/docker/nano/parity/` passes
+   `vector validate --no-environment` (each top-level `*.toml` alone, each subdirectory as one
+   config; this parses, wires and compiles VRL but contacts no source or sink).
+4. Read the digests from the promote job's summary. Never consume a tag; tags are only for
+   humans.
+   - GHCR / Kubernetes: the multi-arch index, `ghcr.io/nano-rs/vector@sha256:…`.
+   - Cloudflare Containers: the **linux/amd64 single-platform manifest** digest, printed
+     separately. Cloudflare needs a linux/amd64 image and its acceptance of an OCI index is
+     undocumented, so nano-main copies and pins the amd64 manifest, not the index.
+
+Cloudflare Containers cannot pull from GHCR. nano-main's roll step copies the pinned amd64
+digest into `registry.cloudflare.com` (`crane copy ghcr.io/nano-rs/vector@sha256:<amd64> …`);
+that step and its credentials belong to nano-main, not to this repository.
+
+## Invariants
+
+- The crate version stays the upstream version (`0.59.0`); the nano suffix exists only in
+  image tags. `vector --version` must keep matching nanosiem's `VECTOR_VERSION_RE`
+  (`^vector \d+\.\d+\.\d+(\s|$)`), which refuses `0.59.0-nano.1`. Never bump `version` in
+  `Cargo.toml`; the image identity goes into `VECTOR_BUILD_DESC` (after the target triple).
+- `/etc/vector` in the image equals upstream's (only `examples/`). nano's entrypoints untar
+  the config bundle there and run `--config-dir /etc/vector`, so a default config in the image
+  would run alongside every tenant pipeline.
+- `vector list` is upstream's plus exactly the fork's components (`FORK_COMPONENTS` in the
+  workflow); add a component there in the same PR that adds it to the fork.
+
+Parity configs are sanitised copies of nanosiem's Vector configs (the platform base bundle in
+`platform-base/`, and pull sources shaped like `tenant_bundle/pull.rs` output in `pull-*.toml`):
+no secrets, env references replaced with literals. Refresh them when the platform bundle grows
+a component type that is not covered. When moving to a new upstream release, update
+`UPSTREAM_IMAGE` (tag and index digest) in the workflow.
+
+One-time setup per repository: Actions enabled with an allow-list that
+covers the actions the workflow pins, and the `vector` package's visibility set to public
+(the first push creates it private under the org).
+
+Local build, for debugging the Dockerfile only:
 
 ```sh
-TAG=0.59.0-nano.1-debian                   # <upstream version>-nano.<n>-debian
-docker build -f distribution/docker/nano/Dockerfile -t nano-vector:$TAG .
-docker run --rm nano-vector:$TAG --version
+docker build -f distribution/docker/nano/Dockerfile -t nano-vector:dev .
+docker run --rm nano-vector:dev --version
 ```
-
-`<n>` increments for every image cut from the same upstream version. The Dockerfile runs
-`vector list` during the build and fails if `azure_event_hubs` is missing. Pushing the image to
-a registry is a separate, deliberate step.
