@@ -9,6 +9,7 @@ Sources:
 - http_server
 - internal_logs
 - internal_metrics
+- kafka
 - kubernetes_logs
 - opentelemetry
 - splunk_hec
