@@ -14,7 +14,8 @@ does not ship (yet). Nothing here is pushed or proposed upstream unless we decid
 Branches are never force-pushed. Moving to a new upstream release creates a **new**
 `nano/vX.Y` branch; the old one stays as the rollback point for images built from it.
 
-GitHub Actions are disabled on the fork; no upstream workflow runs here.
+No upstream GitHub Actions workflow exists on a `nano/vX.Y` branch (see "Upstream CI is
+removed" below). Only the fork's own workflows (`.github/workflows/nano-*.yml`) run here.
 
 ## The patch series
 
@@ -26,6 +27,8 @@ Every patch is a self-contained commit (squash-merge each PR), in this order:
    `tests/integration/azure/config/`, and small hunks in `Cargo.toml` (dependencies and
    features), `src/sources/mod.rs` and `src/internal_events/mod.rs`.
 2. `chore(nano): fork tooling`: this file and `distribution/docker/nano/`.
+3. `chore(nano): neutralise upstream workflows` (NAN-3604): deletes every upstream file in
+   `.github/workflows/` and `.github/dependabot.yml`. See "Upstream CI is removed".
 
 Rules that keep rebases cheap:
 
@@ -44,6 +47,19 @@ OLD=v0.59.0 NEW=v0.60.0                       # example
 git switch -c nano/v0.60 "$NEW"
 # Replay our commits (oldest first) from the previous nano branch:
 git cherry-pick $(git rev-list --reverse "$OLD"..origin/nano/v0.59)
+```
+
+Re-delete upstream CI on the new branch. Replaying the deletion commit stops with
+modify/delete conflicts for every workflow upstream changed since the previous tag; resolve
+them all as deleted (`git rm` the listed paths, `git cherry-pick --continue`). That commit
+also only removes files that existed at the previous tag; the new tag may add workflows. Remove everything that is
+not ours, and fold it into the deletion commit's replay (or a follow-up `chore(nano)` commit):
+
+```sh
+git ls-files .github/workflows | grep -v '^.github/workflows/nano-' | xargs -r git rm -q
+git rm -q --ignore-unmatch .github/dependabot.yml
+git commit -m "chore(nano): neutralise upstream workflows of $NEW"   # if anything was left
+git ls-files .github/workflows   # must list only nano-*.yml
 ```
 
 Resolving conflicts:
@@ -77,6 +93,35 @@ gh repo edit nano-rs/vector --default-branch nano/v0.60
 `--no-default-features`; build the test binaries with `RUSTFLAGS="-A unused_imports"` for
 minimal-feature test runs (this replaces the `-D warnings` from `.cargo/config.toml`, so also run
 the `check --lib` above without it).
+
+## Upstream CI is removed
+
+Upstream's workflows are written for vectordotdev's infrastructure: they publish to its
+registries and package repositories, prune GHCR images, run nightly/regression/scorecard jobs on
+a schedule, label and comment on pull requests, and expect paid larger runners. With Actions
+enabled on this fork, any of them could run against our packages or spend our minutes. So on
+`nano/vX.Y` every upstream workflow file is deleted (NAN-3604), not disabled in place. They
+come back only through a rebase onto a new upstream tag, which is why the procedure above
+re-deletes them.
+
+Deleted from `nano/v0.59` (all 53 files at `v0.59.0`, plus `.github/dependabot.yml`):
+
+| Trigger (as shipped by upstream) | Workflows |
+| --- | --- |
+| `schedule` | `cleanup-ghcr-images`, `component_features`, `coverage`, `deny`, `k8s_e2e`, `nightly`, `regression`, `scorecard` |
+| `push` (branches/tags) | `check_generated_vrl_docs`, `release` (tag `v*`), `release_autotag`, `scorecard`, `static-analysis`, `vdev_autotag`, `vdev_publish`, `warm-cache` |
+| `pull_request`, `merge_group` | `changelog`, `check_generated_vrl_docs`, `deny`, `deprecation`, `integration`, `integration_windows`, `k8s_e2e`, `master_merge_queue`, `preview_site_trigger`, `protobuf`, `release_pr_check`, `spelling`, `test` |
+| `pull_request_target`, `pull_request_review`, `issue_comment` | `add_docs_review_label`, `check_docs_review`, `ci-integration-review`, `ci-review-trigger`, `cla`, `labeler`, `remove_waiting_author` |
+| `workflow_run` | `build_preview_sites`, `check_generated_vrl_docs_comment`, `release_unfreeze`, `remove_docs_review_label` |
+| `workflow_dispatch` / `workflow_call` only | `build-test-runner`, `changes`, `create_preview_sites`, `cross`, `custom_builds`, `install-sh`, `integration-test`, `msrv`, `publish`, `release_housekeeping`, `release_manifests`, `release_prepare`, `release_website`, `test-make-command`, `unit-tests`, `unit_mac`, `unit_windows` |
+
+Left in place because nothing triggers them on their own: `.github/actions/` (composite
+actions), `.github/labeler.yml`, `.github/actionlint.yaml`, issue/PR templates, `CODEOWNERS`.
+
+The fork also mirrors upstream's other branches (`master`, `dependabot/*`, contributor
+branches). Those still carry upstream's workflows, and a push to one of them (for example a
+"Sync fork" of `master`) would run its `push`/`pull_request` workflows. Do not push to
+mirrored branches; see the repository's Actions policy for how that is contained.
 
 ## Cutting an image
 
