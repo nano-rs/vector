@@ -1027,6 +1027,65 @@ mod integration_tests {
         }).await;
     }
 
+    /// Shutting down while an object's events are still unacknowledged downstream: its SQS
+    /// message is not deleted, and is released for immediate redelivery instead of staying
+    /// invisible for the visibility timeout.
+    #[tokio::test]
+    async fn s3_shutdown_releases_unacknowledged_message() {
+        let s3 = s3_client().await;
+        let sqs = sqs_client().await;
+        let queue = create_queue(&sqs).await;
+        let bucket = create_bucket(&s3).await;
+        let key = uuid::Uuid::new_v4().to_string();
+        s3.put_object()
+            .bucket(bucket.clone())
+            .key(key.clone())
+            .body(ByteStream::from(b"one\ntwo\n".to_vec()))
+            .send()
+            .await
+            .expect("Could not put object");
+        let notification = serde_json::json!({
+            "Records": [{
+                "eventVersion": "2.1",
+                "eventSource": "aws:s3",
+                "awsRegion": "us-east-1",
+                "eventTime": "2026-10-12T00:00:00.000Z",
+                "eventName": "ObjectCreated:Put",
+                "s3": {
+                    "s3SchemaVersion": "1.0",
+                    "configurationId": "test",
+                    "bucket": { "name": bucket, "arn": "arn:aws:s3:::test" },
+                    "object": { "key": key, "size": 8 }
+                }
+            }]
+        });
+        sqs.send_message()
+            .queue_url(queue.clone())
+            .message_body(notification.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        let mut config = config(&queue, None, false, DeserializerConfig::Bytes);
+        // Long enough that only a release can make the message visible during the test.
+        config.sqs.as_mut().unwrap().visibility_timeout_secs = 300;
+        let component = crate::config::ComponentKey::from("aws_s3");
+        let (tx, rx) = SourceSender::new_test();
+        let (cx, mut shutdown) = SourceContext::new_shutdown(&component, tx);
+        let source = config.build(cx).await.unwrap();
+        let handle = tokio::spawn(async move { source.await.unwrap() });
+
+        // Both lines arrive and are held, unacknowledged.
+        let held = collect_n(rx, 2).await;
+        assert_eq!(held.len(), 2);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        assert!(shutdown.shutdown_source(&component, deadline).await);
+        handle.await.unwrap();
+        drop(held);
+
+        assert_eq!(count_messages(&sqs, &queue, 0).await, 1);
+    }
+
     /// creates a new SQS queue
     ///
     /// returns the queue name

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     error::Error as _,
     future::Future,
     pin::Pin,
@@ -47,7 +48,7 @@ use crate::{
     gcp::{GcpAuthConfig, GcpAuthenticator, PUBSUB_URL, Scope},
     internal_events::{
         GcpPubsubConnectError, GcpPubsubReceiveError, GcpPubsubStreamingPullError,
-        StreamClosedError,
+        SourceMessagesReleased, StreamClosedError,
     },
     serde::{bool_or_struct, default_decoding, default_framing_message_based},
     shutdown::ShutdownSignal,
@@ -67,6 +68,92 @@ const MAX_ACK_DEADLINE_SECS: u64 = 600;
 const ACK_QUEUE_SIZE: usize = 8;
 
 type Finalizer = UnorderedFinalizer<Vec<String>>;
+
+/// How long a stream waits on shutdown for the acknowledgements of messages already sent
+/// downstream before it releases them for redelivery.
+const SHUTDOWN_ACK_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(15)
+};
+
+/// How long a stream waits on shutdown for the server to close it after the last
+/// acknowledgements and releases were sent, so that they are not lost with the connection.
+const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most ack IDs released in one request.
+const RELEASE_CHUNK_SIZE: usize = 250;
+
+/// An update sent on the streaming pull request stream.
+#[derive(Debug, PartialEq)]
+enum StreamUpdate {
+    /// Acknowledge these messages: they were delivered.
+    Ack(Vec<String>),
+    /// Set the ack deadline of these messages to zero, so that Pub/Sub redelivers them right away
+    /// instead of after the ack deadline. Used on shutdown for messages that were received but
+    /// not delivered; never for a message that is or will be acknowledged.
+    Release(Vec<String>),
+}
+
+/// The ack IDs of one stream that were sent downstream and whose acknowledgement (end-to-end
+/// delivery status) has not come back yet.
+#[derive(Debug, Default)]
+struct InFlight(HashSet<String>);
+
+impl InFlight {
+    fn add(&mut self, ids: &[String]) {
+        self.0.extend(ids.iter().cloned());
+    }
+
+    /// The finalizer reported these IDs (delivered or not); they are settled.
+    fn settle(&mut self, ids: &[String]) {
+        for id in ids {
+            self.0.remove(id);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Takes the IDs still unsettled. The caller must stop processing acknowledgements before
+    /// releasing them, so that no released ID is acknowledged afterwards.
+    fn take(&mut self) -> Vec<String> {
+        self.0.drain().collect()
+    }
+}
+
+/// Builds the request carrying a group of updates.
+fn update_request(updates: Vec<StreamUpdate>) -> proto::StreamingPullRequest {
+    let mut ack_ids = Vec::new();
+    let mut release_ids = Vec::new();
+    for update in updates {
+        match update {
+            StreamUpdate::Ack(ids) => ack_ids.extend(ids),
+            StreamUpdate::Release(ids) => release_ids.extend(ids),
+        }
+    }
+    proto::StreamingPullRequest {
+        ack_ids,
+        modify_deadline_seconds: vec![0; release_ids.len()],
+        modify_deadline_ack_ids: release_ids,
+        ..Default::default()
+    }
+}
+
+/// Why a stream's receive loop ended during shutdown.
+enum Drained {
+    /// Every message sent downstream was acknowledged.
+    Done,
+    /// The acknowledgements did not all come back in time.
+    TimedOut,
+    /// The stream ended; nothing more can be sent on it.
+    StreamEnded,
+}
 
 // https://github.com/hyperium/tonic/issues/1350
 #[allow(clippy::missing_const_for_fn)]
@@ -492,7 +579,7 @@ impl PubsubSource {
         // Tonic added a default of 4MB in 0.9. This replaces the old behavior.
         .max_decoding_message_size(usize::MAX);
 
-        let (ack_ids_sender, ack_ids_receiver) = mpsc::channel(ACK_QUEUE_SIZE);
+        let (ack_ids_sender, ack_ids_receiver) = mpsc::channel::<StreamUpdate>(ACK_QUEUE_SIZE);
 
         // Handle shutdown during startup, the streaming pull doesn't
         // start if there is no data in the subscription.
@@ -510,48 +597,76 @@ impl PubsubSource {
         };
         let mut stream = stream.into_inner();
 
-        let (finalizer, mut ack_stream) =
-            Finalizer::maybe_new(self.acknowledgements, Some(self.shutdown.clone()));
-        let mut pending_acks = 0;
+        // No shutdown signal here: on shutdown the loop below keeps reading acknowledgements
+        // until every message sent downstream is settled (or the drain times out).
+        let (finalizer, mut ack_stream) = Finalizer::maybe_new(self.acknowledgements, None);
+        let mut in_flight = InFlight::default();
+        let mut drain_deadline: Option<tokio::time::Instant> = None;
+        let mut released_on_receive = 0;
 
-        loop {
+        let drained = loop {
             tokio::select! {
                 biased;
                 receipts = ack_stream.next() => if let Some((status, receipts)) = receipts {
-                    pending_acks -= 1;
+                    in_flight.settle(&receipts);
                     if status == BatchStatus::Delivered {
                         ack_ids_sender
-                            .send(receipts)
+                            .send(StreamUpdate::Ack(receipts))
                             .await
                             .unwrap_or_else(|_| unreachable!("request stream never closes"));
                     }
+                    if drain_deadline.is_some() && in_flight.is_empty() {
+                        break Drained::Done;
+                    }
                 },
+                _ = &mut self.shutdown, if drain_deadline.is_none() => {
+                    if in_flight.is_empty() {
+                        break Drained::Done;
+                    }
+                    debug!(
+                        message = "Shutting down; waiting for acknowledgements.",
+                        in_flight = in_flight.len(),
+                    );
+                    drain_deadline = Some(tokio::time::Instant::now() + SHUTDOWN_ACK_TIMEOUT);
+                },
+                _ = tokio::time::sleep_until(drain_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                    if drain_deadline.is_some() => break Drained::TimedOut,
                 response = stream.next() => match response {
+                    // Shutting down: hand new messages straight back instead of processing them.
+                    Some(Ok(response)) if drain_deadline.is_some() => {
+                        let ids: Vec<String> = response
+                            .received_messages
+                            .into_iter()
+                            .map(|message| message.ack_id)
+                            .collect();
+                        released_on_receive += ids.len();
+                        send_release(&ack_ids_sender, ids).await;
+                    }
                     Some(Ok(response)) => {
                         self.handle_response(
                             response,
                             &finalizer,
                             &ack_ids_sender,
-                            &mut pending_acks,
+                            &mut in_flight,
                             busy_flag,
                         ).await;
                     }
-                    Some(Err(error)) => break translate_error(error),
-                    None => break State::RetryNow,
+                    Some(Err(_)) | None if drain_deadline.is_some() => break Drained::StreamEnded,
+                    Some(Err(error)) => return translate_error(error),
+                    None => return State::RetryNow,
                 },
-                _ = &mut self.shutdown, if pending_acks == 0 => return State::Shutdown,
-                _ = self.token_generator.changed() => {
+                _ = self.token_generator.changed(), if drain_deadline.is_none() => {
                     debug!("New authentication token generated, restarting stream.");
-                    break State::RetryNow;
+                    return State::RetryNow;
                 },
                 _ = tokio::time::sleep(self.keepalive) => {
-                    if pending_acks == 0 {
+                    if in_flight.is_empty() && drain_deadline.is_none() {
                         // No pending acks, and no new data, so drop
                         // this stream if we aren't the only active
                         // one.
                         if self.concurrency.load(Ordering::Relaxed) > 1 {
                             info!("Shutting down inactive stream.");
-                            break State::Shutdown;
+                            return State::Shutdown;
                         }
                         // Otherwise, mark this stream as idle.
                         busy_flag.store(false, Ordering::Relaxed);
@@ -564,17 +679,59 @@ impl PubsubSource {
                     // in a new request with empty fields, effectively
                     // a keepalive.
                     ack_ids_sender
-                        .send(Vec::new())
+                        .send(StreamUpdate::Ack(Vec::new()))
                         .await
                         .unwrap_or_else(|_| unreachable!("request stream never closes"));
                 }
             }
+        };
+
+        // Shutdown. Stop reading acknowledgements first: from here on, no ID is acknowledged, so
+        // releasing the unsettled ones cannot race an acknowledgement.
+        drop(ack_stream);
+        drop(finalizer);
+        let unsettled = in_flight.take();
+        let unsettled_count = unsettled.len();
+        let stream_ended = matches!(drained, Drained::StreamEnded);
+        if !stream_ended {
+            send_release(&ack_ids_sender, unsettled).await;
         }
+        // Closing the request side makes the server end the stream once it has processed the
+        // acknowledgements and releases sent so far. Wait for that, briefly.
+        drop(ack_ids_sender);
+        let mut late = 0;
+        if !stream_ended {
+            let flush = async {
+                while let Some(Ok(response)) = stream.next().await {
+                    late += response.received_messages.len();
+                }
+            };
+            if tokio::time::timeout(SHUTDOWN_FLUSH_TIMEOUT, flush)
+                .await
+                .is_err()
+            {
+                debug!("Timed out waiting for the streaming pull to close.");
+            }
+        }
+        let (released, not_released) = if stream_ended {
+            (released_on_receive, unsettled_count + late)
+        } else {
+            (released_on_receive + unsettled_count, late)
+        };
+        if released + not_released > 0 {
+            emit!(SourceMessagesReleased {
+                component_type: "gcp_pubsub",
+                released,
+                not_released,
+                timed_out: matches!(drained, Drained::TimedOut),
+            });
+        }
+        State::Shutdown
     }
 
     fn request_stream(
         &self,
-        ack_ids: mpsc::Receiver<Vec<String>>,
+        ack_ids: mpsc::Receiver<StreamUpdate>,
     ) -> impl Stream<Item = proto::StreamingPullRequest> + 'static + use<> {
         let subscription = self.subscription.clone();
         let client_id = CLIENT_ID.clone();
@@ -591,25 +748,20 @@ impl PubsubSource {
                 ..Default::default()
             }
         })
-        .chain(ack_ids.map(|chunks| {
-            // These "requests" serve only to send updates about
-            // acknowledgements to the server. None of the above
-            // fields need to be repeated and, in fact, will cause
-            // an stream error and cancellation if they are
-            // present.
-            proto::StreamingPullRequest {
-                ack_ids: chunks.into_iter().flatten().collect(),
-                ..Default::default()
-            }
-        }))
+        // These "requests" serve only to send updates about
+        // acknowledgements (and, on shutdown, releases) to the server.
+        // None of the above fields need to be repeated and, in fact,
+        // will cause an stream error and cancellation if they are
+        // present.
+        .chain(ack_ids.map(update_request))
     }
 
     async fn handle_response(
         &mut self,
         response: proto::StreamingPullResponse,
         finalizer: &Option<Finalizer>,
-        ack_ids: &mpsc::Sender<Vec<String>>,
-        pending_acks: &mut usize,
+        ack_ids: &mpsc::Sender<StreamUpdate>,
+        in_flight: &mut InFlight,
         busy_flag: &Arc<AtomicBool>,
     ) {
         if response.received_messages.len() >= self.full_response_size {
@@ -625,15 +777,15 @@ impl PubsubSource {
             Err(_) => emit!(StreamClosedError { count }),
             Ok(()) => match notifier {
                 None => ack_ids
-                    .send(ids)
+                    .send(StreamUpdate::Ack(ids))
                     .await
                     .unwrap_or_else(|_| unreachable!("request stream never closes")),
                 Some(notifier) => {
+                    in_flight.add(&ids);
                     finalizer
                         .as_ref()
                         .expect("Finalizer must have been set up for acknowledgements")
                         .add(ids, notifier);
-                    *pending_acks += 1;
                 }
             },
         }
@@ -701,6 +853,20 @@ impl PubsubSource {
             }
             event
         })
+    }
+}
+
+/// Sends a release for `ids`, in chunks. Best effort: if the request stream is gone, the messages
+/// are redelivered when their ack deadline expires, as before.
+async fn send_release(sender: &mpsc::Sender<StreamUpdate>, ids: Vec<String>) {
+    for chunk in ids.chunks(RELEASE_CHUNK_SIZE) {
+        if sender
+            .send(StreamUpdate::Release(chunk.to_vec()))
+            .await
+            .is_err()
+        {
+            break;
+        }
     }
 }
 
@@ -830,6 +996,338 @@ mod tests {
         .with_event_field(&owned_value_path!("message_id"), Kind::bytes(), None);
 
         assert_eq!(definitions, Some(expected_definition));
+    }
+}
+
+/// Shutdown with messages received but not acknowledged, against a fake Pub/Sub server that
+/// records every acknowledgement and deadline modification it receives.
+#[cfg(test)]
+mod shutdown_release_tests {
+    use std::{collections::HashMap, sync::Mutex};
+
+    use tokio::time::Instant;
+    use tonic::transport::Server;
+    use vector_lib::{event::EventStatus, finalization::Finalizable};
+
+    use super::{
+        proto::{
+            PubsubMessage, ReceivedMessage, StreamingPullRequest, StreamingPullResponse,
+            subscriber_server::{Subscriber, SubscriberServer},
+        },
+        *,
+    };
+    use crate::{
+        config::ComponentKey, shutdown::SourceShutdownCoordinator, test_util::addr::next_addr,
+    };
+
+    #[derive(Default)]
+    struct Recorded {
+        acks: Vec<String>,
+        /// (ack id, new deadline)
+        modacks: Vec<(String, i32)>,
+        /// The open stream's sender, for responses pushed by the test.
+        outbound: Option<mpsc::Sender<Result<StreamingPullResponse, Status>>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakePubsub(Arc<Mutex<Recorded>>);
+
+    #[tonic::async_trait]
+    impl Subscriber for FakePubsub {
+        type StreamingPullStream = ReceiverStream<Result<StreamingPullResponse, Status>>;
+
+        async fn streaming_pull(
+            &self,
+            request: tonic::Request<tonic::Streaming<StreamingPullRequest>>,
+        ) -> Result<tonic::Response<Self::StreamingPullStream>, Status> {
+            let (tx, rx) = mpsc::channel(16);
+            self.0.lock().unwrap().outbound = Some(tx);
+            let recorded = Arc::clone(&self.0);
+            let mut inbound = request.into_inner();
+            tokio::spawn(async move {
+                while let Some(Ok(request)) = inbound.next().await {
+                    let mut recorded = recorded.lock().unwrap();
+                    recorded.acks.extend(request.ack_ids);
+                    assert_eq!(
+                        request.modify_deadline_ack_ids.len(),
+                        request.modify_deadline_seconds.len()
+                    );
+                    recorded.modacks.extend(
+                        request
+                            .modify_deadline_ack_ids
+                            .into_iter()
+                            .zip(request.modify_deadline_seconds),
+                    );
+                }
+                // The client closed its side: end the stream, as Pub/Sub does.
+                recorded.lock().unwrap().outbound = None;
+            });
+            Ok(tonic::Response::new(ReceiverStream::new(rx)))
+        }
+    }
+
+    impl FakePubsub {
+        async fn send(&self, ids: &[&str]) {
+            let response = StreamingPullResponse {
+                received_messages: ids
+                    .iter()
+                    .map(|id| ReceivedMessage {
+                        ack_id: id.to_string(),
+                        message: Some(PubsubMessage {
+                            data: id.as_bytes().to_vec().into(),
+                            message_id: id.to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let sender = self
+                .0
+                .lock()
+                .unwrap()
+                .outbound
+                .clone()
+                .expect("stream open");
+            sender.send(Ok(response)).await.unwrap();
+        }
+
+        fn acks(&self) -> Vec<String> {
+            self.0.lock().unwrap().acks.clone()
+        }
+
+        fn modacks(&self) -> Vec<(String, i32)> {
+            self.0.lock().unwrap().modacks.clone()
+        }
+
+        async fn wait_for(&self, what: &str, condition: impl Fn(&Recorded) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !condition(&self.0.lock().unwrap()) {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    struct Harness {
+        _port: crate::test_util::addr::PortGuard,
+        server: FakePubsub,
+        events: SourceSenderStream,
+        shutdown: SourceShutdownCoordinator,
+        component: ComponentKey,
+        source: tokio::task::JoinHandle<()>,
+    }
+
+    type SourceSenderStream = std::pin::Pin<Box<dyn Stream<Item = Event> + Send>>;
+
+    async fn start() -> Harness {
+        let server = FakePubsub::default();
+        let (port, addr) = next_addr();
+        let service = SubscriberServer::new(server.clone());
+        tokio::spawn(Server::builder().add_service(service).serve(addr));
+
+        let (tx, rx) = SourceSender::new_test();
+        let component = ComponentKey::from("gcp_pubsub");
+        // Parsed, so that every option has its real default (ack deadline 600 s etc.).
+        let config: PubsubConfig = toml::from_str(&format!(
+            r#"
+            project = "project"
+            subscription = "subscription"
+            endpoint = "http://{addr}"
+            skip_authentication = true
+            "#
+        ))
+        .unwrap();
+        let (mut cx, shutdown) = SourceContext::new_shutdown(&component, tx);
+        cx.acknowledgements = true;
+        // The server may take a moment to listen; the source retries connecting.
+        let source = config.build(cx).await.expect("build source");
+        let source = tokio::spawn(async move { source.await.expect("source failed") });
+        server
+            .wait_for("the streaming pull", |r| r.outbound.is_some())
+            .await;
+        Harness {
+            _port: port,
+            server,
+            events: Box::pin(rx),
+            shutdown,
+            component,
+            source,
+        }
+    }
+
+    impl Harness {
+        /// Receives `count` events, keyed by message ID.
+        async fn receive(&mut self, count: usize) -> HashMap<String, Event> {
+            let mut events = HashMap::new();
+            for _ in 0..count {
+                let event = tokio::time::timeout(Duration::from_secs(10), self.events.next())
+                    .await
+                    .expect("timed out receiving")
+                    .expect("stream ended");
+                let id = event
+                    .as_log()
+                    .get_message()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                events.insert(id, event);
+            }
+            events
+        }
+
+        /// Shuts the source down and waits for it to finish.
+        async fn shut_down(mut self) -> FakePubsub {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            assert!(
+                self.shutdown
+                    .shutdown_source(&self.component, deadline)
+                    .await,
+                "source did not shut down in time"
+            );
+            self.source.await.unwrap();
+            self.server
+        }
+    }
+
+    fn deliver(event: Event) {
+        let mut event = event;
+        event
+            .take_finalizers()
+            .update_status(EventStatus::Delivered);
+    }
+
+    fn sorted(mut ids: Vec<String>) -> Vec<String> {
+        ids.sort();
+        ids
+    }
+
+    /// Delivered messages are acknowledged; the ones still in flight at shutdown are released
+    /// with a zero deadline, each exactly once, and never acknowledged.
+    #[tokio::test]
+    async fn shutdown_releases_in_flight_messages_and_acks_delivered_ones() {
+        let mut harness = start().await;
+        harness.server.send(&["a0", "a1", "a2"]).await;
+        harness.server.send(&["b0", "b1"]).await;
+        let mut events = harness.receive(5).await;
+        for id in ["a0", "a1", "a2"] {
+            deliver(events.remove(id).unwrap());
+        }
+        harness
+            .server
+            .wait_for("the acks", |r| r.acks.len() == 3)
+            .await;
+
+        // b0 and b1 are still held downstream when the source shuts down.
+        let started = Instant::now();
+        let server = harness.shut_down().await;
+        drop(events);
+
+        assert_eq!(sorted(server.acks()), vec!["a0", "a1", "a2"]);
+        let modacks = server.modacks();
+        assert_eq!(
+            sorted(modacks.iter().map(|(id, _)| id.clone()).collect()),
+            vec!["b0", "b1"]
+        );
+        assert!(
+            modacks.iter().all(|(_, deadline)| *deadline == 0),
+            "{modacks:?}"
+        );
+        // It waited for the acknowledgements, but not the whole ack deadline.
+        assert!(started.elapsed() >= SHUTDOWN_ACK_TIMEOUT);
+        assert!(
+            started.elapsed()
+                < SHUTDOWN_ACK_TIMEOUT + SHUTDOWN_FLUSH_TIMEOUT + Duration::from_secs(5)
+        );
+    }
+
+    /// An acknowledgement that comes back during the drain is still sent as an ack, and that
+    /// message is not released.
+    #[tokio::test]
+    async fn acknowledgements_during_the_drain_are_acked_not_released() {
+        let mut harness = start().await;
+        // Separate responses: a response is one acknowledgement batch.
+        harness.server.send(&["c0"]).await;
+        harness.server.send(&["c1"]).await;
+        let mut events = harness.receive(2).await;
+        let c0 = events.remove("c0").unwrap();
+        let c1 = events.remove("c1").unwrap();
+        let shutdown = tokio::spawn(harness.shut_down());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        deliver(c0);
+        let server = shutdown.await.unwrap();
+        drop(c1);
+
+        assert_eq!(server.acks(), vec!["c0"]);
+        assert_eq!(server.modacks(), vec![("c1".to_string(), 0)]);
+    }
+
+    /// Messages that arrive after shutdown started are handed straight back, not processed.
+    #[tokio::test]
+    async fn messages_received_while_draining_are_released_unprocessed() {
+        let mut harness = start().await;
+        harness.server.send(&["d0"]).await;
+        let held = harness.receive(1).await;
+        let server = harness.server.clone();
+        let mut events = std::mem::replace(&mut harness.events, Box::pin(futures::stream::empty()));
+        let shutdown = tokio::spawn(harness.shut_down());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        server.send(&["e0", "e1"]).await;
+        let server = shutdown.await.unwrap();
+        drop(held);
+
+        assert!(server.acks().is_empty());
+        assert_eq!(
+            sorted(server.modacks().into_iter().map(|(id, _)| id).collect()),
+            vec!["d0", "e0", "e1"]
+        );
+        // e0 and e1 never reached the pipeline.
+        assert!(events.next().now_or_never().flatten().is_none());
+    }
+
+    /// With everything acknowledged, shutdown releases nothing and does not wait.
+    #[tokio::test]
+    async fn shutdown_with_nothing_in_flight_releases_nothing() {
+        let mut harness = start().await;
+        harness.server.send(&["f0"]).await;
+        let mut events = harness.receive(1).await;
+        deliver(events.remove("f0").unwrap());
+        harness
+            .server
+            .wait_for("the ack", |r| r.acks.len() == 1)
+            .await;
+        let started = Instant::now();
+        let server = harness.shut_down().await;
+        assert!(started.elapsed() < SHUTDOWN_ACK_TIMEOUT);
+        assert_eq!(server.acks(), vec!["f0"]);
+        assert!(server.modacks().is_empty());
+    }
+
+    #[test]
+    fn in_flight_settles_and_takes() {
+        let mut in_flight = InFlight::default();
+        in_flight.add(&["a".into(), "b".into(), "c".into()]);
+        in_flight.settle(&["b".into()]);
+        assert_eq!(in_flight.len(), 2);
+        let mut taken = in_flight.take();
+        taken.sort();
+        assert_eq!(taken, vec!["a", "c"]);
+        assert!(in_flight.is_empty());
+    }
+
+    #[test]
+    fn update_request_combines_acks_and_releases() {
+        let request = update_request(vec![
+            StreamUpdate::Ack(vec!["a".into()]),
+            StreamUpdate::Release(vec!["r1".into(), "r2".into()]),
+            StreamUpdate::Ack(vec!["b".into()]),
+        ]);
+        assert_eq!(request.ack_ids, vec!["a", "b"]);
+        assert_eq!(request.modify_deadline_ack_ids, vec!["r1", "r2"]);
+        assert_eq!(request.modify_deadline_seconds, vec![0, 0]);
+        assert!(request.subscription.is_empty());
+        assert_eq!(request.stream_ack_deadline_seconds, 0);
     }
 }
 

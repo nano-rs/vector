@@ -6,13 +6,14 @@ use aws_sdk_sqs::{
 };
 use chrono::{DateTime, TimeZone, Utc};
 use futures::{FutureExt, StreamExt};
-use tokio::{pin, select};
+use tokio::select;
 use vector_lib::{
     config::LogNamespace,
     finalizer::UnorderedFinalizer,
     internal_event::{EventsReceived, Registered},
 };
 
+use super::release::{self, InFlight, SHUTDOWN_ACK_TIMEOUT, SqsRelease};
 use crate::{
     SourceSender,
     codecs::Decoder,
@@ -45,35 +46,54 @@ pub struct SqsSource {
 impl SqsSource {
     pub async fn run(self, out: SourceSender, shutdown: ShutdownSignal) -> Result<(), ()> {
         let mut task_handles = vec![];
+        // Receipts of messages received and not yet deleted (only tracked with `delete_message`).
+        // On shutdown, whatever is left in it is released for immediate redelivery.
+        let in_flight = InFlight::default();
+        let mut ack_task = None;
         let finalizer = self.acknowledgements.then(|| {
-            let (finalizer, mut ack_stream) = Finalizer::new(Some(shutdown.clone()));
+            // No shutdown signal: after the receiving tasks stop, the acknowledgements of the
+            // messages already sent downstream are still awaited (for a bounded time, below).
+            let (finalizer, mut ack_stream) = Finalizer::new(None);
             let client = self.client.clone();
             let queue_url = self.queue_url.clone();
-            crate::spawn_in_current_span(async move {
+            let in_flight = in_flight.clone();
+            ack_task = Some(crate::spawn_in_current_span(async move {
                 while let Some((status, receipts)) = ack_stream.next().await {
+                    // Settled either way. Removed before the delete is sent, so a message is
+                    // never both deleted and released.
+                    in_flight.remove(&receipts);
                     if status == BatchStatus::Delivered {
                         delete_messages(client.clone(), receipts, queue_url.clone()).await;
                     }
                 }
-            });
+            }));
             Arc::new(finalizer)
         });
         let events_received = register!(EventsReceived);
 
         for _ in 0..self.concurrency {
             let source = self.clone();
-            let shutdown = shutdown.clone().fuse();
+            let shutdown = shutdown.clone();
             let mut out = out.clone();
             let finalizer = finalizer.clone();
             let events_received = events_received.clone();
+            let in_flight = in_flight.clone();
             task_handles.push(crate::spawn_in_current_span(async move {
                 let finalizer = finalizer.as_ref();
-                pin!(shutdown);
-                loop {
-                    select! {
-                        _ = &mut shutdown => break,
-                        _ = source.run_once(&mut out, finalizer, events_received.clone()) => {},
-                    }
+                // Shutdown is checked between polls rather than cancelling one: a long poll
+                // abandoned client-side can still be answered server-side, leaving its messages
+                // invisible for the whole visibility timeout. So a poll in progress at shutdown
+                // completes (within `poll_secs`), and what it received is released.
+                while shutdown.clone().now_or_never().is_none() {
+                    source
+                        .run_once(
+                            &mut out,
+                            finalizer,
+                            &in_flight,
+                            events_received.clone(),
+                            &shutdown,
+                        )
+                        .await;
                 }
             }));
         }
@@ -87,6 +107,31 @@ impl SqsSource {
                 panic::resume_unwind(e.into_panic());
             }
         }
+
+        // Shutdown. Closing the finalizer ends the acknowledgement stream once the batches already
+        // sent downstream are settled; wait for that, but not for long.
+        drop(finalizer);
+        let mut ack_wait_timed_out = false;
+        if let Some(mut ack_task) = ack_task
+            && tokio::time::timeout(SHUTDOWN_ACK_TIMEOUT, &mut ack_task)
+                .await
+                .is_err()
+        {
+            // Stop deleting before releasing: nothing taken below can be deleted afterwards.
+            ack_task.abort();
+            _ = ack_task.await;
+            ack_wait_timed_out = true;
+        }
+        release::release(
+            "aws_sqs",
+            &SqsRelease {
+                client: &self.client,
+                queue_url: &self.queue_url,
+            },
+            in_flight.take(),
+            ack_wait_timed_out,
+        )
+        .await;
         Ok(())
     }
 
@@ -94,7 +139,9 @@ impl SqsSource {
         &self,
         out: &mut SourceSender,
         finalizer: Option<&Arc<Finalizer>>,
+        in_flight: &InFlight,
         events_received: Registered<EventsReceived>,
+        shutdown: &ShutdownSignal,
     ) {
         let result = self
             .client
@@ -156,8 +203,24 @@ impl SqsSource {
             }
             drop(batch); // Drop last reference to batch acknowledgement finalizer
             let count = events.len();
+            // Tracked from now until deleted (or settled without delivery). If the source stops
+            // in between, these are released on shutdown.
+            if self.delete_message {
+                in_flight.insert(&receipts_to_ack);
+            }
+            // Received during shutdown: not sent downstream, released instead (above).
+            if shutdown.clone().now_or_never().is_some() {
+                return;
+            }
 
-            match out.send_batch(events).await {
+            // A send blocked on backpressure is abandoned on shutdown; its receipts are still
+            // in flight, so they are released.
+            let sent = select! {
+                biased;
+                sent = out.send_batch(events) => sent,
+                _ = shutdown.clone() => return,
+            };
+            match sent {
                 Ok(()) => {
                     if self.delete_message {
                         match batch_receiver {
@@ -165,6 +228,7 @@ impl SqsSource {
                                 .expect("Finalizer must exist for the batch receiver to be created")
                                 .add(receipts_to_ack, receiver),
                             None => {
+                                in_flight.remove(&receipts_to_ack);
                                 delete_messages(
                                     self.client.clone(),
                                     receipts_to_ack,

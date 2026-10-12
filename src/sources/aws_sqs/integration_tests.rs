@@ -124,3 +124,108 @@ pub(crate) async fn test() {
 fn calculate_message(index: u32) -> String {
     format!("Test message: {index}")
 }
+
+/// Starts the source with end-to-end acknowledgements, receives `count` events, and returns them
+/// unacknowledged with the means to shut the source down.
+async fn start_holding(
+    queue_url: &str,
+    count: usize,
+) -> (
+    Vec<Event>,
+    crate::shutdown::SourceShutdownCoordinator,
+    crate::config::ComponentKey,
+    tokio::task::JoinHandle<()>,
+) {
+    let config = AwsSqsConfig {
+        region: RegionOrEndpoint::with_both("us-east-1", sqs_address().as_str()),
+        auth: AwsAuthentication::test_auth(),
+        queue_url: queue_url.to_string(),
+        poll_secs: 1,
+        ..Default::default()
+    };
+    let component = crate::config::ComponentKey::from("aws_sqs");
+    let (tx, rx) = SourceSender::new_test();
+    let (mut cx, shutdown) = SourceContext::new_shutdown(&component, tx);
+    cx.acknowledgements = true;
+    let source = config.build(cx).await.unwrap();
+    let handle = tokio::spawn(async move { source.await.unwrap() });
+    let events: Vec<Event> = timeout(Duration::from_secs(10), rx.take(count).collect())
+        .await
+        .unwrap();
+    (events, shutdown, component, handle)
+}
+
+async fn shut_down(
+    mut shutdown: crate::shutdown::SourceShutdownCoordinator,
+    component: &crate::config::ComponentKey,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    assert!(shutdown.shutdown_source(component, deadline).await);
+    handle.await.unwrap();
+}
+
+/// Messages visible right now (not waiting out a visibility timeout).
+async fn visible_now(queue_url: &str, client: &aws_sdk_sqs::Client) -> Vec<String> {
+    let mut bodies = Vec::new();
+    loop {
+        let output = client
+            .receive_message()
+            .queue_url(queue_url)
+            .max_number_of_messages(10)
+            .wait_time_seconds(0)
+            .send()
+            .await
+            .unwrap();
+        let messages = output.messages.unwrap_or_default();
+        if messages.is_empty() {
+            break;
+        }
+        bodies.extend(messages.into_iter().filter_map(|m| m.body));
+    }
+    bodies.sort();
+    bodies
+}
+
+/// Shutting down with messages sent downstream but not acknowledged: they are neither deleted
+/// nor left invisible for the visibility timeout (300 s by default), but released at once.
+#[tokio::test]
+async fn shutdown_releases_unacknowledged_messages() {
+    let sqs_client = get_sqs_client().await;
+    let queue_url = ensure_queue(&gen_queue_name(), &sqs_client)
+        .await
+        .queue_url
+        .unwrap();
+    send_test_events(3, &queue_url, &sqs_client).await;
+
+    let (held, shutdown, component, handle) = start_holding(&queue_url, 3).await;
+    shut_down(shutdown, &component, handle).await;
+    drop(held);
+
+    let mut expected: Vec<String> = (0..3).map(calculate_message).collect();
+    expected.sort();
+    assert_eq!(visible_now(&queue_url, &sqs_client).await, expected);
+}
+
+/// Acknowledged messages are deleted as before, and nothing is released.
+#[tokio::test]
+async fn shutdown_deletes_acknowledged_messages() {
+    use vector_lib::{event::EventStatus, finalization::Finalizable};
+
+    let sqs_client = get_sqs_client().await;
+    let queue_url = ensure_queue(&gen_queue_name(), &sqs_client)
+        .await
+        .queue_url
+        .unwrap();
+    send_test_events(3, &queue_url, &sqs_client).await;
+
+    let (held, shutdown, component, handle) = start_holding(&queue_url, 3).await;
+    for mut event in held {
+        event
+            .take_finalizers()
+            .update_status(EventStatus::Delivered);
+    }
+    shut_down(shutdown, &component, handle).await;
+
+    assert!(visible_now(&queue_url, &sqs_client).await.is_empty());
+}
