@@ -46,6 +46,10 @@ pub(crate) const MAX_POLL_WAIT_SECS: u32 = if cfg!(test) { 1 } else { POLL_WAIT_
 const POLL_WAIT_CAP_SECS: u32 = 5;
 
 const _: () = assert!((POLL_WAIT_CAP_SECS as u64) + 1 < SHUTDOWN_ACK_WAIT.as_secs());
+// The acknowledgement wait and the release fit the graceful shutdown limit, with margin.
+const _: () = assert!(
+    SHUTDOWN_ACK_WAIT.as_secs() + RELEASE_WAIT.as_secs() + 2 <= GRACEFUL_SHUTDOWN_LIMIT.as_secs()
+);
 // The same ordering in tests: polls end well before the acknowledgement wait does.
 const _: () = assert!((MAX_POLL_WAIT_SECS as u64) + 1 < SHUTDOWN_ACK_TIMEOUT.as_secs());
 
