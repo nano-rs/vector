@@ -9,12 +9,18 @@
 //!   --lib sources::azure_event_hubs::integration_tests
 //! ```
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use azure_core::http::Url;
 use azure_messaging_eventhubs::{EventDataBatchOptions, ProducerClient, models::EventData};
 use futures::{Stream, StreamExt};
-use vector_lib::{config::LogNamespace, event::EventStatus, shutdown::ShutdownSignal};
+use vector_lib::{
+    config::LogNamespace, event::EventStatus, finalization::Finalizable, shutdown::ShutdownSignal,
+};
 
 use super::{
     AzureEventHubsSourceConfig, CheckpointStoreConfig, StartPositionConfig,
@@ -151,7 +157,7 @@ async fn run_source(
     out: SourceSender,
     rx: impl Stream<Item = Event> + Unpin,
     run: &str,
-    stop: impl Fn(usize) -> bool,
+    stop: impl Fn(&[String]) -> bool,
 ) -> Vec<String> {
     let (trigger, shutdown, done) = ShutdownSignal::new_wired();
     let mut cx = SourceContext::new_test(out, None);
@@ -163,7 +169,7 @@ async fn run_source(
     let mut rx = rx;
     let mut messages = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    while !stop(messages.len()) {
+    while !stop(&messages) {
         match tokio::time::timeout_at(deadline, rx.next()).await {
             Ok(Some(event)) => {
                 let message = message(&event);
@@ -209,7 +215,7 @@ async fn azure_event_hubs_delivers_all_events_and_resumes_from_checkpoints() {
     let first = produce(hub, &run, 200).await;
     let received = assert_source_compliance(&SOURCE_TAGS, async {
         let (tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
-        run_source(&config, tx, rx, &run, |n| n >= first.len()).await
+        run_source(&config, tx, rx, &run, |m| m.len() >= first.len()).await
     })
     .await;
     assert_eq!(received.len(), first.len());
@@ -218,8 +224,37 @@ async fn azure_event_hubs_delivers_all_events_and_resumes_from_checkpoints() {
     // Second pass: after a restart, only the new events are read: the checkpoints hold.
     let second = produce(hub, &run, 100).await;
     let (tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
-    let received = run_source(&config, tx, rx, &run, |n| n >= second.len()).await;
+    let received = run_source(&config, tx, rx, &run, |m| m.len() >= second.len()).await;
     assert_exactly_once(&second, &received);
+}
+
+/// Acknowledges every event as delivered, except the first delivery of `fail`, which errors.
+///
+/// Keyed on the event's content rather than its arrival index: with `start_position = "earliest"`
+/// and a fresh checkpoint container, the source first re-reads whatever earlier runs left in the
+/// hub (the emulator retains events for an hour), so an index would usually hit another run's
+/// event (NAN-3706).
+fn fail_once(
+    rx: impl Stream<Item = Event> + Unpin,
+    fail: String,
+) -> impl Stream<Item = Event> + Unpin {
+    let mut failed = false;
+    rx.map(move |mut event| {
+        let status = if !failed && message(&event) == fail {
+            failed = true;
+            EventStatus::Errored
+        } else {
+            EventStatus::Delivered
+        };
+        event.take_finalizers().update_status(status);
+        event
+    })
+}
+
+/// Whether every one of `expected` is in `received`.
+fn received_all(expected: &[String], received: &[String]) -> bool {
+    let received: HashSet<&String> = received.iter().collect();
+    expected.iter().all(|body| received.contains(body))
 }
 
 #[tokio::test]
@@ -231,17 +266,30 @@ async fn azure_event_hubs_replays_after_failed_delivery() {
     let run = random_string(10);
     let produced = produce(hub, &run, 100).await;
 
-    // The 10th batch fails downstream: its partition is replayed from the last acknowledged event,
-    // so every event still arrives at least once.
-    let (tx, rx) = SourceSender::new_test_errors(|i| i == 10);
-    let received = run_source(&config, tx, rx, &run, |n| n >= produced.len() + 1).await;
-    let distinct: std::collections::HashSet<_> = received.iter().collect();
-    assert_eq!(distinct.len(), produced.len());
+    // One event of this run fails downstream: its partition is replayed from the last
+    // acknowledged event, so the failed event arrives again and every event at least once.
+    // Stop on content, not on a count: replayed duplicates arrive while the other partition is
+    // still delivering, so a count can be reached with events still missing.
+    let fail = produced[10].clone();
+    let (tx, rx) = SourceSender::new_test();
+    let rx = fail_once(rx, fail.clone());
+    let received = run_source(&config, tx, rx, &run, |m| {
+        received_all(&produced, m) && m.iter().filter(|body| **body == fail).count() >= 2
+    })
+    .await;
+    for body in &produced {
+        assert!(received.contains(body), "missing event {body}");
+    }
+    assert!(
+        received.iter().filter(|body| **body == fail).count() >= 2,
+        "the failed event was not replayed"
+    );
 
-    // After a restart nothing is lost and nothing old is re-read beyond what was in flight.
+    // After a restart nothing is lost. Events still in flight at the shutdown above are read
+    // again, so this run can also see some of `produced`.
     let more = produce(hub, &run, 20).await;
     let (tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
-    let received = run_source(&config, tx, rx, &run, |n| n >= more.len()).await;
+    let received = run_source(&config, tx, rx, &run, |m| received_all(&more, m)).await;
     for body in &more {
         assert!(received.contains(body), "missing event {body}");
     }
@@ -323,7 +371,7 @@ async fn azure_event_hubs_latest_restart_while_idle_skips_nothing() {
             history_tx.unbounded_send(message).unwrap();
         }
     });
-    let received = run_source(&config, tx, rx, &run, |n| n >= while_down.len()).await;
+    let received = run_source(&config, tx, rx, &run, |m| m.len() >= while_down.len()).await;
     assert_exactly_once(&while_down, &received);
     let history_read: Vec<String> = history_rx.collect().await;
     assert!(
