@@ -8,6 +8,11 @@
 //! persisted in a [`checkpoint::CheckpointStore`]. On restart, each partition resumes right after
 //! its checkpoint.
 //!
+//! With `start_position = "latest"` and a checkpoint store, a partition without a checkpoint gets
+//! one before it is read: the position of its last enqueued event at that moment, written
+//! create-only. A restart before the partition's first event then resumes after that position
+//! instead of at `latest` again, which would skip what was enqueued while the source was down.
+//!
 //! [event_hubs]: https://learn.microsoft.com/azure/event-hubs/event-hubs-about
 
 use std::{sync::Arc, time::Duration};
@@ -42,6 +47,7 @@ mod integration_tests;
 
 pub use checkpoint::CheckpointStoreConfig;
 use checkpoint::Checkpointer;
+pub(crate) use checkpoint::InitialCheckpoint;
 use sas::{EventHubsConnectionString, SasTokenCredential};
 use source::PartitionReader;
 
@@ -74,10 +80,7 @@ impl StartPositionConfig {
 
 /// Configuration for the `azure_event_hubs` source.
 #[serde_as]
-#[configurable_component(source(
-    "azure_event_hubs",
-    "Collect events from Azure Event Hubs."
-))]
+#[configurable_component(source("azure_event_hubs", "Collect events from Azure Event Hubs."))]
 #[derive(Clone, Debug, Derivative)]
 #[derivative(Default)]
 #[serde(deny_unknown_fields)]
@@ -126,6 +129,10 @@ pub struct AzureEventHubsSourceConfig {
     pub partition_ids: Vec<String>,
 
     /// Where to start reading a partition that has no checkpoint.
+    ///
+    /// With `latest` and a `checkpoint_store`, the partition's current end is written as its
+    /// first checkpoint before reading starts, so a restart never skips events enqueued while the
+    /// source was down, even if the partition received none before.
     #[serde(default)]
     pub start_position: StartPositionConfig,
 
@@ -282,7 +289,9 @@ impl AzureEventHubsSourceConfig {
                 );
             }
             (None, None, _) => {
-                return Err("either `connection_string`, or `namespace` and `auth`, must be set".into());
+                return Err(
+                    "either `connection_string`, or `namespace` and `auth`, must be set".into(),
+                );
             }
             (None, Some(_), None) => {
                 return Err("`auth` is required when using `namespace`".into());
@@ -328,7 +337,8 @@ impl SourceConfig for AzureEventHubsSourceConfig {
             )),
             None => {
                 warn!(
-                    message = "No `checkpoint_store` configured; every start begins at `start_position`."
+                    message =
+                        "No `checkpoint_store` configured; every start begins at `start_position`."
                 );
                 None
             }
@@ -402,25 +412,32 @@ impl SourceConfig for AzureEventHubsSourceConfig {
         );
 
         let client = Arc::new(client);
-        let readers: Vec<_> = partition_ids.into_iter().map(|partition_id| {
-            PartitionReader {
-                client: Arc::clone(&client),
-                initial_position: positions.get(&partition_id).cloned(),
-                partition_id,
-                event_hub_name: connection.event_hub_name.clone(),
-                checkpointer: checkpointer.clone(),
-                default_start: self.start_position.start_position(),
-                prefetch: self.prefetch,
-                owner_level: self.owner_level,
-                checkpoint_interval: self.checkpoint_interval_secs,
-                decoder: decoder.clone(),
-                out: cx.out.clone(),
-                acknowledgements,
-                log_namespace,
-                shutdown: cx.shutdown.clone(),
-            }
-            .run()
-        }).collect();
+        let readers: Vec<_> = partition_ids
+            .into_iter()
+            .map(|partition_id| {
+                PartitionReader {
+                    client: Arc::clone(&client),
+                    initial_position: positions.get(&partition_id).cloned(),
+                    partition_id,
+                    event_hub_name: connection.event_hub_name.clone(),
+                    checkpointer: checkpointer.clone(),
+                    default_start: self.start_position.start_position(),
+                    // `earliest` needs no initial checkpoint: restarting at the earliest retained
+                    // event re-reads, but never skips.
+                    initial_checkpoint: checkpointer.is_some()
+                        && self.start_position == StartPositionConfig::Latest,
+                    prefetch: self.prefetch,
+                    owner_level: self.owner_level,
+                    checkpoint_interval: self.checkpoint_interval_secs,
+                    decoder: decoder.clone(),
+                    out: cx.out.clone(),
+                    acknowledgements,
+                    log_namespace,
+                    shutdown: cx.shutdown.clone(),
+                }
+                .run()
+            })
+            .collect();
 
         Ok(async move {
             let results = join_all(readers).await;
@@ -449,7 +466,9 @@ impl SourceConfig for AzureEventHubsSourceConfig {
             .with_standard_vector_source_metadata()
             .with_source_metadata(
                 Self::NAME,
-                Some(LegacyKey::InsertIfEmpty(owned_value_path!("event_hub_name"))),
+                Some(LegacyKey::InsertIfEmpty(owned_value_path!(
+                    "event_hub_name"
+                ))),
                 &owned_value_path!("event_hub_name"),
                 Kind::bytes(),
                 None,
@@ -470,7 +489,9 @@ impl SourceConfig for AzureEventHubsSourceConfig {
             )
             .with_source_metadata(
                 Self::NAME,
-                Some(LegacyKey::InsertIfEmpty(owned_value_path!("sequence_number"))),
+                Some(LegacyKey::InsertIfEmpty(owned_value_path!(
+                    "sequence_number"
+                ))),
                 &owned_value_path!("sequence_number"),
                 Kind::integer().or_undefined(),
                 None,
@@ -583,13 +604,17 @@ mod tests {
     fn invalid_connection_settings() {
         let err = |toml: &str| parse(toml).connection().err().unwrap().to_string();
         assert!(err(r#"event_hub_name = "hub""#).contains("must be set"));
-        assert!(err(r#"namespace = "ns"
+        assert!(
+            err(r#"namespace = "ns"
                         event_hub_name = "hub""#)
-            .contains("`auth` is required"));
-        assert!(err(
-            r#"connection_string = "Endpoint=sb://ns/;SharedAccessKeyName=l;SharedAccessKey=k""#
-        )
-        .contains("`event_hub_name` is required"));
+            .contains("`auth` is required")
+        );
+        assert!(
+            err(
+                r#"connection_string = "Endpoint=sb://ns/;SharedAccessKeyName=l;SharedAccessKey=k""#
+            )
+            .contains("`event_hub_name` is required")
+        );
         assert!(err(
             r#"connection_string = "Endpoint=sb://ns/;SharedAccessKeyName=l;SharedAccessKey=k;EntityPath=a"
                event_hub_name = "b""#
@@ -631,8 +656,6 @@ mod tests {
 
     #[test]
     fn rejects_unknown_fields() {
-        assert!(
-            toml::from_str::<AzureEventHubsSourceConfig>(r#"bogus = 1"#).is_err()
-        );
+        assert!(toml::from_str::<AzureEventHubsSourceConfig>(r#"bogus = 1"#).is_err());
     }
 }

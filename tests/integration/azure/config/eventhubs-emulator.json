@@ -6,7 +6,8 @@
         "Name": "emulatorNs1",
         "Entities": [
           { "Name": "eh-resume", "PartitionCount": 4, "ConsumerGroups": [{ "Name": "cg1" }] },
-          { "Name": "eh-replay", "PartitionCount": 2, "ConsumerGroups": [{ "Name": "cg1" }] }
+          { "Name": "eh-replay", "PartitionCount": 2, "ConsumerGroups": [{ "Name": "cg1" }] },
+          { "Name": "eh-idle", "PartitionCount": 2, "ConsumerGroups": [{ "Name": "cg1" }] }
         ]
       }
     ],
