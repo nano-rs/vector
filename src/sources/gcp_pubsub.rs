@@ -69,16 +69,34 @@ const ACK_QUEUE_SIZE: usize = 8;
 
 type Finalizer = UnorderedFinalizer<Vec<String>>;
 
+/// The time a shutting-down source has in all before Vector stops it outright: nano's pull
+/// container runs Vector with `--graceful-shutdown-limit-secs 15` (`VECTOR_GRACEFUL_SHUTDOWN_LIMIT_SECS`
+/// in nanosiem's `pull-container.js`). The release must be sent within it, or the messages wait
+/// out their ack deadline after all.
+const GRACEFUL_SHUTDOWN_LIMIT: Duration = Duration::from_secs(15);
+
 /// How long a stream waits on shutdown for the acknowledgements of messages already sent
 /// downstream before it releases them for redelivery.
+const SHUTDOWN_ACK_WAIT: Duration = Duration::from_secs(8);
+
+// The worst case of a shutdown (acknowledgements that never come, a slow release or close)
+// ends `SHUTDOWN_ACK_WAIT + SHUTDOWN_FLUSH_TIMEOUT` (13 s) after the signal, with headroom under
+// the graceful shutdown limit. Checked at compile time.
+const _: () = assert!(
+    SHUTDOWN_ACK_WAIT.as_secs() + SHUTDOWN_FLUSH_TIMEOUT.as_secs() + 2
+        <= GRACEFUL_SHUTDOWN_LIMIT.as_secs()
+);
+
+/// [`SHUTDOWN_ACK_WAIT`], shortened in tests.
 const SHUTDOWN_ACK_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_secs(1)
 } else {
-    Duration::from_secs(15)
+    SHUTDOWN_ACK_WAIT
 };
 
-/// How long a stream waits on shutdown for the server to close it after the last
-/// acknowledgements and releases were sent, so that they are not lost with the connection.
+/// How long a stream takes on shutdown, after the acknowledgement wait, to send the releases and
+/// wait for the server to close the stream (so that the last acknowledgements and releases are
+/// not lost with the connection).
 const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The most ack IDs released in one request.
@@ -693,24 +711,22 @@ impl PubsubSource {
         let unsettled = in_flight.take();
         let unsettled_count = unsettled.len();
         let stream_ended = matches!(drained, Drained::StreamEnded);
-        if !stream_ended {
-            send_release(&ack_ids_sender, unsettled).await;
-        }
-        // Closing the request side makes the server end the stream once it has processed the
-        // acknowledgements and releases sent so far. Wait for that, briefly.
-        drop(ack_ids_sender);
         let mut late = 0;
         if !stream_ended {
-            let flush = async {
+            // Send the releases, then close the request side: the server ends the stream once it
+            // has processed the acknowledgements and releases sent so far. All within one budget.
+            let finish = async {
+                send_release(&ack_ids_sender, unsettled).await;
+                drop(ack_ids_sender);
                 while let Some(Ok(response)) = stream.next().await {
                     late += response.received_messages.len();
                 }
             };
-            if tokio::time::timeout(SHUTDOWN_FLUSH_TIMEOUT, flush)
+            if tokio::time::timeout(SHUTDOWN_FLUSH_TIMEOUT, finish)
                 .await
                 .is_err()
             {
-                debug!("Timed out waiting for the streaming pull to close.");
+                debug!("Timed out releasing messages or waiting for the streaming pull to close.");
             }
         }
         let (released, not_released) = if stream_ended {
@@ -1221,7 +1237,19 @@ mod shutdown_release_tests {
 
         // b0 and b1 are still held downstream when the source shuts down.
         let started = Instant::now();
-        let server = harness.shut_down().await;
+        let server = harness.server.clone();
+        let shutdown = tokio::spawn(harness.shut_down());
+        // The release goes out right at the end of the acknowledgement wait...
+        server
+            .wait_for("the release", |r| r.modacks.len() == 2)
+            .await;
+        let released_after = started.elapsed();
+        assert!(released_after >= SHUTDOWN_ACK_TIMEOUT, "{released_after:?}");
+        assert!(
+            released_after < SHUTDOWN_ACK_TIMEOUT + Duration::from_secs(1),
+            "{released_after:?}"
+        );
+        let server = shutdown.await.unwrap();
         drop(events);
 
         assert_eq!(sorted(server.acks()), vec!["a0", "a1", "a2"]);
@@ -1234,11 +1262,11 @@ mod shutdown_release_tests {
             modacks.iter().all(|(_, deadline)| *deadline == 0),
             "{modacks:?}"
         );
-        // It waited for the acknowledgements, but not the whole ack deadline.
-        assert!(started.elapsed() >= SHUTDOWN_ACK_TIMEOUT);
+        // ...and the whole shutdown stays within the acknowledgement wait plus the flush.
         assert!(
+            started.elapsed() < SHUTDOWN_ACK_TIMEOUT + SHUTDOWN_FLUSH_TIMEOUT,
+            "{:?}",
             started.elapsed()
-                < SHUTDOWN_ACK_TIMEOUT + SHUTDOWN_FLUSH_TIMEOUT + Duration::from_secs(5)
         );
     }
 
@@ -1302,6 +1330,20 @@ mod shutdown_release_tests {
         assert!(started.elapsed() < SHUTDOWN_ACK_TIMEOUT);
         assert_eq!(server.acks(), vec!["f0"]);
         assert!(server.modacks().is_empty());
+    }
+
+    /// The worst case (acknowledgements that never come, a slow release or close) fits in the
+    /// graceful shutdown limit (`VECTOR_GRACEFUL_SHUTDOWN_LIMIT_SECS` in nanosiem's
+    /// `pull-container.js`), so the release is always sent.
+    #[test]
+    fn shutdown_fits_the_graceful_shutdown_limit() {
+        // The release starts by 8 s; with the flush, everything ends by 13 s.
+        assert_eq!(SHUTDOWN_ACK_WAIT, Duration::from_secs(8));
+        assert_eq!(
+            SHUTDOWN_ACK_WAIT + SHUTDOWN_FLUSH_TIMEOUT,
+            Duration::from_secs(13)
+        );
+        assert!(SHUTDOWN_ACK_WAIT + SHUTDOWN_FLUSH_TIMEOUT < GRACEFUL_SHUTDOWN_LIMIT);
     }
 
     #[test]

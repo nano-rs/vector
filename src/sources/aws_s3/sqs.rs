@@ -26,7 +26,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
 use smallvec::SmallVec;
 use snafu::{ResultExt, Snafu};
-use tokio::select;
+use tokio::{pin, select};
 use tokio_util::codec::FramedRead;
 use vector_lib::{
     codecs::decoding::FramingError,
@@ -58,7 +58,7 @@ use crate::{
     shutdown::ShutdownSignal,
     sources::{
         aws_s3::AwsS3Config,
-        aws_sqs::release::{self, SHUTDOWN_ACK_TIMEOUT, SqsRelease},
+        aws_sqs::release::{self, InFlight, MAX_POLL_WAIT_SECS, ShutdownDeadlines, SqsRelease},
     },
     tls::TlsConfig,
 };
@@ -108,6 +108,10 @@ pub(super) struct Config {
     ///
     /// Generally, this should not be changed unless instructed to do so, as if messages are available,
     /// they are always consumed, regardless of the value of `poll_secs`.
+    ///
+    /// A single receive call waits at most 5 seconds; higher values are capped. A poll open when
+    /// the source shuts down then ends before the source releases its unacknowledged messages,
+    /// so a released message is not received again by that poll, nor stranded by it.
     // NOTE: We restrict this to u32 for safe conversion to i32 later.
     // NOTE: This value isn't used as a `Duration` downstream, so we don't bother using `serde_with`
     #[serde(default = "default_poll_secs")]
@@ -352,6 +356,9 @@ impl Ingestor {
         log_namespace: LogNamespace,
     ) -> Result<(), ()> {
         let acknowledgements = cx.do_acknowledgements(acknowledgements);
+        // Receipts of messages to release on shutdown, collected from every process and released
+        // once all of their polls have ended.
+        let to_release = InFlight::default();
         let mut handles = Vec::new();
         for _ in 0..self.state.client_concurrency {
             let process = IngestorProcess::new(
@@ -360,6 +367,7 @@ impl Ingestor {
                 cx.shutdown.clone(),
                 log_namespace,
                 acknowledgements,
+                to_release.clone(),
             );
             let fut = process.run();
             let handle = crate::spawn_in_current_span(fut);
@@ -368,14 +376,44 @@ impl Ingestor {
 
         // Wait for all of the processes to finish.  If any one of them panics, we resume
         // that panic here to properly shutdown Vector.
-        for handle in handles.drain(..) {
-            if let Err(e) = handle.await
-                && e.is_panic()
-            {
-                panic::resume_unwind(e.into_panic());
+        let processes_done = async {
+            for handle in handles.drain(..) {
+                if let Err(e) = handle.await
+                    && e.is_panic()
+                {
+                    panic::resume_unwind(e.into_panic());
+                }
             }
-        }
+        };
+        pin!(processes_done);
+        let deadlines = select! {
+            () = &mut processes_done => return Ok(()),
+            deadlines = ShutdownDeadlines::of(cx.shutdown.clone()) => deadlines,
+        };
 
+        // Shutdown. Each process finishes its poll (within `MAX_POLL_WAIT_SECS`) or its batch
+        // (until the acknowledgement deadline) and hands over what to release. Release only once
+        // they are done: with no poll of this source open, a released message cannot be
+        // received again by it.
+        let ack_wait_timed_out =
+            tokio::time::timeout_at(deadlines.acknowledgements, &mut processes_done)
+                .await
+                .is_err();
+        release::release(
+            "aws_s3",
+            &SqsRelease {
+                client: &self.state.sqs_client,
+                queue_url: &self.state.queue_url,
+            },
+            to_release.take(),
+            ack_wait_timed_out,
+            deadlines.release,
+        )
+        .await;
+        if ack_wait_timed_out {
+            // Bounded too: late polls by `late_poll`, their releases by `release`.
+            processes_done.await;
+        }
         Ok(())
     }
 }
@@ -389,15 +427,18 @@ pub struct IngestorProcess {
     bytes_received: Registered<BytesReceived>,
     events_received: Registered<EventsReceived>,
     backoff: ExponentialBackoff,
+    /// Where messages to release on shutdown go (see `Ingestor::run`).
+    to_release: InFlight,
 }
 
 impl IngestorProcess {
-    pub fn new(
+    pub(crate) fn new(
         state: Arc<State>,
         out: SourceSender,
         shutdown: ShutdownSignal,
         log_namespace: LogNamespace,
         acknowledgements: bool,
+        to_release: InFlight,
     ) -> Self {
         Self {
             state,
@@ -408,17 +449,41 @@ impl IngestorProcess {
             bytes_received: register!(BytesReceived::from(Protocol::HTTP)),
             events_received: register!(EventsReceived),
             backoff: ExponentialBackoff::default().max_delay(Duration::from_secs(30)),
+            to_release,
         }
     }
 
     async fn run(mut self) {
-        // Shutdown is checked between polls rather than cancelling one: a long poll abandoned
+        // Shutdown is checked between polls rather than cancelling one: a poll abandoned
         // client-side can still be answered server-side, leaving its messages invisible for the
-        // whole visibility timeout. So a poll in progress at shutdown completes (within
-        // `poll_secs`), and a batch received during shutdown is released unprocessed (see
-        // `process_messages`), so its messages are either deleted or released.
+        // whole visibility timeout. So a poll open at shutdown is awaited (it ends within
+        // `MAX_POLL_WAIT_SECS`) and what it returns is released unprocessed. A batch being
+        // processed at shutdown is finished or released (see `run_once`), so its messages are
+        // either deleted or released.
         while self.shutdown.clone().now_or_never().is_none() {
-            let received = self.receive_messages().await;
+            let receive = self.receive_messages();
+            pin!(receive);
+            let received = select! {
+                biased;
+                received = &mut receive => received,
+                deadlines = ShutdownDeadlines::of(self.shutdown.clone()) => {
+                    // Ends within `MAX_POLL_WAIT_SECS` (or, answered late, by `late_poll`).
+                    if let Ok(Ok(messages)) =
+                        tokio::time::timeout_at(deadlines.late_poll, receive).await
+                    {
+                        self.hand_over(
+                            messages
+                                .into_iter()
+                                .filter_map(|message| message.receipt_handle)
+                                .collect(),
+                            false,
+                            deadlines.release,
+                        )
+                        .await;
+                    }
+                    break;
+                }
+            };
             match self.run_once(received).await {
                 Ok(()) => {
                     // Reset backoff on successful receive
@@ -439,6 +504,30 @@ impl IngestorProcess {
         }
     }
 
+    /// Hands over messages to release on shutdown, or releases them right away if the shutdown
+    /// release already went out.
+    async fn hand_over(
+        &self,
+        receipts: Vec<String>,
+        ack_wait_timed_out: bool,
+        release_deadline: tokio::time::Instant,
+    ) {
+        if receipts.is_empty() || self.to_release.insert(&receipts) {
+            return;
+        }
+        release::release(
+            "aws_s3",
+            &SqsRelease {
+                client: &self.state.sqs_client,
+                queue_url: &self.state.queue_url,
+            },
+            receipts,
+            ack_wait_timed_out,
+            release_deadline,
+        )
+        .await;
+    }
+
     async fn run_once(
         &mut self,
         received: Result<Vec<Message>, SdkError<ReceiveMessageError, HttpResponse>>,
@@ -457,12 +546,12 @@ impl IngestorProcess {
         };
 
         let mut batch = BatchProgress::new(&messages, self.state.delete_message);
-        // On shutdown, the batch gets `SHUTDOWN_ACK_TIMEOUT` to finish (its objects' events to be
-        // acknowledged); then it is cut short and its unfinished messages are released.
+        // On shutdown, the batch has until the acknowledgement deadline to finish (its objects'
+        // events to be acknowledged); then it is cut short and its unfinished messages released.
         let shutdown = self.shutdown.clone();
-        let drain_timeout = async move {
-            shutdown.await;
-            tokio::time::sleep(SHUTDOWN_ACK_TIMEOUT).await;
+        let drain_timeout = async {
+            let deadlines = ShutdownDeadlines::of(shutdown).await;
+            tokio::time::sleep_until(deadlines.acknowledgements).await;
         };
         let ack_wait_timed_out = select! {
             biased;
@@ -474,6 +563,14 @@ impl IngestorProcess {
             deferred_entries,
             unsettled,
         } = batch;
+
+        // Only on shutdown: the messages of this batch that were not processed in time.
+        self.hand_over(
+            unsettled.into_iter().collect(),
+            ack_wait_timed_out,
+            ShutdownDeadlines::release_from_now(),
+        )
+        .await;
 
         // Should consider removing failed deferrals from the delete_entries
         if !deferred_entries.is_empty() {
@@ -534,17 +631,6 @@ impl IngestorProcess {
                 }
             }
         }
-        // Only on shutdown: the messages of this batch that were not processed in time.
-        release::release(
-            "aws_s3",
-            &SqsRelease {
-                client: &self.state.sqs_client,
-                queue_url: &self.state.queue_url,
-            },
-            unsettled.into_iter().collect(),
-            ack_wait_timed_out,
-        )
-        .await;
         Ok(())
     }
 
@@ -911,19 +997,23 @@ impl IngestorProcess {
         }
     }
 
-    async fn receive_messages(
-        &mut self,
-    ) -> Result<Vec<Message>, SdkError<ReceiveMessageError, HttpResponse>> {
+    /// Polls the queue. The future does not borrow the ingestor, so that a poll open at shutdown
+    /// can be finished while the ingestor releases what it returns.
+    fn receive_messages(
+        &self,
+    ) -> impl Future<Output = Result<Vec<Message>, SdkError<ReceiveMessageError, HttpResponse>>>
+    + Send
+    + 'static
+    + use<> {
         self.state
             .sqs_client
             .receive_message()
             .queue_url(self.state.queue_url.clone())
             .max_number_of_messages(self.state.max_number_of_messages)
             .visibility_timeout(self.state.visibility_timeout_secs)
-            .wait_time_seconds(self.state.poll_secs)
+            .wait_time_seconds(self.state.poll_secs.min(MAX_POLL_WAIT_SECS as i32))
             .send()
             .map_ok(|res| res.messages.unwrap_or_default())
-            .await
     }
 
     async fn delete_messages(

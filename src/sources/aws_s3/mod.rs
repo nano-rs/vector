@@ -1066,24 +1066,99 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let mut config = config(&queue, None, false, DeserializerConfig::Bytes);
-        // Long enough that only a release can make the message visible during the test.
-        config.sqs.as_mut().unwrap().visibility_timeout_secs = 300;
-        let component = crate::config::ComponentKey::from("aws_s3");
-        let (tx, rx) = SourceSender::new_test();
-        let (cx, mut shutdown) = SourceContext::new_shutdown(&component, tx);
-        let source = config.build(cx).await.unwrap();
-        let handle = tokio::spawn(async move { source.await.unwrap() });
+        let (component, mut shutdown, handle, rx) = start_releasing(&queue).await;
 
-        // Both lines arrive and are held, unacknowledged.
+        // Both lines arrive and are held, unacknowledged. The other ingestors sit in long polls.
         let held = collect_n(rx, 2).await;
         assert_eq!(held.len(), 2);
+        let started = tokio::time::Instant::now();
+        let deadlines = crate::sources::aws_sqs::release::ShutdownDeadlines::starting_at(started);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         assert!(shutdown.shutdown_source(&component, deadline).await);
         handle.await.unwrap();
+        // Within the release deadline, not after the long polls.
+        assert!(
+            tokio::time::Instant::now() <= deadlines.release + Duration::from_millis(500),
+            "shutdown took {:?}",
+            started.elapsed()
+        );
         drop(held);
 
         assert_eq!(count_messages(&sqs, &queue, 0).await, 1);
+    }
+
+    /// A long poll open at shutdown is not abandoned (which could strand what the server answers
+    /// it with for the visibility timeout): a message it returns during the shutdown is released
+    /// unprocessed.
+    #[tokio::test]
+    async fn s3_shutdown_releases_what_an_open_poll_returns() {
+        let sqs = sqs_client().await;
+        let queue = create_queue(&sqs).await;
+        let (component, mut shutdown, handle, rx) = start_releasing(&queue).await;
+        // Let the ingestors open their polls.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let shutting_down = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            assert!(shutdown.shutdown_source(&component, deadline).await);
+            handle.await.unwrap();
+        });
+        // Shutdown has started, and the polls opened before it are still open.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        sqs.send_message()
+            .queue_url(queue.clone())
+            .message_body(r#"{"Records":[]}"#)
+            .send()
+            .await
+            .unwrap();
+        shutting_down.await.unwrap();
+
+        // Received by the open poll, released, and received again here (a message nobody
+        // received would be visible too, with a count of 1). Polls answered late by a loaded
+        // localstack can pass it around a few more times before the shutdown ends.
+        let output = sqs
+            .receive_message()
+            .queue_url(queue)
+            .wait_time_seconds(0)
+            .message_system_attribute_names(
+                aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount,
+            )
+            .send()
+            .await
+            .unwrap();
+        let messages = output.messages.unwrap_or_default();
+        assert_eq!(messages.len(), 1);
+        let count = messages[0]
+            .attributes
+            .as_ref()
+            .and_then(|a| {
+                a.get(&aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount)
+            })
+            .and_then(|count| count.parse::<u32>().ok());
+        assert!(count >= Some(2), "{count:?}");
+        drop(rx);
+    }
+
+    /// Starts the source on `queue` with long polls and a visibility timeout long enough that
+    /// only a release can make a message visible during a test.
+    async fn start_releasing(
+        queue: &str,
+    ) -> (
+        crate::config::ComponentKey,
+        crate::shutdown::SourceShutdownCoordinator,
+        tokio::task::JoinHandle<()>,
+        impl futures::Stream<Item = crate::event::Event> + Unpin + use<>,
+    ) {
+        let mut config = config(queue, None, false, DeserializerConfig::Bytes);
+        let sqs_config = config.sqs.as_mut().unwrap();
+        sqs_config.visibility_timeout_secs = 300;
+        sqs_config.poll_secs = 20;
+        let component = crate::config::ComponentKey::from("aws_s3");
+        let (tx, rx) = SourceSender::new_test();
+        let (cx, shutdown) = SourceContext::new_shutdown(&component, tx);
+        let source = config.build(cx).await.unwrap();
+        let handle = tokio::spawn(async move { source.await.unwrap() });
+        (component, shutdown, handle, rx)
     }
 
     /// creates a new SQS queue

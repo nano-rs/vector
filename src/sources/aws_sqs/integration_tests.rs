@@ -130,6 +130,7 @@ fn calculate_message(index: u32) -> String {
 async fn start_holding(
     queue_url: &str,
     count: usize,
+    poll_secs: u32,
 ) -> (
     Vec<Event>,
     crate::shutdown::SourceShutdownCoordinator,
@@ -140,7 +141,9 @@ async fn start_holding(
         region: RegionOrEndpoint::with_both("us-east-1", sqs_address().as_str()),
         auth: AwsAuthentication::test_auth(),
         queue_url: queue_url.to_string(),
-        poll_secs: 1,
+        poll_secs,
+        // Long enough that only a release can make a message visible during a test.
+        visibility_timeout_secs: 300,
         ..Default::default()
     };
     let component = crate::config::ComponentKey::from("aws_sqs");
@@ -157,11 +160,11 @@ async fn start_holding(
 
 async fn shut_down(
     mut shutdown: crate::shutdown::SourceShutdownCoordinator,
-    component: &crate::config::ComponentKey,
+    component: impl std::borrow::Borrow<crate::config::ComponentKey>,
     handle: tokio::task::JoinHandle<()>,
 ) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    assert!(shutdown.shutdown_source(component, deadline).await);
+    assert!(shutdown.shutdown_source(component.borrow(), deadline).await);
     handle.await.unwrap();
 }
 
@@ -198,7 +201,7 @@ async fn shutdown_releases_unacknowledged_messages() {
         .unwrap();
     send_test_events(3, &queue_url, &sqs_client).await;
 
-    let (held, shutdown, component, handle) = start_holding(&queue_url, 3).await;
+    let (held, shutdown, component, handle) = start_holding(&queue_url, 3, 1).await;
     shut_down(shutdown, &component, handle).await;
     drop(held);
 
@@ -219,7 +222,7 @@ async fn shutdown_deletes_acknowledged_messages() {
         .unwrap();
     send_test_events(3, &queue_url, &sqs_client).await;
 
-    let (held, shutdown, component, handle) = start_holding(&queue_url, 3).await;
+    let (held, shutdown, component, handle) = start_holding(&queue_url, 3, 1).await;
     for mut event in held {
         event
             .take_finalizers()
@@ -228,4 +231,99 @@ async fn shutdown_deletes_acknowledged_messages() {
     shut_down(shutdown, &component, handle).await;
 
     assert!(visible_now(&queue_url, &sqs_client).await.is_empty());
+}
+
+/// The worst case of a shutdown: messages held downstream (acknowledgements never come) while the
+/// other receiving tasks sit in long polls (`poll_secs` 20). The release still goes out at the end
+/// of the acknowledgement wait and the shutdown ends within the release deadline, not after the
+/// polls.
+#[tokio::test]
+async fn shutdown_with_long_polls_open_stays_within_the_deadlines() {
+    let sqs_client = get_sqs_client().await;
+    let queue_url = ensure_queue(&gen_queue_name(), &sqs_client)
+        .await
+        .queue_url
+        .unwrap();
+    send_test_events(3, &queue_url, &sqs_client).await;
+
+    let (held, shutdown, component, handle) = start_holding(&queue_url, 3, 20).await;
+    let started = tokio::time::Instant::now();
+    let deadlines = super::release::ShutdownDeadlines::starting_at(started);
+    shut_down(shutdown, &component, handle).await;
+    assert!(
+        tokio::time::Instant::now() <= deadlines.release + Duration::from_millis(500),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
+    drop(held);
+
+    let mut expected: Vec<String> = (0..3).map(calculate_message).collect();
+    expected.sort();
+    assert_eq!(visible_now(&queue_url, &sqs_client).await, expected);
+}
+
+/// A long poll open at shutdown is not abandoned (which could strand what the server answers it
+/// with for the visibility timeout): a message it returns during the shutdown is released.
+#[tokio::test]
+async fn shutdown_releases_what_an_open_poll_returns() {
+    let sqs_client = get_sqs_client().await;
+    let queue_url = ensure_queue(&gen_queue_name(), &sqs_client)
+        .await
+        .queue_url
+        .unwrap();
+    send_test_events(1, &queue_url, &sqs_client).await;
+    // One message received and acknowledged: the source is up and its polls are open.
+    let (held, shutdown, component, handle) = start_holding(&queue_url, 1, 20).await;
+    for mut event in held {
+        use vector_lib::{event::EventStatus, finalization::Finalizable};
+        event
+            .take_finalizers()
+            .update_status(EventStatus::Delivered);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let shutting_down = tokio::spawn(shut_down(shutdown, component, handle));
+    // Shutdown has started, and the polls opened before it are still open.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send_test_events(1, &queue_url, &sqs_client).await;
+    shutting_down.await.unwrap();
+
+    // Received by the open poll, released, and received again here (a message nobody received
+    // would be visible too, with a count of 1). Polls answered late by a loaded localstack can
+    // pass it around a few more times before the shutdown ends.
+    let visible = visible_receive_counts(&queue_url, &sqs_client).await;
+    assert_eq!(visible.len(), 1, "{visible:?}");
+    assert_eq!(visible[0].0, calculate_message(0));
+    assert!(visible[0].1 >= 2, "{visible:?}");
+}
+
+/// Receives the messages visible right now with how many times each has been received.
+async fn visible_receive_counts(
+    queue_url: &str,
+    client: &aws_sdk_sqs::Client,
+) -> Vec<(String, u32)> {
+    use aws_sdk_sqs::types::MessageSystemAttributeName;
+    let output = client
+        .receive_message()
+        .queue_url(queue_url)
+        .max_number_of_messages(10)
+        .wait_time_seconds(0)
+        .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
+        .send()
+        .await
+        .unwrap();
+    output
+        .messages
+        .unwrap_or_default()
+        .into_iter()
+        .map(|message| {
+            let count = message
+                .attributes
+                .as_ref()
+                .and_then(|a| a.get(&MessageSystemAttributeName::ApproximateReceiveCount))
+                .and_then(|count| count.parse().ok())
+                .unwrap_or(0);
+            (message.body.unwrap_or_default(), count)
+        })
+        .collect()
 }

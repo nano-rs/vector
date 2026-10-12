@@ -40,6 +40,10 @@ pub struct AwsSqsConfig {
     ///
     /// Generally, this should not be changed unless instructed to do so, as if messages are available,
     /// they are always consumed, regardless of the value of `poll_secs`.
+    ///
+    /// A single receive call waits at most 5 seconds; higher values are capped. A poll open when
+    /// the source shuts down then ends before the source releases its unacknowledged messages,
+    /// so a released message is not received again by that poll, nor stranded by it.
     // NOTE: We restrict this to u32 for safe conversion to i32 later.
     // NOTE: This value isn't used as a `Duration` downstream, so we don't bother using `serde_with`
     #[serde(default = "default_poll_secs")]
