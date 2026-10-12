@@ -13,6 +13,7 @@ use vector_lib::{
     internal_event::{EventsReceived, Registered},
 };
 
+use super::release::{self, InFlight, MAX_POLL_WAIT_SECS, ShutdownDeadlines, SqsRelease};
 use crate::{
     SourceSender,
     codecs::Decoder,
@@ -45,47 +46,102 @@ pub struct SqsSource {
 impl SqsSource {
     pub async fn run(self, out: SourceSender, shutdown: ShutdownSignal) -> Result<(), ()> {
         let mut task_handles = vec![];
-        let finalizer = self.acknowledgements.then(|| {
-            let (finalizer, mut ack_stream) = Finalizer::new(Some(shutdown.clone()));
+        // Receipts of messages received and not yet deleted (only tracked with `delete_message`).
+        // On shutdown, whatever is left in it is released for immediate redelivery.
+        let in_flight = InFlight::default();
+        let mut ack_task = None;
+        let mut finalizer = self.acknowledgements.then(|| {
+            // No shutdown signal: after shutdown, the acknowledgements of the messages already
+            // sent downstream are still awaited (for a bounded time, below).
+            let (finalizer, mut ack_stream) = Finalizer::new(None);
             let client = self.client.clone();
             let queue_url = self.queue_url.clone();
-            crate::spawn_in_current_span(async move {
+            let in_flight = in_flight.clone();
+            ack_task = Some(crate::spawn_in_current_span(async move {
                 while let Some((status, receipts)) = ack_stream.next().await {
+                    // Settled either way. Removed before the delete is sent, so a message is
+                    // never both deleted and released.
+                    in_flight.remove(&receipts);
                     if status == BatchStatus::Delivered {
                         delete_messages(client.clone(), receipts, queue_url.clone()).await;
                     }
                 }
-            });
+            }));
             Arc::new(finalizer)
         });
         let events_received = register!(EventsReceived);
 
         for _ in 0..self.concurrency {
             let source = self.clone();
-            let shutdown = shutdown.clone().fuse();
+            let shutdown = shutdown.clone();
             let mut out = out.clone();
-            let finalizer = finalizer.clone();
+            let mut finalizer = finalizer.clone();
             let events_received = events_received.clone();
+            let in_flight = in_flight.clone();
             task_handles.push(crate::spawn_in_current_span(async move {
-                let finalizer = finalizer.as_ref();
-                pin!(shutdown);
-                loop {
-                    select! {
-                        _ = &mut shutdown => break,
-                        _ = source.run_once(&mut out, finalizer, events_received.clone()) => {},
-                    }
+                while shutdown.clone().now_or_never().is_none() {
+                    source
+                        .run_once(
+                            &mut out,
+                            &mut finalizer,
+                            &in_flight,
+                            events_received.clone(),
+                            &shutdown,
+                        )
+                        .await;
                 }
             }));
         }
 
         // Wait for all of the processes to finish.  If any one of them panics, we resume
         // that panic here to properly shutdown Vector.
-        for task_handle in task_handles.drain(..) {
-            if let Err(e) = task_handle.await
-                && e.is_panic()
-            {
-                panic::resume_unwind(e.into_panic());
+        let tasks_done = async {
+            for task_handle in task_handles.drain(..) {
+                if let Err(e) = task_handle.await
+                    && e.is_panic()
+                {
+                    panic::resume_unwind(e.into_panic());
+                }
             }
+        };
+        pin!(tasks_done);
+        let deadlines = select! {
+            () = &mut tasks_done => return Ok(()),
+            deadlines = ShutdownDeadlines::of(shutdown.clone()) => deadlines,
+        };
+
+        // Shutdown. Closing the finalizer ends the acknowledgement stream once the batches already
+        // sent downstream are settled (each task drops its reference when it stops). Wait for
+        // that and for the receiving tasks, whose polls open at shutdown end within
+        // `MAX_POLL_WAIT_SECS`, until the acknowledgement deadline. Only then release: with no
+        // poll of this source open, a released message cannot be received again by it.
+        drop(finalizer.take());
+        let mut tasks_finished = false;
+        let settled = async {
+            (&mut tasks_done).await;
+            tasks_finished = true;
+            if let Some(ack_task) = ack_task.as_mut() {
+                _ = ack_task.await;
+            }
+        };
+        let ack_wait_timed_out = tokio::time::timeout_at(deadlines.acknowledgements, settled)
+            .await
+            .is_err();
+        if ack_wait_timed_out && let Some(ack_task) = ack_task {
+            // Stop deleting before releasing: nothing taken below can be deleted afterwards.
+            ack_task.abort();
+            _ = ack_task.await;
+        }
+        release::release(
+            "aws_sqs",
+            &self.releaser(),
+            in_flight.take(),
+            ack_wait_timed_out,
+            deadlines.release,
+        )
+        .await;
+        if !tasks_finished {
+            tasks_done.await;
         }
         Ok(())
     }
@@ -93,21 +149,51 @@ impl SqsSource {
     async fn run_once(
         &self,
         out: &mut SourceSender,
-        finalizer: Option<&Arc<Finalizer>>,
+        finalizer: &mut Option<Arc<Finalizer>>,
+        in_flight: &InFlight,
         events_received: Registered<EventsReceived>,
+        shutdown: &ShutdownSignal,
     ) {
-        let result = self
+        let receive = self
             .client
             .receive_message()
             .queue_url(&self.queue_url)
             .max_number_of_messages(MAX_BATCH_SIZE)
-            .wait_time_seconds(self.poll_secs as i32)
+            .wait_time_seconds(self.poll_secs.min(MAX_POLL_WAIT_SECS) as i32)
             .visibility_timeout(self.visibility_timeout_secs as i32)
             .message_system_attribute_names(MessageSystemAttributeName::from("SentTimestamp"))
             // I think this should be a known attribute
             // https://github.com/awslabs/aws-sdk-rust/issues/411
-            .send()
-            .await;
+            .send();
+        pin!(receive);
+        let result = select! {
+            biased;
+            result = &mut receive => result,
+            deadlines = ShutdownDeadlines::of(shutdown.clone()) => {
+                // Shutdown during a poll. Not cancelled: a poll abandoned client-side can still be
+                // answered server-side, leaving its messages invisible for the whole visibility
+                // timeout. It ends within `MAX_POLL_WAIT_SECS` (or, answered late, by
+                // `late_poll`); what it returns is not processed but released, with the other
+                // in-flight messages by `run` or directly if that release already went out.
+                drop(finalizer.take());
+                let Ok(Ok(output)) = tokio::time::timeout_at(deadlines.late_poll, receive).await
+                else {
+                    return;
+                };
+                let receipts: Vec<String> = output
+                    .messages
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|message| message.receipt_handle)
+                    .collect();
+                if !in_flight.insert(&receipts) {
+                    // Answered after the release went out: release these directly.
+                    release::release("aws_sqs", &self.releaser(), receipts, false, deadlines.release)
+                        .await;
+                }
+                return;
+            }
+        };
 
         let receive_message_output = match result {
             Ok(output) => output,
@@ -156,15 +242,42 @@ impl SqsSource {
             }
             drop(batch); // Drop last reference to batch acknowledgement finalizer
             let count = events.len();
+            // Tracked from now until deleted (or settled without delivery). If the source stops
+            // in between, these are released on shutdown.
+            if self.delete_message && !in_flight.insert(&receipts_to_ack) {
+                // The in-flight receipts were already taken for release: release these too.
+                release::release(
+                    "aws_sqs",
+                    &self.releaser(),
+                    receipts_to_ack,
+                    false,
+                    ShutdownDeadlines::release_from_now(),
+                )
+                .await;
+                return;
+            }
+            // Received during shutdown: not sent downstream, released instead (in `run`).
+            if shutdown.clone().now_or_never().is_some() {
+                return;
+            }
 
-            match out.send_batch(events).await {
+            // A send blocked on backpressure is abandoned on shutdown; its receipts are still
+            // in flight, so they are released.
+            let sent = select! {
+                biased;
+                sent = out.send_batch(events) => sent,
+                _ = shutdown.clone() => return,
+            };
+            match sent {
                 Ok(()) => {
                     if self.delete_message {
                         match batch_receiver {
                             Some(receiver) => finalizer
+                                .as_ref()
                                 .expect("Finalizer must exist for the batch receiver to be created")
                                 .add(receipts_to_ack, receiver),
                             None => {
+                                in_flight.remove(&receipts_to_ack);
                                 delete_messages(
                                     self.client.clone(),
                                     receipts_to_ack,
@@ -177,6 +290,15 @@ impl SqsSource {
                 }
                 Err(_) => emit!(StreamClosedError { count }),
             }
+        }
+    }
+}
+
+impl SqsSource {
+    fn releaser(&self) -> SqsRelease<'_> {
+        SqsRelease {
+            client: &self.client,
+            queue_url: &self.queue_url,
         }
     }
 }

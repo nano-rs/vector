@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::ready,
     num::NonZeroUsize,
     panic,
@@ -56,7 +56,10 @@ use crate::{
     },
     line_agg::{self, LineAgg},
     shutdown::ShutdownSignal,
-    sources::aws_s3::AwsS3Config,
+    sources::{
+        aws_s3::AwsS3Config,
+        aws_sqs::release::{self, InFlight, MAX_POLL_WAIT_SECS, ShutdownDeadlines, SqsRelease},
+    },
     tls::TlsConfig,
 };
 
@@ -105,6 +108,10 @@ pub(super) struct Config {
     ///
     /// Generally, this should not be changed unless instructed to do so, as if messages are available,
     /// they are always consumed, regardless of the value of `poll_secs`.
+    ///
+    /// A single receive call waits at most 5 seconds; higher values are capped. A poll open when
+    /// the source shuts down then ends before the source releases its unacknowledged messages,
+    /// so a released message is not received again by that poll, nor stranded by it.
     // NOTE: We restrict this to u32 for safe conversion to i32 later.
     // NOTE: This value isn't used as a `Duration` downstream, so we don't bother using `serde_with`
     #[serde(default = "default_poll_secs")]
@@ -349,6 +356,9 @@ impl Ingestor {
         log_namespace: LogNamespace,
     ) -> Result<(), ()> {
         let acknowledgements = cx.do_acknowledgements(acknowledgements);
+        // Receipts of messages to release on shutdown, collected from every process and released
+        // once all of their polls have ended.
+        let to_release = InFlight::default();
         let mut handles = Vec::new();
         for _ in 0..self.state.client_concurrency {
             let process = IngestorProcess::new(
@@ -357,6 +367,7 @@ impl Ingestor {
                 cx.shutdown.clone(),
                 log_namespace,
                 acknowledgements,
+                to_release.clone(),
             );
             let fut = process.run();
             let handle = crate::spawn_in_current_span(fut);
@@ -365,14 +376,44 @@ impl Ingestor {
 
         // Wait for all of the processes to finish.  If any one of them panics, we resume
         // that panic here to properly shutdown Vector.
-        for handle in handles.drain(..) {
-            if let Err(e) = handle.await
-                && e.is_panic()
-            {
-                panic::resume_unwind(e.into_panic());
+        let processes_done = async {
+            for handle in handles.drain(..) {
+                if let Err(e) = handle.await
+                    && e.is_panic()
+                {
+                    panic::resume_unwind(e.into_panic());
+                }
             }
-        }
+        };
+        pin!(processes_done);
+        let deadlines = select! {
+            () = &mut processes_done => return Ok(()),
+            deadlines = ShutdownDeadlines::of(cx.shutdown.clone()) => deadlines,
+        };
 
+        // Shutdown. Each process finishes its poll (within `MAX_POLL_WAIT_SECS`) or its batch
+        // (until the acknowledgement deadline) and hands over what to release. Release only once
+        // they are done: with no poll of this source open, a released message cannot be
+        // received again by it.
+        let ack_wait_timed_out =
+            tokio::time::timeout_at(deadlines.acknowledgements, &mut processes_done)
+                .await
+                .is_err();
+        release::release(
+            "aws_s3",
+            &SqsRelease {
+                client: &self.state.sqs_client,
+                queue_url: &self.state.queue_url,
+            },
+            to_release.take(),
+            ack_wait_timed_out,
+            deadlines.release,
+        )
+        .await;
+        if ack_wait_timed_out {
+            // Bounded too: late polls by `late_poll`, their releases by `release`.
+            processes_done.await;
+        }
         Ok(())
     }
 }
@@ -386,15 +427,18 @@ pub struct IngestorProcess {
     bytes_received: Registered<BytesReceived>,
     events_received: Registered<EventsReceived>,
     backoff: ExponentialBackoff,
+    /// Where messages to release on shutdown go (see `Ingestor::run`).
+    to_release: InFlight,
 }
 
 impl IngestorProcess {
-    pub fn new(
+    pub(crate) fn new(
         state: Arc<State>,
         out: SourceSender,
         shutdown: ShutdownSignal,
         log_namespace: LogNamespace,
         acknowledgements: bool,
+        to_release: InFlight,
     ) -> Self {
         Self {
             state,
@@ -405,38 +449,90 @@ impl IngestorProcess {
             bytes_received: register!(BytesReceived::from(Protocol::HTTP)),
             events_received: register!(EventsReceived),
             backoff: ExponentialBackoff::default().max_delay(Duration::from_secs(30)),
+            to_release,
         }
     }
 
     async fn run(mut self) {
-        let shutdown = self.shutdown.clone().fuse();
-        pin!(shutdown);
-
-        loop {
-            select! {
-                _ = &mut shutdown => break,
-                result = self.run_once() => {
-                    match result {
-                        Ok(()) => {
-                            // Reset backoff on successful receive
-                            self.backoff.reset();
-                        }
-                        Err(_) => {
-                            let delay = self.backoff.next().expect("backoff never ends");
-                            trace!(
-                                delay_ms = delay.as_millis(),
-                                "`run_once` failed, will retry after delay.",
-                            );
-                            tokio::time::sleep(delay).await;
-                        }
+        // Shutdown is checked between polls rather than cancelling one: a poll abandoned
+        // client-side can still be answered server-side, leaving its messages invisible for the
+        // whole visibility timeout. So a poll open at shutdown is awaited (it ends within
+        // `MAX_POLL_WAIT_SECS`) and what it returns is released unprocessed. A batch being
+        // processed at shutdown is finished or released (see `run_once`), so its messages are
+        // either deleted or released.
+        while self.shutdown.clone().now_or_never().is_none() {
+            let receive = self.receive_messages();
+            pin!(receive);
+            let received = select! {
+                biased;
+                received = &mut receive => received,
+                deadlines = ShutdownDeadlines::of(self.shutdown.clone()) => {
+                    // Ends within `MAX_POLL_WAIT_SECS` (or, answered late, by `late_poll`).
+                    if let Ok(Ok(messages)) =
+                        tokio::time::timeout_at(deadlines.late_poll, receive).await
+                    {
+                        self.hand_over(
+                            messages
+                                .into_iter()
+                                .filter_map(|message| message.receipt_handle)
+                                .collect(),
+                            false,
+                            deadlines.release,
+                        )
+                        .await;
                     }
-                },
+                    break;
+                }
+            };
+            match self.run_once(received).await {
+                Ok(()) => {
+                    // Reset backoff on successful receive
+                    self.backoff.reset();
+                }
+                Err(_) => {
+                    let delay = self.backoff.next().expect("backoff never ends");
+                    trace!(
+                        delay_ms = delay.as_millis(),
+                        "`run_once` failed, will retry after delay.",
+                    );
+                    select! {
+                        _ = self.shutdown.clone() => break,
+                        _ = tokio::time::sleep(delay) => {},
+                    }
+                }
             }
         }
     }
 
-    async fn run_once(&mut self) -> Result<(), ()> {
-        let messages = match self.receive_messages().await {
+    /// Hands over messages to release on shutdown, or releases them right away if the shutdown
+    /// release already went out.
+    async fn hand_over(
+        &self,
+        receipts: Vec<String>,
+        ack_wait_timed_out: bool,
+        release_deadline: tokio::time::Instant,
+    ) {
+        if receipts.is_empty() || self.to_release.insert(&receipts) {
+            return;
+        }
+        release::release(
+            "aws_s3",
+            &SqsRelease {
+                client: &self.state.sqs_client,
+                queue_url: &self.state.queue_url,
+            },
+            receipts,
+            ack_wait_timed_out,
+            release_deadline,
+        )
+        .await;
+    }
+
+    async fn run_once(
+        &mut self,
+        received: Result<Vec<Message>, SdkError<ReceiveMessageError, HttpResponse>>,
+    ) -> Result<(), ()> {
+        let messages = match received {
             Ok(messages) => {
                 emit!(SqsMessageReceiveSucceeded {
                     count: messages.len(),
@@ -449,92 +545,32 @@ impl IngestorProcess {
             }
         };
 
-        let mut delete_entries = Vec::new();
-        let mut deferred_entries = Vec::new();
-        for message in messages {
-            let receipt_handle = match message.receipt_handle {
-                None => {
-                    // I don't think this will ever actually happen, but is just an artifact of the
-                    // AWS's API predilection for returning nullable values for all response
-                    // attributes
-                    warn!(message = "Refusing to process message with no receipt_handle.", ?message.message_id);
-                    continue;
-                }
-                Some(ref handle) => handle.to_owned(),
-            };
+        let mut batch = BatchProgress::new(&messages, self.state.delete_message);
+        // On shutdown, the batch has until the acknowledgement deadline to finish (its objects'
+        // events to be acknowledged); then it is cut short and its unfinished messages released.
+        let shutdown = self.shutdown.clone();
+        let drain_timeout = async {
+            let deadlines = ShutdownDeadlines::of(shutdown).await;
+            tokio::time::sleep_until(deadlines.acknowledgements).await;
+        };
+        let ack_wait_timed_out = select! {
+            biased;
+            () = self.process_messages(messages, &mut batch) => false,
+            () = drain_timeout => true,
+        };
+        let BatchProgress {
+            delete_entries,
+            deferred_entries,
+            unsettled,
+        } = batch;
 
-            let message_id = message
-                .message_id
-                .clone()
-                .unwrap_or_else(|| "<unknown>".to_owned());
-            match self.handle_sqs_message(message.clone()).await {
-                Ok(()) => {
-                    emit!(SqsMessageProcessingSucceeded {
-                        message_id: &message_id
-                    });
-                    if self.state.delete_message {
-                        trace!(
-                            message = "Queued SQS message for deletion.",
-                            id = message_id,
-                            receipt_handle = receipt_handle,
-                        );
-                        delete_entries.push(
-                            DeleteMessageBatchRequestEntry::builder()
-                                .id(message_id.clone())
-                                .receipt_handle(receipt_handle)
-                                .build()
-                                .expect("all required builder params specified"),
-                        );
-                    }
-                }
-                Err(err) => {
-                    match err {
-                        ProcessingError::FileTooOld { .. } => {
-                            emit!(SqsMessageProcessingSucceeded {
-                                message_id: &message_id
-                            });
-                            if let Some(deferred) = &self.state.deferred {
-                                trace!(
-                                    message = "Forwarding message to deferred queue.",
-                                    id = message_id,
-                                    receipt_handle = receipt_handle,
-                                    deferred_queue = deferred.queue_url,
-                                );
-
-                                deferred_entries.push(
-                                    SendMessageBatchRequestEntry::builder()
-                                        .id(message_id.clone())
-                                        .message_body(message.body.unwrap_or_default())
-                                        .build()
-                                        .expect("all required builder params specified"),
-                                );
-                            }
-                            //  maybe delete the message from current queue since we have processed it
-                            if self.state.delete_message {
-                                trace!(
-                                    message = "Queued SQS message for deletion.",
-                                    id = message_id,
-                                    receipt_handle = receipt_handle,
-                                );
-                                delete_entries.push(
-                                    DeleteMessageBatchRequestEntry::builder()
-                                        .id(message_id)
-                                        .receipt_handle(receipt_handle)
-                                        .build()
-                                        .expect("all required builder params specified"),
-                                );
-                            }
-                        }
-                        _ => {
-                            emit!(SqsMessageProcessingError {
-                                message_id: &message_id,
-                                error: &err,
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        // Only on shutdown: the messages of this batch that were not processed in time.
+        self.hand_over(
+            unsettled.into_iter().collect(),
+            ack_wait_timed_out,
+            ShutdownDeadlines::release_from_now(),
+        )
+        .await;
 
         // Should consider removing failed deferrals from the delete_entries
         if !deferred_entries.is_empty() {
@@ -596,6 +632,102 @@ impl IngestorProcess {
             }
         }
         Ok(())
+    }
+
+    /// Processes the messages of one batch in order, recording in `batch` which to delete or
+    /// defer. Each message leaves `batch.unsettled` once processed, whatever the outcome; on
+    /// shutdown the remaining messages are not started.
+    async fn process_messages(&mut self, messages: Vec<Message>, batch: &mut BatchProgress) {
+        for message in messages {
+            if self.shutdown.clone().now_or_never().is_some() {
+                break;
+            }
+            let receipt_handle = match message.receipt_handle {
+                None => {
+                    // I don't think this will ever actually happen, but is just an artifact of the
+                    // AWS's API predilection for returning nullable values for all response
+                    // attributes
+                    warn!(message = "Refusing to process message with no receipt_handle.", ?message.message_id);
+                    continue;
+                }
+                Some(ref handle) => handle.to_owned(),
+            };
+
+            let message_id = message
+                .message_id
+                .clone()
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            let result = self.handle_sqs_message(message.clone()).await;
+            // Processed: deleted, deferred, or left to its visibility timeout; never released.
+            batch.unsettled.remove(&receipt_handle);
+            match result {
+                Ok(()) => {
+                    emit!(SqsMessageProcessingSucceeded {
+                        message_id: &message_id
+                    });
+                    if self.state.delete_message {
+                        trace!(
+                            message = "Queued SQS message for deletion.",
+                            id = message_id,
+                            receipt_handle = receipt_handle,
+                        );
+                        batch.delete_entries.push(
+                            DeleteMessageBatchRequestEntry::builder()
+                                .id(message_id.clone())
+                                .receipt_handle(receipt_handle)
+                                .build()
+                                .expect("all required builder params specified"),
+                        );
+                    }
+                }
+                Err(err) => {
+                    match err {
+                        ProcessingError::FileTooOld { .. } => {
+                            emit!(SqsMessageProcessingSucceeded {
+                                message_id: &message_id
+                            });
+                            if let Some(deferred) = &self.state.deferred {
+                                trace!(
+                                    message = "Forwarding message to deferred queue.",
+                                    id = message_id,
+                                    receipt_handle = receipt_handle,
+                                    deferred_queue = deferred.queue_url,
+                                );
+
+                                batch.deferred_entries.push(
+                                    SendMessageBatchRequestEntry::builder()
+                                        .id(message_id.clone())
+                                        .message_body(message.body.unwrap_or_default())
+                                        .build()
+                                        .expect("all required builder params specified"),
+                                );
+                            }
+                            //  maybe delete the message from current queue since we have processed it
+                            if self.state.delete_message {
+                                trace!(
+                                    message = "Queued SQS message for deletion.",
+                                    id = message_id,
+                                    receipt_handle = receipt_handle,
+                                );
+                                batch.delete_entries.push(
+                                    DeleteMessageBatchRequestEntry::builder()
+                                        .id(message_id)
+                                        .receipt_handle(receipt_handle)
+                                        .build()
+                                        .expect("all required builder params specified"),
+                                );
+                            }
+                        }
+                        _ => {
+                            emit!(SqsMessageProcessingError {
+                                message_id: &message_id,
+                                error: &err,
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn handle_sqs_message(&mut self, message: Message) -> Result<(), ProcessingError> {
@@ -865,19 +997,23 @@ impl IngestorProcess {
         }
     }
 
-    async fn receive_messages(
-        &mut self,
-    ) -> Result<Vec<Message>, SdkError<ReceiveMessageError, HttpResponse>> {
+    /// Polls the queue. The future does not borrow the ingestor, so that a poll open at shutdown
+    /// can be finished while the ingestor releases what it returns.
+    fn receive_messages(
+        &self,
+    ) -> impl Future<Output = Result<Vec<Message>, SdkError<ReceiveMessageError, HttpResponse>>>
+    + Send
+    + 'static
+    + use<> {
         self.state
             .sqs_client
             .receive_message()
             .queue_url(self.state.queue_url.clone())
             .max_number_of_messages(self.state.max_number_of_messages)
             .visibility_timeout(self.state.visibility_timeout_secs)
-            .wait_time_seconds(self.state.poll_secs)
+            .wait_time_seconds(self.state.poll_secs.min(MAX_POLL_WAIT_SECS as i32))
             .send()
             .map_ok(|res| res.messages.unwrap_or_default())
-            .await
     }
 
     async fn delete_messages(
@@ -905,6 +1041,32 @@ impl IngestorProcess {
             .set_entries(Some(entries))
             .send()
             .await
+    }
+}
+
+/// The bookkeeping of one received batch of SQS messages.
+struct BatchProgress {
+    delete_entries: Vec<DeleteMessageBatchRequestEntry>,
+    deferred_entries: Vec<SendMessageBatchRequestEntry>,
+    /// Receipts of messages not processed yet. Only tracked with `delete_message`: without it,
+    /// messages are never deleted and simply reappear after their visibility timeout.
+    unsettled: HashSet<String>,
+}
+
+impl BatchProgress {
+    fn new(messages: &[Message], delete_message: bool) -> Self {
+        Self {
+            delete_entries: Vec::new(),
+            deferred_entries: Vec::new(),
+            unsettled: if delete_message {
+                messages
+                    .iter()
+                    .filter_map(|message| message.receipt_handle.clone())
+                    .collect()
+            } else {
+                HashSet::new()
+            },
+        }
     }
 }
 
@@ -1401,4 +1563,20 @@ fn parse_sqs_config() {
           queue_url: "https://sqs.us-east-1.amazonaws.com/123456789012/MyDeferredQueue"
     "#});
     assert!(test.is_err());
+}
+
+#[test]
+fn batch_progress_tracks_receipts_only_when_deleting() {
+    let messages = vec![
+        Message::builder().receipt_handle("r1").build(),
+        Message::builder().build(),
+        Message::builder().receipt_handle("r2").build(),
+    ];
+    let progress = BatchProgress::new(&messages, true);
+    assert_eq!(
+        progress.unsettled,
+        HashSet::from(["r1".to_string(), "r2".to_string()])
+    );
+    // Without `delete_message`, messages are never deleted, so none is released either.
+    assert!(BatchProgress::new(&messages, false).unsettled.is_empty());
 }
