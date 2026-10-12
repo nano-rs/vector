@@ -234,6 +234,13 @@ impl SourceConfig for AwsS3Config {
                 Kind::timestamp(),
                 Some("timestamp"),
             )
+            .with_source_metadata(
+                Self::NAME,
+                Some(LegacyKey::Overwrite(owned_value_path!("s3_event_time"))),
+                &owned_value_path!("event_time"),
+                Kind::timestamp(),
+                None,
+            )
             .with_standard_vector_source_metadata()
             // for metadata that is added to the events dynamically from the metadata
             .with_source_metadata(
@@ -997,6 +1004,7 @@ mod integration_tests {
                 assert_eq!(namespace.get_source_metadata(AwsS3Config::NAME, log, path!("bucket"), path!("bucket")).unwrap(), &bucket.clone().into());
                 assert_eq!(namespace.get_source_metadata(AwsS3Config::NAME, log, path!("object"), path!("object")).unwrap(), &key.clone().into());
                 assert_eq!(namespace.get_source_metadata(AwsS3Config::NAME, log, path!("region"), path!("region")).unwrap(), &"us-east-1".into());
+                assert_eq!(namespace.get_source_metadata(AwsS3Config::NAME, log, path!("s3_event_time"), path!("event_time")).unwrap(), &Value::Timestamp(s3_event.records[0].event_time));
             }
 
             // Unfortunately we need a fairly large sleep here to ensure that the source has actually managed to delete the SQS message.

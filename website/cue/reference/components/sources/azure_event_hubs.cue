@@ -122,6 +122,12 @@ components: sources: azure_event_hubs: {
 				therefore at-least-once: a crash can re-deliver the events read since the last
 				checkpoint, but cannot skip any.
 
+				With `start_position` set to `latest`, a partition without a checkpoint gets one
+				before it is read: the position of its last enqueued event at that moment. A restart
+				then resumes after it, even if the partition received no event in between, so events
+				enqueued while Vector was down are never skipped. This first checkpoint is written
+				create-only (`If-None-Match: *` on the blob) and never replaces an existing one.
+
 				The checkpoint blobs use the layout of the Azure SDK blob checkpoint stores
 				(`<namespace>/<event hub>/<consumer group>/checkpoint/<partition id>`).
 				"""

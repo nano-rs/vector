@@ -61,6 +61,15 @@ components: sources: aws_s3: components._aws & {
 				timestamp: fields._current_timestamp & {
 					description: "The Last-Modified time of the object. Defaults the current timestamp if this information is missing."
 				}
+				s3_event_time: {
+					description: """
+						The time S3 accepted the object, from the `eventTime` of its event notification.
+						Unlike `timestamp`, it is not carried over when an object is copied or restored.
+						With the `vector` log namespace it is the `%aws_s3.event_time` metadata field.
+						"""
+					required:    true
+					type: timestamp: {}
+				}
 				source_type: {
 					description: "The name of the source type."
 					required:    true

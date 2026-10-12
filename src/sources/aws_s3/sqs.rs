@@ -950,6 +950,17 @@ fn handle_single_log(
         }
     }
 
+    // When S3 accepted the object (the notification's `eventTime`), as opposed to its
+    // Last-Modified time, which a restore or copy can carry over from long before. Inserted after
+    // the object's user metadata so that a metadata key of the same name cannot replace it.
+    log_namespace.insert_source_metadata(
+        AwsS3Config::NAME,
+        log,
+        Some(LegacyKey::Overwrite(path!("s3_event_time"))),
+        path!("event_time"),
+        s3_event.event_time,
+    );
+
     log_namespace.insert_vector_metadata(
         log,
         log_schema().source_type_key(),
@@ -1245,6 +1256,103 @@ fn test_s3_sns_testevent() {
     assert_eq!(value.bucket, "bucketname".to_string());
     assert_eq!(value.event.kind, "s3".to_string());
     assert_eq!(value.event.name, "TestEvent".to_string());
+}
+
+#[cfg(test)]
+fn s3_event_record(event_time: &str) -> S3EventRecord {
+    // `from_str`, not `from_value`: the object key deserializer borrows from the input.
+    let json = serde_json::json!({
+        "eventVersion": "2.1",
+        "eventSource": "aws:s3",
+        "awsRegion": "us-east-1",
+        "eventTime": event_time,
+        "eventName": "ObjectCreated:Copy",
+        "s3": {
+            "s3SchemaVersion": "1.0",
+            "configurationId": "config",
+            "bucket": { "name": "bucket", "arn": "arn:aws:s3:::bucket" },
+            "object": { "key": "AWSLogs/restored.log", "size": 3 }
+        }
+    })
+    .to_string();
+    serde_json::from_str(&json).unwrap()
+}
+
+#[test]
+fn handle_single_log_adds_s3_event_time() {
+    use vrl::value::Value;
+
+    use crate::config::SourceConfig;
+
+    // A restored object: Last-Modified is years before the notification.
+    let event_time = DateTime::parse_from_rfc3339("2026-10-12T14:00:00.123Z")
+        .unwrap()
+        .to_utc();
+    let last_modified = DateTime::parse_from_rfc3339("2021-01-01T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let record = s3_event_record("2026-10-12T14:00:00.123Z");
+    assert_eq!(record.event_time, event_time);
+    // A user metadata key of the same name cannot replace it.
+    let metadata = Some(HashMap::from([(
+        "s3_event_time".to_string(),
+        "user value".to_string(),
+    )]));
+
+    for namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
+        let mut log = match namespace {
+            // Not `LogEvent::from(&str)`, which already sets `timestamp` to now.
+            LogNamespace::Legacy => {
+                let mut log = LogEvent::default();
+                log.insert(vrl::event_path!("message"), "line");
+                log
+            }
+            LogNamespace::Vector => LogEvent::from(Value::from("line")),
+        };
+        handle_single_log(&mut log, namespace, &record, &metadata, Some(last_modified));
+
+        assert_eq!(
+            namespace.get_source_metadata(
+                AwsS3Config::NAME,
+                &log,
+                path!("s3_event_time"),
+                path!("event_time"),
+            ),
+            Some(&Value::Timestamp(event_time)),
+            "{namespace:?}"
+        );
+        match namespace {
+            LogNamespace::Legacy => {
+                assert_eq!(log["s3_event_time"], Value::Timestamp(event_time));
+                // `timestamp` keeps its meaning: the object's Last-Modified time.
+                assert_eq!(log["timestamp"], Value::Timestamp(last_modified));
+            }
+            LogNamespace::Vector => {
+                assert_eq!(
+                    log.get(metadata_path!("aws_s3", "event_time")),
+                    Some(&Value::Timestamp(event_time))
+                );
+                assert_eq!(
+                    log.get(metadata_path!("aws_s3", "timestamp")),
+                    Some(&Value::Timestamp(last_modified))
+                );
+                // Nothing is added to the event itself.
+                assert_eq!(log.value(), &Value::from("line"));
+            }
+        }
+
+        // The field is part of the declared schema.
+        let config = AwsS3Config::default();
+        let definition = config
+            .outputs(namespace)
+            .pop()
+            .unwrap()
+            .schema_definition
+            .unwrap();
+        definition
+            .is_valid_for_event(&Event::Log(log))
+            .unwrap_or_else(|error| panic!("{namespace:?}: {error}"));
+    }
 }
 
 #[test]
