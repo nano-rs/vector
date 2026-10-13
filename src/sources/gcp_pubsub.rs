@@ -350,10 +350,12 @@ const fn default_poll_time() -> Duration {
     Duration::from_secs(2)
 }
 
-#[async_trait::async_trait]
-#[typetag::serde(name = "gcp_pubsub")]
-impl SourceConfig for PubsubConfig {
-    async fn build(&self, cx: SourceContext) -> crate::Result<crate::sources::Source> {
+impl PubsubConfig {
+    fn build_with_auth(
+        &self,
+        cx: SourceContext,
+        auth: GcpAuthenticator,
+    ) -> crate::Result<crate::sources::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
         let ack_deadline_secs = match self.ack_deadline_seconds {
             None => self.ack_deadline_secs,
@@ -377,8 +379,6 @@ impl SourceConfig for PubsubConfig {
                 Duration::from_secs_f64(rds)
             }
         };
-
-        let auth = self.auth.build(Scope::PubSub).await?;
 
         let mut uri: Uri = self.endpoint.parse().context(UriSnafu)?;
         auth.apply_uri(&mut uri);
@@ -434,6 +434,17 @@ impl SourceConfig for PubsubConfig {
         .run_all(self.max_concurrency, self.poll_time_seconds)
         .map_err(|error| error!(message = "Source failed.", %error));
         Ok(Box::pin(source))
+    }
+}
+
+#[async_trait::async_trait]
+#[typetag::serde(name = "gcp_pubsub")]
+impl SourceConfig for PubsubConfig {
+    async fn build(&self, cx: SourceContext) -> crate::Result<crate::sources::Source> {
+        // Refused credentials must not fail the build (and with it every other source of this
+        // Vector): the source starts, logs the error, and starts pulling once a token is granted.
+        let auth = self.auth.build_deferred(Scope::PubSub).await?;
+        self.build_with_auth(cx, auth)
     }
 
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
@@ -571,6 +582,18 @@ impl PubsubSource {
     }
 
     async fn run_once(&mut self, busy_flag: &Arc<AtomicBool>) -> State {
+        if self.auth.awaiting_token() {
+            // The credentials were refused at startup: pulling unauthenticated would only fail.
+            // The token regenerator keeps retrying (and logging); pull once it gets a token.
+            info!("Waiting for a GCP authentication token before pulling.");
+            tokio::select! {
+                _ = &mut self.shutdown => return State::Shutdown,
+                changed = self.token_generator.changed() => if changed.is_err() {
+                    return State::RetryDelay;
+                },
+            }
+        }
+
         let connection = match self.endpoint.connect().await {
             Ok(connection) => connection,
             Err(error) => {
@@ -1043,6 +1066,8 @@ mod shutdown_release_tests {
         modacks: Vec<(String, i32)>,
         /// The open stream's sender, for responses pushed by the test.
         outbound: Option<mpsc::Sender<Result<StreamingPullResponse, Status>>>,
+        /// The `authorization` metadata of every streaming pull.
+        authorizations: Vec<Option<String>>,
     }
 
     #[derive(Clone, Default)]
@@ -1057,7 +1082,15 @@ mod shutdown_release_tests {
             request: tonic::Request<tonic::Streaming<StreamingPullRequest>>,
         ) -> Result<tonic::Response<Self::StreamingPullStream>, Status> {
             let (tx, rx) = mpsc::channel(16);
-            self.0.lock().unwrap().outbound = Some(tx);
+            let authorization = request
+                .metadata()
+                .get("authorization")
+                .map(|value| value.to_str().unwrap().to_string());
+            {
+                let mut recorded = self.0.lock().unwrap();
+                recorded.outbound = Some(tx);
+                recorded.authorizations.push(authorization);
+            }
             let recorded = Arc::clone(&self.0);
             let mut inbound = request.into_inner();
             tokio::spawn(async move {
@@ -1217,6 +1250,95 @@ mod shutdown_release_tests {
     fn sorted(mut ids: Vec<String>) -> Vec<String> {
         ids.sort();
         ids
+    }
+
+    /// Refused credentials (here: the metadata server refusing the first token) do not fail the
+    /// build. The source starts without pulling, and once a token is granted it pulls, with that
+    /// token, without being restarted.
+    #[tokio::test]
+    async fn refused_credentials_start_the_source_and_it_pulls_once_they_work() {
+        let metadata = crate::gcp::test_util::FakeMetadata::start(1);
+        let server = FakePubsub::default();
+        let (_port, addr) = next_addr();
+        let service = SubscriberServer::new(server.clone());
+        tokio::spawn(Server::builder().add_service(service).serve(addr));
+
+        let (tx, rx) = SourceSender::new_test();
+        let mut events: SourceSenderStream = Box::pin(rx);
+        let component = ComponentKey::from("gcp_pubsub");
+        let config: PubsubConfig = toml::from_str(&format!(
+            r#"
+            project = "project"
+            subscription = "subscription"
+            endpoint = "http://{addr}"
+            "#
+        ))
+        .unwrap();
+        let (mut cx, mut shutdown) = SourceContext::new_shutdown(&component, tx);
+        cx.acknowledgements = true;
+        // What `build` does, with the metadata server pointed at the fake.
+        let auth =
+            GcpAuthenticator::new_implicit_deferred(metadata.url.clone(), Duration::from_secs(10))
+                .await
+                .expect("refused credentials must not fail the build");
+        let source = config.build_with_auth(cx, auth).expect("build source");
+        let source = tokio::spawn(async move { source.await.expect("source failed") });
+
+        // Refused: the source runs, but does not pull without a token.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!source.is_finished());
+        assert!(server.0.lock().unwrap().authorizations.is_empty());
+        assert_eq!(metadata.requests(), 1);
+
+        // The token regenerator retries after 2 s and gets a token: the source pulls with it.
+        server
+            .wait_for("the streaming pull", |r| r.outbound.is_some())
+            .await;
+        assert_eq!(
+            server.0.lock().unwrap().authorizations,
+            vec![Some("Bearer token-2".to_string())]
+        );
+        server.send(&["a"]).await;
+        let event = tokio::time::timeout(Duration::from_secs(10), events.next())
+            .await
+            .expect("timed out receiving")
+            .expect("stream ended");
+        deliver(event);
+        server
+            .wait_for("the acknowledgement", |r| r.acks == ["a"])
+            .await;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        assert!(shutdown.shutdown_source(&component, deadline).await);
+        source.await.unwrap();
+    }
+
+    /// Malformed configuration still fails the build.
+    #[tokio::test]
+    async fn bad_configuration_still_fails_the_build() {
+        for (case, auth) in [
+            ("bad API key", r#"api_key = "abc%xyz""#),
+            (
+                "missing credentials file",
+                r#"credentials_path = "/nonexistent/credentials.json""#,
+            ),
+        ] {
+            let config: PubsubConfig = toml::from_str(&format!(
+                r#"
+                project = "project"
+                subscription = "subscription"
+                {auth}
+                "#
+            ))
+            .unwrap();
+            let (tx, _rx) = SourceSender::new_test();
+            let component = ComponentKey::from("gcp_pubsub");
+            let (cx, _shutdown) = SourceContext::new_shutdown(&component, tx);
+            assert!(
+                config.build(cx).await.is_err(),
+                "{case} must fail the build"
+            );
+        }
     }
 
     /// Delivered messages are acknowledged; the ones still in flight at shutdown are released
