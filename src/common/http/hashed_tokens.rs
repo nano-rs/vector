@@ -415,7 +415,10 @@ mod tests {
             TokenCheck::NotListed { .. }
         ));
         assert!(matches!(store.check(None), TokenCheck::NotListed { .. }));
-        assert!(matches!(store.check(Some("")), TokenCheck::NotListed { .. }));
+        assert!(matches!(
+            store.check(Some("")),
+            TokenCheck::NotListed { .. }
+        ));
     }
 
     #[test]
@@ -487,7 +490,10 @@ mod tests {
         let path = dir.path().join("tokens.json");
         write(&path, &file_with(&[("tok-a", "id-a", "a")], true));
         let store = store(&path, 0);
-        write(&path, "{\"version\": 1, \"tokens\": [{\"sha256\": \"zz\", \"id\": \"x\"}]}");
+        write(
+            &path,
+            "{\"version\": 1, \"tokens\": [{\"sha256\": \"zz\", \"id\": \"x\"}]}",
+        );
         assert!(matches!(store.check(Some("tok-a")), TokenCheck::Matched(_)));
         write(&path, "not json");
         assert!(matches!(store.check(Some("tok-a")), TokenCheck::Matched(_)));
@@ -525,10 +531,10 @@ mod tests {
     #[test]
     fn stamp_overwrites_metadata() {
         let mut event = Event::Log(LogEvent::from("message"));
-        event
-            .metadata_mut()
-            .value_mut()
-            .insert(vrl::path!(CREDENTIAL_ID_METADATA_KEY), Value::from("forged"));
+        event.metadata_mut().value_mut().insert(
+            vrl::path!(CREDENTIAL_ID_METADATA_KEY),
+            Value::from("forged"),
+        );
         HashedCredential {
             id: "id-a".into(),
             name: "a".into(),
@@ -547,8 +553,7 @@ mod tests {
 
     #[test]
     fn config_defaults_interval() {
-        let config: HashedTokensFileConfig =
-            toml::from_str("path = \"/tmp/tokens.json\"").unwrap();
+        let config: HashedTokensFileConfig = toml::from_str("path = \"/tmp/tokens.json\"").unwrap();
         assert_eq!(config.reload_interval_secs, 2);
         assert!(toml::from_str::<HashedTokensFileConfig>("path = \"/x\"\nbogus = 1").is_err());
     }

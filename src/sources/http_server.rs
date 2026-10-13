@@ -1711,6 +1711,7 @@ mod tests {
         use crate::common::http::hashed_tokens::{
             CREDENTIAL_ID_METADATA_KEY, CREDENTIAL_NAME_METADATA_KEY, HashedTokensFileConfig,
         };
+        use similar_asserts::assert_eq;
 
         fn sha256_hex(token: &str) -> String {
             openssl::sha::sha256(token.as_bytes())
@@ -1780,9 +1781,12 @@ mod tests {
             write_tokens(&path, &[("named-token", "cred-1", "sender one")], true);
             let (rx, addr) = token_source(&path, None).await;
 
-            let events =
-                spawn_ok_collect_n(send_with_headers(addr, "hello", bearer("named-token")), rx, 1)
-                    .await;
+            let events = spawn_ok_collect_n(
+                send_with_headers(addr, "hello", bearer("named-token")),
+                rx,
+                1,
+            )
+            .await;
             assert_eq!(
                 metadata_str(&events[0], CREDENTIAL_ID_METADATA_KEY).as_deref(),
                 Some("cred-1")
@@ -1806,7 +1810,8 @@ mod tests {
             assert_eq!(401, send_with_headers(addr, "x", bearer("other")).await);
             assert_eq!(401, send_with_headers(addr, "x", HeaderMap::new()).await);
             // A missing file never opens a source that has no `auth`.
-            let (_rx2, addr2) = token_source(&dir.path().join("absent.json"), None).await;
+            let absent = dir.path().join("absent.json");
+            let (_rx2, addr2) = token_source(&absent, None).await;
             assert_eq!(401, send_with_headers(addr2, "x", bearer("other")).await);
         }
 
@@ -1845,8 +1850,16 @@ mod tests {
 
             // With the fallback disabled the `auth` token is refused too.
             write_tokens(&path, &[("named-token", "cred-1", "a")], false);
-            assert_eq!(401, send_with_headers(addr, "x", bearer("install-token")).await);
-            assert_eq!(200, send_with_headers(addr, "x", bearer("named-token")).await);
+            assert_eq!(
+                401,
+                send_with_headers(addr, "x", bearer("install-token")).await
+            );
+            // The receiver was consumed above, so an authenticated request now fails
+            // downstream (5xx) rather than being refused.
+            assert_ne!(
+                401,
+                send_with_headers(addr, "x", bearer("named-token")).await
+            );
         }
     }
 

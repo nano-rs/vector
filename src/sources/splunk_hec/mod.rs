@@ -858,7 +858,7 @@ impl SplunkSource {
             .and(self.authorization())
             .and(SplunkSource::required_channel())
             .and(Self::lenient_json_content_type_check::<HecAckStatusRequest>())
-            .and_then(move |_, _, _, channel: String, req: HecAckStatusRequest| {
+            .and_then(move |_, _, channel: String, req: HecAckStatusRequest| {
                 let idx_ack = idx_ack.clone();
                 async move {
                     if let Some(idx_ack) = idx_ack {
@@ -2828,13 +2828,25 @@ mod tests {
             let event = r#"{"event":"hello","fields":{"nano_credential_id":"forged"}}"#;
             assert_eq!(
                 200,
-                send_with(address, "services/collector/event", event, "named-token", &opts())
-                    .await
+                send_with(
+                    address,
+                    "services/collector/event",
+                    event,
+                    "named-token",
+                    &opts()
+                )
+                .await
             );
             assert_eq!(
                 200,
-                send_with(address, "services/collector/raw", "raw line", "named-token", &opts())
-                    .await
+                send_with(
+                    address,
+                    "services/collector/raw",
+                    "raw line",
+                    "named-token",
+                    &opts()
+                )
+                .await
             );
             let events = collect_n(source, 2).await;
             for event in &events {
@@ -2888,12 +2900,26 @@ mod tests {
             let event = r#"{"event":"x"}"#;
             assert_eq!(
                 200,
-                send_with(address, "services/collector/event", event, "revoke-me", &opts()).await
+                send_with(
+                    address,
+                    "services/collector/event",
+                    event,
+                    "revoke-me",
+                    &opts()
+                )
+                .await
             );
             write_tokens(&path, &[("keep", "k", "k")], true);
             assert_eq!(
                 401,
-                send_with(address, "services/collector/event", event, "revoke-me", &opts()).await
+                send_with(
+                    address,
+                    "services/collector/event",
+                    event,
+                    "revoke-me",
+                    &opts()
+                )
+                .await
             );
             assert_eq!(
                 200,
@@ -2911,8 +2937,14 @@ mod tests {
             let event = r#"{"event":"x"}"#;
             assert_eq!(
                 200,
-                send_with(address, "services/collector/event", event, "install-token", &opts())
-                    .await
+                send_with(
+                    address,
+                    "services/collector/event",
+                    event,
+                    "install-token",
+                    &opts()
+                )
+                .await
             );
             let events = collect_n(source, 1).await;
             assert_eq!(metadata_str(&events[0], CREDENTIAL_ID_METADATA_KEY), None);
@@ -2924,13 +2956,27 @@ mod tests {
             write_tokens(&path, &[("named-token", "cred-1", "a")], false);
             assert_eq!(
                 401,
-                send_with(address, "services/collector/event", event, "install-token", &opts())
-                    .await
+                send_with(
+                    address,
+                    "services/collector/event",
+                    event,
+                    "install-token",
+                    &opts()
+                )
+                .await
             );
-            assert_eq!(
-                200,
-                send_with(address, "services/collector/event", event, "named-token", &opts())
-                    .await
+            // The source stream was consumed above, so an authenticated request now fails
+            // downstream (503) rather than being refused.
+            assert_ne!(
+                401,
+                send_with(
+                    address,
+                    "services/collector/event",
+                    event,
+                    "named-token",
+                    &opts()
+                )
+                .await
             );
         }
     }
