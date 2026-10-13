@@ -1277,9 +1277,10 @@ mod shutdown_release_tests {
         let (mut cx, mut shutdown) = SourceContext::new_shutdown(&component, tx);
         cx.acknowledgements = true;
         // What `build` does, with the metadata server pointed at the fake.
-        let auth = GcpAuthenticator::new_implicit_deferred(metadata.url.clone())
-            .await
-            .expect("refused credentials must not fail the build");
+        let auth =
+            GcpAuthenticator::new_implicit_deferred(metadata.url.clone(), Duration::from_secs(10))
+                .await
+                .expect("refused credentials must not fail the build");
         let source = config.build_with_auth(cx, auth).expect("build source");
         let source = tokio::spawn(async move { source.await.expect("source failed") });
 

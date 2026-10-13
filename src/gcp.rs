@@ -18,7 +18,13 @@ use hyper::header::AUTHORIZATION;
 use smpl_jwt::Jwt;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::watch;
-use vector_lib::{configurable::configurable_component, sensitive_string::SensitiveString};
+use vector_lib::{
+    NamedInternalEvent,
+    configurable::configurable_component,
+    counter,
+    internal_event::{CounterName, InternalEvent, error_stage, error_type},
+    sensitive_string::SensitiveString,
+};
 
 use crate::{
     config::ProxyConfig,
@@ -35,6 +41,11 @@ const METADATA_TOKEN_ERROR_RETRY_SECS: u64 = 2;
 
 /// Upper bound of the retry backoff while a deferred authenticator has no token yet.
 const DEFERRED_TOKEN_MAX_RETRY_SECS: u64 = 60;
+
+/// How long a deferred authenticator waits for a token (the first one at build, and each retry
+/// while it has none) before treating the attempt as failed. A token endpoint that hangs must not
+/// hang the build, which would keep every other component of the Vector from starting.
+const DEFERRED_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub const PUBSUB_URL: &str = "https://pubsub.googleapis.com";
 
@@ -145,8 +156,11 @@ impl GcpAuthConfig {
                 (Some(path), _) => GcpAuthenticator::from_file_deferred(path, scope).await?,
                 (None, Some(api_key)) => GcpAuthenticator::from_api_key(api_key.inner())?,
                 (None, None) => {
-                    GcpAuthenticator::new_implicit_deferred(SERVICE_ACCOUNT_TOKEN_URL.into())
-                        .await?
+                    GcpAuthenticator::new_implicit_deferred(
+                        SERVICE_ACCOUNT_TOKEN_URL.into(),
+                        DEFERRED_TOKEN_TIMEOUT,
+                    )
+                    .await?
                 }
             }
         })
@@ -185,19 +199,25 @@ impl GcpAuthenticator {
         let creds = Credentials::from_file(path).context(InvalidCredentialsSnafu)?;
         // Checked here so that a malformed key fails the build instead of being retried.
         creds.rsa_key().context(InvalidRsaKeySnafu)?;
-        let token = fetch_token(&creds, &scope)
-            .await
-            .map_err(|error| error.to_string());
+        let token =
+            match tokio::time::timeout(DEFERRED_TOKEN_TIMEOUT, fetch_token(&creds, &scope)).await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err(timed_out(DEFERRED_TOKEN_TIMEOUT)),
+            };
         Ok(Self::with_token(
             Some((creds, scope)),
             deferred_first_token(token),
         ))
     }
 
-    pub(crate) async fn new_implicit_deferred(metadata_url: String) -> crate::Result<Self> {
-        let token = match get_token_implicit(&metadata_url).await {
-            Err(error @ GcpError::BuildHttpClient { .. }) => return Err(error.into()),
-            result => result.map_err(|error| error.to_string()),
+    pub(crate) async fn new_implicit_deferred(
+        metadata_url: String,
+        timeout: Duration,
+    ) -> crate::Result<Self> {
+        let token = match tokio::time::timeout(timeout, get_token_implicit(&metadata_url)).await {
+            Ok(Err(error @ GcpError::BuildHttpClient { .. })) => return Err(error.into()),
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(_) => Err(timed_out(timeout)),
         };
         Ok(Self::Credentials(Arc::new(InnerCreds {
             creds: None,
@@ -329,7 +349,16 @@ impl GcpAuthenticator {
                         "Sleeping before refreshing GCP authentication token.",
                     );
                     tokio::time::sleep(deadline).await;
-                    match inner.regenerate_token().await {
+                    let had_token = inner.has_token();
+                    let result = if had_token {
+                        inner.regenerate_token().await
+                    } else {
+                        // Still deferred: a hanging token endpoint must not stall the retries.
+                        tokio::time::timeout(DEFERRED_TOKEN_TIMEOUT, inner.regenerate_token())
+                            .await
+                            .unwrap_or_else(|_| Err(timed_out(DEFERRED_TOKEN_TIMEOUT).into()))
+                    };
+                    match result {
                         Ok(()) => {
                             sender.send_replace(());
                             debug!("GCP authentication token renewed.");
@@ -338,6 +367,12 @@ impl GcpAuthenticator {
                             // This scenario is handled by retrying the token refresh after the
                             // METADATA_TOKEN_ERROR_RETRY_SECS period when a fresh token is expected
                             expires_in = inner.expires_in().unwrap_or(0);
+                        }
+                        Err(error) if !had_token => {
+                            emit!(GcpAuthTokenDeferredError {
+                                error: &error.to_string(),
+                                retry_in: Duration::from_secs(no_token_retry),
+                            });
                         }
                         Err(error) => {
                             error!(
@@ -390,13 +425,48 @@ fn deferred_first_token(token: Result<Token, String>) -> Option<Token> {
     match token {
         Ok(token) => Some(token),
         Err(error) => {
-            error!(
-                message = "Failed to get GCP authentication token; starting without one and retrying.",
-                %error,
-                retry_in_secs = METADATA_TOKEN_ERROR_RETRY_SECS,
-            );
+            emit!(GcpAuthTokenDeferredError {
+                error: &error,
+                retry_in: Duration::from_secs(METADATA_TOKEN_ERROR_RETRY_SECS),
+            });
             None
         }
+    }
+}
+
+fn timed_out(timeout: Duration) -> String {
+    format!(
+        "timed out after {} s waiting for the token endpoint",
+        timeout.as_secs_f64()
+    )
+}
+
+/// A deferred authenticator (see [`GcpAuthConfig::build_deferred`]) could not get a token, so
+/// its component runs without one and retries. Counted as a component error, so refused
+/// credentials show up in `component_errors_total`.
+#[derive(Debug, NamedInternalEvent)]
+struct GcpAuthTokenDeferredError<'a> {
+    error: &'a str,
+    retry_in: Duration,
+}
+
+impl InternalEvent for GcpAuthTokenDeferredError<'_> {
+    fn emit(self) {
+        error!(
+            message = "Failed to get GCP authentication token; running without one and retrying.",
+            error = %self.error,
+            retry_in_secs = self.retry_in.as_secs_f64(),
+            error_code = "failed_getting_token",
+            error_type = error_type::REQUEST_FAILED,
+            stage = error_stage::RECEIVING,
+        );
+        counter!(
+            CounterName::ComponentErrorsTotal,
+            "error_code" => "failed_getting_token",
+            "error_type" => error_type::REQUEST_FAILED,
+            "stage" => error_stage::RECEIVING,
+        )
+        .increment(1);
     }
 }
 
@@ -469,6 +539,7 @@ pub(crate) mod test_util {
         Body, Response, Server, StatusCode,
         service::{make_service_fn, service_fn},
     };
+    use tokio::time::Duration;
 
     use crate::test_util::addr::{PortGuard, next_addr};
 
@@ -483,6 +554,16 @@ pub(crate) mod test_util {
         /// revoked credentials (403 with an OAuth error), then serves token `token-<n>` for the
         /// n-th request.
         pub(crate) fn start(refusals: usize) -> Self {
+            Self::start_with(refusals, None)
+        }
+
+        /// Answers the first token request only after `delay` (a hanging endpoint), then serves
+        /// tokens right away.
+        pub(crate) fn start_hanging_first(delay: Duration) -> Self {
+            Self::start_with(0, Some(delay))
+        }
+
+        fn start_with(refusals: usize, first_delay: Option<Duration>) -> Self {
             let (port, addr) = next_addr();
             let requests = Arc::new(AtomicUsize::new(0));
             let counter = Arc::clone(&requests);
@@ -518,7 +599,13 @@ pub(crate) mod test_util {
                             .status(status)
                             .body(Body::from(body))
                             .unwrap();
-                        async move { Ok::<_, Infallible>(response) }
+                        let delay = first_delay.filter(|_| n == 1);
+                        async move {
+                            if let Some(delay) = delay {
+                                tokio::time::sleep(delay).await;
+                            }
+                            Ok::<_, Infallible>(response)
+                        }
                     }))
                 }
             });
@@ -599,9 +686,10 @@ mod tests {
     #[tokio::test]
     async fn deferred_implicit_token_is_retried_until_it_works() {
         let metadata = test_util::FakeMetadata::start(2);
-        let auth = GcpAuthenticator::new_implicit_deferred(metadata.url.clone())
-            .await
-            .expect("a refused token must not fail the build");
+        let auth =
+            GcpAuthenticator::new_implicit_deferred(metadata.url.clone(), DEFERRED_TOKEN_TIMEOUT)
+                .await
+                .expect("a refused token must not fail the build");
         assert!(auth.awaiting_token());
         assert_eq!(auth.make_token(), None);
         let mut request = http::Request::get("http://example.com").body(()).unwrap();
@@ -624,12 +712,40 @@ mod tests {
         );
     }
 
+    /// A token endpoint that hangs does not hang the build: the first fetch times out, the
+    /// authenticator starts without a token, and the retries get one once the endpoint answers.
+    #[tokio::test]
+    async fn deferred_implicit_token_endpoint_hanging_does_not_hang_the_build() {
+        let metadata = test_util::FakeMetadata::start_hanging_first(Duration::from_secs(30));
+        let start = tokio::time::Instant::now();
+        let auth = GcpAuthenticator::new_implicit_deferred(
+            metadata.url.clone(),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("a hanging token endpoint must not fail the build");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "build waited {:?}",
+            start.elapsed()
+        );
+        assert!(auth.awaiting_token());
+
+        let mut regenerated = auth.spawn_regenerate_token();
+        tokio::time::timeout(Duration::from_secs(30), regenerated.changed())
+            .await
+            .expect("no token after the endpoint started answering")
+            .unwrap();
+        assert_eq!(auth.make_token().as_deref(), Some("Bearer token-2"));
+    }
+
     #[tokio::test]
     async fn deferred_implicit_with_a_working_token_starts_with_it() {
         let metadata = test_util::FakeMetadata::start(0);
-        let auth = GcpAuthenticator::new_implicit_deferred(metadata.url.clone())
-            .await
-            .unwrap();
+        let auth =
+            GcpAuthenticator::new_implicit_deferred(metadata.url.clone(), DEFERRED_TOKEN_TIMEOUT)
+                .await
+                .unwrap();
         assert!(!auth.awaiting_token());
         assert_eq!(auth.make_token().as_deref(), Some("Bearer token-1"));
     }
