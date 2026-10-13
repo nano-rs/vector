@@ -41,7 +41,7 @@ use crate::{
     },
 };
 
-const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+pub(super) const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// How long a partition waits on shutdown for in-flight events to be acknowledged.
 const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -113,15 +113,6 @@ impl PositionState {
     /// returned, which is what the store now holds (or keeps, see [`InitialCheckpoint`]).
     fn initialized(outcome: &InitialCheckpoint) -> Self {
         Self::new(Some(outcome.position().clone()))
-    }
-
-    /// The state when the initial checkpoint could not be written: read after `latest` anyway,
-    /// and let the periodic commit retry writing it.
-    fn uncommitted(latest: Position) -> Self {
-        Self {
-            acknowledged: Some(latest),
-            ..Default::default()
-        }
     }
 
     fn on_received(&mut self, position: Position, acknowledged_on_send: bool) {
@@ -340,12 +331,9 @@ impl PartitionReader {
     /// after that position rather than at `latest`, so nothing enqueued between the two is
     /// missed, and a restart before the first event resumes after it too.
     ///
-    /// Reading the partition properties is retried until it succeeds, as opening a receiver is.
-    /// If the checkpoint write fails, the partition is read anyway and the periodic commit retries
-    /// the write. That retry is an ordinary (unconditional) checkpoint write: it could only
-    /// replace a checkpoint that another consumer of the same partition and consumer group wrote
-    /// in the meantime, which this source does not coordinate with in any case (see
-    /// `owner_level`).
+    /// Reading the partition properties and writing the checkpoint are each retried until they
+    /// succeed, as opening a receiver is; `latest` is resolved once, so a retried write never
+    /// moves it forward.
     ///
     /// Returns `None` on shutdown.
     async fn initialize_checkpoint(&self, checkpointer: &Checkpointer) -> Option<PositionState> {
@@ -370,27 +358,36 @@ impl PartitionReader {
                 }
             }
         };
-        let result = tokio::select! {
-            biased;
-            _ = &mut shutdown => return None,
-            result = checkpointer.initialize(&self.partition_id, latest.clone()) => result,
-        };
-        Some(match result {
-            Ok(outcome) => {
-                emit!(AzureEventHubsInitialCheckpoint {
-                    partition_id: &self.partition_id,
-                    outcome: &outcome,
-                });
-                PositionState::initialized(&outcome)
+        // The write is retried with the same `latest` until it succeeds (a refused or missing
+        // checkpoint store, say), and the partition is not read meanwhile: reading first and
+        // committing later would let a restart before that commit resolve `latest` again and
+        // skip what was enqueued in between. The events wait in the partition.
+        backoff = BACKOFF_INITIAL;
+        loop {
+            let result = tokio::select! {
+                biased;
+                _ = &mut shutdown => return None,
+                result = checkpointer.initialize(&self.partition_id, latest.clone()) => result,
+            };
+            match result {
+                Ok(outcome) => {
+                    emit!(AzureEventHubsInitialCheckpoint {
+                        partition_id: &self.partition_id,
+                        outcome: &outcome,
+                    });
+                    return Some(PositionState::initialized(&outcome));
+                }
+                Err(error) => {
+                    emit!(AzureEventHubsCheckpointError {
+                        partition_id: &self.partition_id,
+                        error,
+                    });
+                    if !sleep_or_shutdown(&mut backoff, &mut shutdown).await {
+                        return None;
+                    }
+                }
             }
-            Err(error) => {
-                emit!(AzureEventHubsCheckpointError {
-                    partition_id: &self.partition_id,
-                    error,
-                });
-                PositionState::uncommitted(latest)
-            }
-        })
+        }
     }
 
     /// Writes the acknowledged position, if it changed. Failures are retried on the next tick.
@@ -499,7 +496,10 @@ impl PartitionReader {
 
 /// Sleeps for the current backoff, doubling it, unless shutdown comes first. Returns `false` on
 /// shutdown.
-async fn sleep_or_shutdown(backoff: &mut Duration, shutdown: &mut ShutdownSignal) -> bool {
+pub(super) async fn sleep_or_shutdown(
+    backoff: &mut Duration,
+    shutdown: &mut ShutdownSignal,
+) -> bool {
     let delay = *backoff;
     *backoff = (*backoff * 2).min(BACKOFF_MAX);
     tokio::select! {
@@ -745,14 +745,6 @@ mod tests {
             describe(&pos(5).after())
         );
         assert!(state.pending_commit().is_none());
-
-        // The write failed: read after `latest` anyway, and commit it on the next tick.
-        let state = PositionState::uncommitted(pos(9));
-        assert_eq!(
-            describe(&state.reconnect_start(&latest)),
-            describe(&pos(9).after())
-        );
-        assert_eq!(state.pending_commit(), Some(&pos(9)));
     }
 
     /// One partition, filtered the way the service applies a receiver's start position. Event
