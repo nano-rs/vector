@@ -1,4 +1,4 @@
-use std::{collections::HashMap, panic, str::FromStr, sync::Arc};
+use std::{collections::HashMap, panic, str::FromStr, sync::Arc, time::Duration};
 
 use aws_sdk_sqs::{
     Client as SqsClient,
@@ -17,6 +17,7 @@ use super::release::{self, InFlight, MAX_POLL_WAIT_SECS, ShutdownDeadlines, SqsR
 use crate::{
     SourceSender,
     codecs::Decoder,
+    common::backoff::ExponentialBackoff,
     event::{BatchNotifier, BatchStatus},
     internal_events::{
         EndpointBytesReceived, SqsMessageDeleteError, SqsMessageReceiveError, StreamClosedError,
@@ -27,6 +28,12 @@ use crate::{
 
 // This is the maximum SQS supports in a single batch request
 const MAX_BATCH_SIZE: i32 = 10;
+
+/// Upper bound of the delay between receives while they fail.
+const RECEIVE_ERROR_MAX_DELAY: Duration = Duration::from_secs(30);
+
+/// A receive request failed (the error is already emitted).
+struct ReceiveFailed;
 
 type Finalizer = UnorderedFinalizer<Vec<String>>;
 
@@ -79,8 +86,11 @@ impl SqsSource {
             let events_received = events_received.clone();
             let in_flight = in_flight.clone();
             task_handles.push(crate::spawn_in_current_span(async move {
+                // Failed receives (revoked credentials, a deleted queue, ...) are retried with
+                // backoff instead of in a tight loop. The wait ends at shutdown.
+                let mut backoff = ExponentialBackoff::default().max_delay(RECEIVE_ERROR_MAX_DELAY);
                 while shutdown.clone().now_or_never().is_none() {
-                    source
+                    let received = source
                         .run_once(
                             &mut out,
                             &mut finalizer,
@@ -89,6 +99,20 @@ impl SqsSource {
                             &shutdown,
                         )
                         .await;
+                    match received {
+                        Ok(()) => backoff.reset(),
+                        Err(ReceiveFailed) => {
+                            let delay = backoff.next().expect("backoff never ends");
+                            debug!(
+                                delay_ms = delay.as_millis() as u64,
+                                "Receiving failed, retrying after a delay."
+                            );
+                            select! {
+                                _ = shutdown.clone() => break,
+                                _ = tokio::time::sleep(delay) => {},
+                            }
+                        }
+                    }
                 }
             }));
         }
@@ -153,7 +177,7 @@ impl SqsSource {
         in_flight: &InFlight,
         events_received: Registered<EventsReceived>,
         shutdown: &ShutdownSignal,
-    ) {
+    ) -> Result<(), ReceiveFailed> {
         let receive = self
             .client
             .receive_message()
@@ -178,7 +202,7 @@ impl SqsSource {
                 drop(finalizer.take());
                 let Ok(Ok(output)) = tokio::time::timeout_at(deadlines.late_poll, receive).await
                 else {
-                    return;
+                    return Ok(());
                 };
                 let receipts: Vec<String> = output
                     .messages
@@ -191,7 +215,7 @@ impl SqsSource {
                     release::release("aws_sqs", &self.releaser(), receipts, false, deadlines.release)
                         .await;
                 }
-                return;
+                return Ok(());
             }
         };
 
@@ -199,7 +223,7 @@ impl SqsSource {
             Ok(output) => output,
             Err(err) => {
                 emit!(SqsMessageReceiveError { error: &err });
-                return;
+                return Err(ReceiveFailed);
             }
         };
 
@@ -254,11 +278,11 @@ impl SqsSource {
                     ShutdownDeadlines::release_from_now(),
                 )
                 .await;
-                return;
+                return Ok(());
             }
             // Received during shutdown: not sent downstream, released instead (in `run`).
             if shutdown.clone().now_or_never().is_some() {
-                return;
+                return Ok(());
             }
 
             // A send blocked on backpressure is abandoned on shutdown; its receipts are still
@@ -266,7 +290,7 @@ impl SqsSource {
             let sent = select! {
                 biased;
                 sent = out.send_batch(events) => sent,
-                _ = shutdown.clone() => return,
+                _ = shutdown.clone() => return Ok(()),
             };
             match sent {
                 Ok(()) => {
@@ -291,6 +315,7 @@ impl SqsSource {
                 Err(_) => emit!(StreamClosedError { count }),
             }
         }
+        Ok(())
     }
 }
 
@@ -346,6 +371,77 @@ mod tests {
         config::{SourceConfig, log_schema},
         sources::aws_sqs::AwsSqsConfig,
     };
+
+    /// A receive that keeps failing (here: refused credentials) is retried with backoff, not in
+    /// a tight loop, and shutting down does not wait for the backoff.
+    #[tokio::test]
+    async fn failing_receives_back_off_and_shutdown_interrupts_the_backoff() {
+        use std::{
+            convert::Infallible,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        use hyper::{
+            Body, Response, Server, StatusCode,
+            service::{make_service_fn, service_fn},
+        };
+
+        use crate::{SourceSender, config::ComponentKey, test_util::addr::next_addr};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let (_port, addr) = next_addr();
+        let make_service = make_service_fn(move |_| {
+            let counter = Arc::clone(&counter);
+            async move {
+                Ok::<_, Infallible>(service_fn(move |_request: hyper::Request<Body>| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let response = Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("content-type", "application/x-amz-json-1.0")
+                        .body(Body::from(
+                            r#"{"__type":"com.amazonaws.sqs#InvalidClientTokenId","message":"The security token included in the request is invalid."}"#,
+                        ))
+                        .unwrap();
+                    async move { Ok::<_, Infallible>(response) }
+                }))
+            }
+        });
+        tokio::spawn(Server::bind(&addr).serve(make_service));
+
+        let config: AwsSqsConfig = toml::from_str(&format!(
+            r#"
+            queue_url = "http://{addr}/000000000000/queue"
+            region = "us-east-1"
+            endpoint = "http://{addr}"
+            client_concurrency = 1
+            auth.access_key_id = "revoked"
+            auth.secret_access_key = "revoked"
+            "#
+        ))
+        .unwrap();
+        let (tx, _rx) = SourceSender::new_test();
+        let component = ComponentKey::from("aws_sqs");
+        let (cx, mut shutdown) = crate::config::SourceContext::new_shutdown(&component, tx);
+        let source = tokio::spawn(config.build(cx).await.expect("build source"));
+
+        // Back-to-back failures would be hundreds of requests; with the backoff (0.5 s, 1 s,
+        // 2 s, ...) there are about four.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let sent = requests.load(Ordering::SeqCst);
+        assert!((2..=6).contains(&sent), "{sent} receive requests in 3 s");
+
+        // Shutdown ends the wait for the next retry (due at about 3.5 s, then 7.5 s) right away.
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(30);
+        assert!(shutdown.shutdown_source(&component, deadline).await);
+        source.await.unwrap().unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
 
     #[tokio::test]
     async fn test_decode_vector_namespace() {

@@ -33,6 +33,9 @@ const METADATA_TOKEN_EXPIRY_MARGIN_SECS: u64 = 200;
 
 const METADATA_TOKEN_ERROR_RETRY_SECS: u64 = 2;
 
+/// Upper bound of the retry backoff while a deferred authenticator has no token yet.
+const DEFERRED_TOKEN_MAX_RETRY_SECS: u64 = 60;
+
 pub const PUBSUB_URL: &str = "https://pubsub.googleapis.com";
 
 pub static PUBSUB_ADDRESS: LazyLock<String> = LazyLock::new(|| {
@@ -120,6 +123,34 @@ impl GcpAuthConfig {
             }
         })
     }
+
+    /// Like [`Self::build`], but a failure to obtain the first token does not fail the build.
+    ///
+    /// Configuration errors (unreadable or malformed credentials file, invalid RSA key, invalid
+    /// API key) still fail. Any other failure to get the first token (refused credentials, an
+    /// unreachable token endpoint) is logged, and the authenticator starts without a token: it
+    /// applies no `Authorization` header until the token regenerator spawned by
+    /// [`GcpAuthenticator::spawn_regenerate_token`] gets one, retrying with a backoff starting at
+    /// 2 seconds, and signals that receiver when it does.
+    ///
+    /// Meant for sources, which should start and recover by themselves once the credentials work,
+    /// instead of failing the whole configuration.
+    pub async fn build_deferred(&self, scope: Scope) -> crate::Result<GcpAuthenticator> {
+        Ok(if self.skip_authentication {
+            GcpAuthenticator::None
+        } else {
+            let gap = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok();
+            let creds_path = self.credentials_path.as_ref().or(gap.as_ref());
+            match (&creds_path, &self.api_key) {
+                (Some(path), _) => GcpAuthenticator::from_file_deferred(path, scope).await?,
+                (None, Some(api_key)) => GcpAuthenticator::from_api_key(api_key.inner())?,
+                (None, None) => {
+                    GcpAuthenticator::new_implicit_deferred(SERVICE_ACCOUNT_TOKEN_URL.into())
+                        .await?
+                }
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -132,21 +163,55 @@ pub enum GcpAuthenticator {
 #[derive(Debug)]
 pub struct InnerCreds {
     creds: Option<(Credentials, Scope)>,
-    token: RwLock<Token>,
+    /// Where implicit (`creds == None`) tokens are fetched from.
+    metadata_url: Box<str>,
+    /// `None` only for a deferred authenticator that has not obtained its first token yet.
+    token: RwLock<Option<Token>>,
 }
 
 impl GcpAuthenticator {
     async fn from_file(path: &str, scope: Scope) -> crate::Result<Self> {
         let creds = Credentials::from_file(path).context(InvalidCredentialsSnafu)?;
-        let token = RwLock::new(fetch_token(&creds, &scope).await?);
-        let creds = Some((creds, scope));
-        Ok(Self::Credentials(Arc::new(InnerCreds { creds, token })))
+        let token = fetch_token(&creds, &scope).await?;
+        Ok(Self::with_token(Some((creds, scope)), Some(token)))
     }
 
     async fn new_implicit() -> crate::Result<Self> {
-        let token = RwLock::new(get_token_implicit().await?);
-        let creds = None;
-        Ok(Self::Credentials(Arc::new(InnerCreds { creds, token })))
+        let token = get_token_implicit(SERVICE_ACCOUNT_TOKEN_URL).await?;
+        Ok(Self::with_token(None, Some(token)))
+    }
+
+    async fn from_file_deferred(path: &str, scope: Scope) -> crate::Result<Self> {
+        let creds = Credentials::from_file(path).context(InvalidCredentialsSnafu)?;
+        // Checked here so that a malformed key fails the build instead of being retried.
+        creds.rsa_key().context(InvalidRsaKeySnafu)?;
+        let token = fetch_token(&creds, &scope)
+            .await
+            .map_err(|error| error.to_string());
+        Ok(Self::with_token(
+            Some((creds, scope)),
+            deferred_first_token(token),
+        ))
+    }
+
+    pub(crate) async fn new_implicit_deferred(metadata_url: String) -> crate::Result<Self> {
+        let token = match get_token_implicit(&metadata_url).await {
+            Err(error @ GcpError::BuildHttpClient { .. }) => return Err(error.into()),
+            result => result.map_err(|error| error.to_string()),
+        };
+        Ok(Self::Credentials(Arc::new(InnerCreds {
+            creds: None,
+            metadata_url: metadata_url.into(),
+            token: RwLock::new(deferred_first_token(token)),
+        })))
+    }
+
+    fn with_token(creds: Option<(Credentials, Scope)>, token: Option<Token>) -> Self {
+        Self::Credentials(Arc::new(InnerCreds {
+            creds,
+            metadata_url: SERVICE_ACCOUNT_TOKEN_URL.into(),
+            token: RwLock::new(token),
+        }))
     }
 
     fn from_api_key(api_key: &str) -> crate::Result<Self> {
@@ -158,8 +223,17 @@ impl GcpAuthenticator {
 
     pub fn make_token(&self) -> Option<String> {
         match self {
-            Self::Credentials(inner) => Some(inner.make_token()),
+            Self::Credentials(inner) => inner.make_token(),
             Self::ApiKey(_) | Self::None => None,
+        }
+    }
+
+    /// Whether this is a deferred authenticator still waiting for its first token (see
+    /// [`GcpAuthConfig::build_deferred`]). Requests made meanwhile are unauthenticated.
+    pub fn awaiting_token(&self) -> bool {
+        match self {
+            Self::Credentials(inner) => inner.token.read().unwrap().is_none(),
+            Self::ApiKey(_) | Self::None => false,
         }
     }
 
@@ -233,13 +307,23 @@ impl GcpAuthenticator {
     async fn token_regenerator(self, sender: watch::Sender<()>) {
         match self {
             Self::Credentials(inner) => {
-                let mut expires_in = inner.token.read().unwrap().expires_in() as u64;
+                // Without a token yet (deferred), the first retry is due right away.
+                let mut expires_in = inner.expires_in().unwrap_or(0);
+                // The backoff only applies while there is no token at all: once there is one,
+                // a failed refresh is retried every METADATA_TOKEN_ERROR_RETRY_SECS as before.
+                let mut no_token_retry = METADATA_TOKEN_ERROR_RETRY_SECS;
                 loop {
-                    let deadline = Duration::from_secs(
-                        expires_in
-                            .saturating_sub(METADATA_TOKEN_EXPIRY_MARGIN_SECS)
-                            .max(METADATA_TOKEN_ERROR_RETRY_SECS),
-                    );
+                    let deadline = if inner.has_token() {
+                        Duration::from_secs(
+                            expires_in
+                                .saturating_sub(METADATA_TOKEN_EXPIRY_MARGIN_SECS)
+                                .max(METADATA_TOKEN_ERROR_RETRY_SECS),
+                        )
+                    } else {
+                        let retry = no_token_retry;
+                        no_token_retry = (no_token_retry * 2).min(DEFERRED_TOKEN_MAX_RETRY_SECS);
+                        Duration::from_secs(retry)
+                    };
                     debug!(
                         deadline = deadline.as_secs(),
                         "Sleeping before refreshing GCP authentication token.",
@@ -253,7 +337,7 @@ impl GcpAuthenticator {
                             // the same (cached) token during the last 300 seconds of its lifetime.
                             // This scenario is handled by retrying the token refresh after the
                             // METADATA_TOKEN_ERROR_RETRY_SECS period when a fresh token is expected
-                            expires_in = inner.token.read().unwrap().expires_in() as u64;
+                            expires_in = inner.expires_in().unwrap_or(0);
                         }
                         Err(error) => {
                             error!(
@@ -279,15 +363,40 @@ impl InnerCreds {
     async fn regenerate_token(&self) -> crate::Result<()> {
         let token = match &self.creds {
             Some((creds, scope)) => fetch_token(creds, scope).await?,
-            None => get_token_implicit().await?,
+            None => get_token_implicit(&self.metadata_url).await?,
         };
-        *self.token.write().unwrap() = token;
+        *self.token.write().unwrap() = Some(token);
         Ok(())
     }
 
-    fn make_token(&self) -> String {
+    fn make_token(&self) -> Option<String> {
         let token = self.token.read().unwrap();
-        format!("{} {}", token.token_type(), token.access_token())
+        let token = token.as_ref()?;
+        Some(format!("{} {}", token.token_type(), token.access_token()))
+    }
+
+    fn has_token(&self) -> bool {
+        self.token.read().unwrap().is_some()
+    }
+
+    fn expires_in(&self) -> Option<u64> {
+        let token = self.token.read().unwrap();
+        token.as_ref().map(|token| token.expires_in() as u64)
+    }
+}
+
+/// The first token of a deferred authenticator: a failure is logged, not returned.
+fn deferred_first_token(token: Result<Token, String>) -> Option<Token> {
+    match token {
+        Ok(token) => Some(token),
+        Err(error) => {
+            error!(
+                message = "Failed to get GCP authentication token; starting without one and retrying.",
+                %error,
+                retry_in_secs = METADATA_TOKEN_ERROR_RETRY_SECS,
+            );
+            None
+        }
     }
 }
 
@@ -314,9 +423,9 @@ async fn fetch_token(creds: &Credentials, scope: &Scope) -> crate::Result<Token>
         .map_err(Into::into)
 }
 
-async fn get_token_implicit() -> Result<Token, GcpError> {
+async fn get_token_implicit(url: &str) -> Result<Token, GcpError> {
     debug!("Fetching implicit GCP authentication token.");
-    let req = http::Request::get(SERVICE_ACCOUNT_TOKEN_URL)
+    let req = http::Request::get(url)
         .header("Metadata-Flavor", "Google")
         .body(hyper::Body::empty())
         .unwrap();
@@ -342,6 +451,88 @@ async fn get_token_implicit() -> Result<Token, GcpError> {
             Ok(error) => GcpError::TokenFromJson { source: error },
             Err(_) => GcpError::TokenJsonFromStr { source: error },
         }),
+    }
+}
+
+/// A fake GCE metadata server for tests of deferred authentication.
+#[cfg(test)]
+pub(crate) mod test_util {
+    use std::{
+        convert::Infallible,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use hyper::{
+        Body, Response, Server, StatusCode,
+        service::{make_service_fn, service_fn},
+    };
+
+    use crate::test_util::addr::{PortGuard, next_addr};
+
+    pub(crate) struct FakeMetadata {
+        pub(crate) url: String,
+        requests: Arc<AtomicUsize>,
+        _port: PortGuard,
+    }
+
+    impl FakeMetadata {
+        /// Refuses the first `refusals` token requests the way the token endpoint refuses
+        /// revoked credentials (403 with an OAuth error), then serves token `token-<n>` for the
+        /// n-th request.
+        pub(crate) fn start(refusals: usize) -> Self {
+            let (port, addr) = next_addr();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&requests);
+            let make_service = make_service_fn(move |_| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    Ok::<_, Infallible>(service_fn(move |request: hyper::Request<Body>| {
+                        let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        let flavored = request
+                            .headers()
+                            .get("Metadata-Flavor")
+                            .is_some_and(|value| value == "Google");
+                        let (status, body) = if !flavored {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                "missing Metadata-Flavor".to_string(),
+                            )
+                        } else if n <= refusals {
+                            (
+                                StatusCode::FORBIDDEN,
+                                r#"{"error":"access_denied","error_description":"refused by the test"}"#
+                                    .to_string(),
+                            )
+                        } else {
+                            (
+                                StatusCode::OK,
+                                format!(
+                                    r#"{{"access_token":"token-{n}","token_type":"Bearer","expires_in":3599}}"#
+                                ),
+                            )
+                        };
+                        let response = Response::builder()
+                            .status(status)
+                            .body(Body::from(body))
+                            .unwrap();
+                        async move { Ok::<_, Infallible>(response) }
+                    }))
+                }
+            });
+            tokio::spawn(Server::bind(&addr).serve(make_service));
+            Self {
+                url: format!("http://{addr}/token"),
+                requests,
+                _port: port,
+            }
+        }
+
+        pub(crate) fn requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
     }
 }
 
@@ -401,6 +592,92 @@ mod tests {
             .await
             .expect_err("build failed to error");
         assert_downcast_matches!(error, GcpError, GcpError::InvalidApiKey { .. });
+    }
+
+    /// A refused first token does not fail a deferred build: the authenticator starts without
+    /// a token and gets one, with backoff (2 s, then 4 s), once the credentials work.
+    #[tokio::test]
+    async fn deferred_implicit_token_is_retried_until_it_works() {
+        let metadata = test_util::FakeMetadata::start(2);
+        let auth = GcpAuthenticator::new_implicit_deferred(metadata.url.clone())
+            .await
+            .expect("a refused token must not fail the build");
+        assert!(auth.awaiting_token());
+        assert_eq!(auth.make_token(), None);
+        let mut request = http::Request::get("http://example.com").body(()).unwrap();
+        auth.apply(&mut request);
+        assert!(request.headers().get(AUTHORIZATION).is_none());
+
+        let start = tokio::time::Instant::now();
+        let mut regenerated = auth.spawn_regenerate_token();
+        tokio::time::timeout(Duration::from_secs(30), regenerated.changed())
+            .await
+            .expect("no token after the credentials started working")
+            .unwrap();
+        assert!(!auth.awaiting_token());
+        assert_eq!(auth.make_token().as_deref(), Some("Bearer token-3"));
+        assert_eq!(metadata.requests(), 3);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(6),
+            "retried too fast: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_implicit_with_a_working_token_starts_with_it() {
+        let metadata = test_util::FakeMetadata::start(0);
+        let auth = GcpAuthenticator::new_implicit_deferred(metadata.url.clone())
+            .await
+            .unwrap();
+        assert!(!auth.awaiting_token());
+        assert_eq!(auth.make_token().as_deref(), Some("Bearer token-1"));
+    }
+
+    #[tokio::test]
+    async fn deferred_build_still_fails_on_bad_configuration() {
+        let error = build_deferred_auth(r#"api_key: "abc%xyz""#)
+            .await
+            .expect_err("a bad API key must fail the build");
+        assert_downcast_matches!(error, GcpError, GcpError::InvalidApiKey { .. });
+
+        let error = build_deferred_auth(r#"credentials_path: "/nonexistent/credentials.json""#)
+            .await
+            .expect_err("a missing credentials file must fail the build");
+        assert_downcast_matches!(error, GcpError, GcpError::InvalidCredentials { .. });
+
+        let path = crate::test_util::temp_file();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "type": "service_account",
+                "project_id": "project",
+                "private_key_id": "id",
+                "private_key": "not a key",
+                "client_email": "vector@project.iam.gserviceaccount.com",
+                "client_id": "1",
+                "auth_uri": "http://127.0.0.1:1/auth",
+                "token_uri": "http://127.0.0.1:1/token",
+                "auth_provider_x509_cert_url": "http://127.0.0.1:1/certs",
+                "client_x509_cert_url": "http://127.0.0.1:1/cert",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let error = build_deferred_auth(&format!("credentials_path: {:?}", path.to_str().unwrap()))
+            .await
+            .expect_err("a malformed private key must fail the build");
+        assert_downcast_matches!(error, GcpError, GcpError::InvalidRsaKey { .. });
+
+        let auth = build_deferred_auth("skip_authentication: true")
+            .await
+            .unwrap();
+        assert!(matches!(auth, GcpAuthenticator::None));
+    }
+
+    async fn build_deferred_auth(yaml: &str) -> crate::Result<GcpAuthenticator> {
+        let config: GcpAuthConfig = serde_yaml::from_str(yaml).expect("Invalid YAML");
+        config.build_deferred(Scope::PubSub).await
     }
 
     fn apply_uri(auth: &GcpAuthenticator, uri: &str) -> String {
