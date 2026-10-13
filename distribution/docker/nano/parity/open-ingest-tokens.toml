@@ -1,0 +1,40 @@
+# NAN-3770: open-core named ingest tokens. nanosiem's config/vector/00-base.toml
+# (http_ingest) and 02-hec-source.toml (splunk_hec_ingest) read the hashed
+# tokens file nano-api writes to the shared dynamic volume; a listed token
+# stamps %nano_credential_id / %nano_credential_name. A missing file is an
+# empty token list (the static install token still applies).
+[sources.http_ingest]
+type = "http_server"
+address = "0.0.0.0:8080"
+strict_path = false
+path = "/"
+framing.method = "newline_delimited"
+decoding.codec = "bytes"
+valid_tokens_file.path = "/etc/vector/dynamic/ingest-tokens/tokens.json"
+valid_tokens_file.reload_interval_secs = 2
+auth.strategy = "custom"
+auth.source = '''
+auth_header = to_string(.headers.authorization) ?? ""
+auth_header == "Bearer parity-not-a-secret"
+'''
+
+[sources.splunk_hec_ingest]
+type = "splunk_hec"
+address = "0.0.0.0:8088"
+valid_tokens = ["parity-not-a-secret"]
+valid_tokens_file.path = "/etc/vector/dynamic/ingest-tokens/tokens.json"
+valid_tokens_file.reload_interval_secs = 2
+acknowledgements.enabled = true
+
+[transforms.ingest_token_attribution]
+type = "remap"
+inputs = ["http_ingest", "splunk_hec_ingest"]
+source = '''
+credential_id = to_string(%nano_credential_id) ?? ""
+if credential_id != "" { .nano_credential_id = credential_id }
+'''
+
+[sinks.ingest_token_blackhole]
+type = "blackhole"
+inputs = ["ingest_token_attribution"]
+print_interval_secs = 0
