@@ -30,6 +30,11 @@ Every patch is a self-contained commit (squash-merge each PR), in this order:
    `.github/workflows/nano-image.yml` and `distribution/docker/nano/parity/`.
 3. `chore(nano): neutralise upstream workflows` (NAN-3604): deletes every upstream file in
    `.github/workflows/` and `.github/dependabot.yml`. See "Upstream CI is removed".
+4. `feat(splunk_hec, http_server sources): valid_tokens_file` (NAN-3770): hashed, hot-reloaded
+   per-sender ingest tokens for nanosiem open core. New file `src/common/http/hashed_tokens.rs`;
+   small hunks in `src/common/http/mod.rs`, `src/sources/util/http/prelude.rs`,
+   `src/sources/http_server.rs` and `src/sources/splunk_hec/mod.rs`; parity config
+   `distribution/docker/nano/parity/open-ingest-tokens.toml`.
 
 Rules that keep rebases cheap:
 

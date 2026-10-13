@@ -65,7 +65,10 @@ use self::{
 use crate::{
     SourceSender,
     codecs::DecodingConfig,
-    common::http::ErrorMessage,
+    common::http::{
+        ErrorMessage,
+        hashed_tokens::{HashedCredential, HashedTokenStore, HashedTokensFileConfig, TokenCheck},
+    },
     config::{DataType, Resource, SourceConfig, SourceContext, SourceOutput, log_schema},
     event::{Event, LogEvent, Value},
     http::{KeepaliveConfig, MaxConnectionAgeLayer, build_http_trace_layer},
@@ -115,6 +118,16 @@ pub struct SplunkConfig {
     /// If _not_ supplied, the `Authorization` header is ignored and requests are not authenticated.
     #[configurable(metadata(docs::examples = "A94A8FE5CCB19BA61C4C08"))]
     valid_tokens: Option<Vec<SensitiveString>>,
+
+    /// A file of SHA-256-hashed tokens, reloaded on change (nano fork).
+    ///
+    /// A request whose `Authorization: Splunk <token>` is listed in the file is accepted, and
+    /// its events get the credential's id and name in event metadata (`%nano_credential_id`,
+    /// `%nano_credential_name`). A request that is not listed is checked against
+    /// `valid_tokens`, unless the file disables the fallback. When this is set, requests are
+    /// always authenticated: with no `valid_tokens`, an unlisted token is refused.
+    #[serde(default)]
+    valid_tokens_file: Option<HashedTokensFileConfig>,
 
     /// Whether or not to forward the Splunk HEC authentication token with events.
     ///
@@ -205,6 +218,7 @@ impl Default for SplunkConfig {
             address: default_socket_address(),
             token: None,
             valid_tokens: None,
+            valid_tokens_file: None,
             tls: None,
             acknowledgements: Default::default(),
             store_hec_token: false,
@@ -458,6 +472,7 @@ impl SourceConfig for SplunkConfig {
 /// Shared data for responding to requests.
 struct SplunkSource {
     valid_credentials: Vec<String>,
+    hashed_tokens: Option<Arc<HashedTokenStore>>,
     protocol: &'static str,
     idx_ack: Option<Arc<IndexerAcknowledgement>>,
     store_hec_token: bool,
@@ -495,6 +510,10 @@ impl SplunkSource {
             valid_credentials: valid_tokens
                 .map(|token| format!("Splunk {}", token.inner()))
                 .collect(),
+            hashed_tokens: config
+                .valid_tokens_file
+                .as_ref()
+                .map(|file| Arc::new(HashedTokenStore::new(file))),
             protocol,
             idx_ack,
             store_hec_token: config.store_hec_token,
@@ -537,6 +556,7 @@ impl SplunkSource {
             .and_then(
                 move |_,
                       token: Option<String>,
+                      credential: Option<Arc<HashedCredential>>,
                       channel: Option<String>,
                       remote: Option<SocketAddr>,
                       remote_addr: Option<String>,
@@ -630,6 +650,10 @@ impl SplunkSource {
                                 };
                         }
 
+                        if let Some(credential) = credential.as_deref() {
+                            stamp_credential(&mut events, credential);
+                        }
+
                         if !events.is_empty() {
                             match out.send_batch(events).await {
                                 Ok(()) => (),
@@ -674,6 +698,7 @@ impl SplunkSource {
             .and_then(
                 move |_,
                       token: Option<String>,
+                      credential: Option<Arc<HashedCredential>>,
                       channel_id: String,
                       remote: Option<SocketAddr>,
                       xff: Option<String>,
@@ -721,6 +746,9 @@ impl SplunkSource {
                             if let Some(token) = token.filter(|_| store_hec_token) {
                                 event.metadata_mut().set_splunk_hec_token(token.into());
                             }
+                            if let Some(credential) = credential.as_deref() {
+                                credential.stamp(&mut event);
+                            }
                             let res = out.send_event(event).await;
                             return res
                                 .map(|_| maybe_ack_id)
@@ -732,7 +760,7 @@ impl SplunkSource {
                         // (rather than after the whole payload is decoded).
                         let token: Option<Arc<str>> =
                             token.filter(|_| store_hec_token).map(Arc::from);
-                        let (events, had_decode_errors) = raw_event(
+                        let (mut events, had_decode_errors) = raw_event(
                             body,
                             gzip,
                             channel_id.clone(),
@@ -744,6 +772,9 @@ impl SplunkSource {
                             Some(decoder),
                             token,
                         )?;
+                        if let Some(credential) = credential.as_deref() {
+                            stamp_credential(&mut events, credential);
+                        }
 
                         if events.is_empty() || had_decode_errors {
                             // With newline framing, `valid \n invalid \n valid`
@@ -827,7 +858,7 @@ impl SplunkSource {
             .and(self.authorization())
             .and(SplunkSource::required_channel())
             .and(Self::lenient_json_content_type_check::<HecAckStatusRequest>())
-            .and_then(move |_, channel: String, req: HecAckStatusRequest| {
+            .and_then(move |_, _, _, channel: String, req: HecAckStatusRequest| {
                 let idx_ack = idx_ack.clone();
                 async move {
                     if let Some(idx_ack) = idx_ack {
@@ -860,31 +891,48 @@ impl SplunkSource {
         post.or(get).unify().boxed()
     }
 
-    /// Authorize request
-    fn authorization(&self) -> BoxedFilter<(Option<String>,)> {
+    /// Authorize request. Yields the token (without the `Splunk ` prefix) and, when it is
+    /// listed in `valid_tokens_file`, the credential it belongs to.
+    fn authorization(&self) -> BoxedFilter<(Option<String>, Option<Arc<HashedCredential>>)> {
         let valid_credentials = self.valid_credentials.clone();
+        let hashed_tokens = self.hashed_tokens.clone();
         warp::header::optional("Authorization")
             .and_then(move |token: Option<String>| {
                 let valid_credentials = valid_credentials.clone();
+                let hashed_tokens = hashed_tokens.clone();
                 async move {
+                    if let Some(store) = hashed_tokens {
+                        match store.check_authorization(token.as_deref(), "Splunk") {
+                            TokenCheck::Matched(credential) => {
+                                return Ok((token.map(strip_splunk_prefix), Some(credential)));
+                            }
+                            // A configured file never opens the source: with no static
+                            // fallback (disabled, or no `valid_tokens`), unlisted is refused.
+                            TokenCheck::NotListed { fallback_enabled }
+                                if !fallback_enabled || valid_credentials.is_empty() =>
+                            {
+                                return Err(Rejection::from(if token.is_some() {
+                                    ApiError::InvalidAuthorization
+                                } else {
+                                    ApiError::MissingAuthorization
+                                }));
+                            }
+                            TokenCheck::NotListed { .. } => {}
+                        }
+                    }
                     match (token, valid_credentials.is_empty()) {
                         // Remove the "Splunk " prefix if present as it is not
                         // part of the token itself
-                        (token, true) => {
-                            Ok(token
-                                .map(|t| t.strip_prefix("Splunk ").map(Into::into).unwrap_or(t)))
+                        (token, true) => Ok((token.map(strip_splunk_prefix), None)),
+                        (Some(token), false) if valid_credentials.contains(&token) => {
+                            Ok((Some(strip_splunk_prefix(token)), None))
                         }
-                        (Some(token), false) if valid_credentials.contains(&token) => Ok(Some(
-                            token
-                                .strip_prefix("Splunk ")
-                                .map(Into::into)
-                                .unwrap_or(token),
-                        )),
                         (Some(_), false) => Err(Rejection::from(ApiError::InvalidAuthorization)),
                         (None, false) => Err(Rejection::from(ApiError::MissingAuthorization)),
                     }
                 }
             })
+            .untuple_one()
             .boxed()
     }
 
@@ -916,6 +964,19 @@ impl SplunkSource {
             .boxed()
     }
 }
+fn strip_splunk_prefix(token: String) -> String {
+    token
+        .strip_prefix("Splunk ")
+        .map(Into::into)
+        .unwrap_or(token)
+}
+
+fn stamp_credential(events: &mut [Event], credential: &HashedCredential) {
+    for event in events {
+        credential.stamp(event);
+    }
+}
+
 /// Constructs one or more events from json-s coming from reader.
 /// If errors, it's done with input.
 struct EventIterator<'de, R: JsonRead<'de>> {
@@ -2142,6 +2203,7 @@ mod tests {
                 address,
                 token,
                 valid_tokens,
+                valid_tokens_file: None,
                 tls: None,
                 acknowledgements: acknowledgements.unwrap_or_default(),
                 store_hec_token,
@@ -2683,6 +2745,194 @@ mod tests {
             );
         })
         .await;
+    }
+
+    // nano fork (NAN-3770): hashed tokens file.
+    mod hashed_tokens_file {
+        use std::path::Path;
+
+        use super::*;
+        use crate::common::http::hashed_tokens::{
+            CREDENTIAL_ID_METADATA_KEY, CREDENTIAL_NAME_METADATA_KEY,
+        };
+
+        fn sha256_hex(token: &str) -> String {
+            openssl::sha::sha256(token.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        }
+
+        fn write_tokens(path: &Path, tokens: &[(&str, &str, &str)], fallback_enabled: bool) {
+            let entries: Vec<_> = tokens
+                .iter()
+                .map(|(token, id, name)| {
+                    serde_json::json!({"sha256": sha256_hex(token), "id": id, "name": name})
+                })
+                .collect();
+            let body = serde_json::json!({
+                "version": 1, "fallback_enabled": fallback_enabled, "tokens": entries
+            });
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, body.to_string()).unwrap();
+            std::fs::rename(&tmp, path).unwrap();
+        }
+
+        async fn token_source(
+            tokens_file: &Path,
+            valid_tokens: Option<Vec<SensitiveString>>,
+        ) -> (
+            impl Stream<Item = Event> + Unpin + use<>,
+            SocketAddr,
+            PortGuard,
+        ) {
+            let (sender, recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
+            let (guard, address) = next_addr();
+            let cx = SourceContext::new_test(sender, None);
+            let config = SplunkConfig {
+                address,
+                valid_tokens,
+                valid_tokens_file: Some(HashedTokensFileConfig {
+                    path: tokens_file.to_path_buf(),
+                    reload_interval_secs: 0,
+                }),
+                ..Default::default()
+            };
+            tokio::spawn(async move { config.build(cx).await.unwrap().await.unwrap() });
+            wait_for_tcp(address).await;
+            (recv, address, guard)
+        }
+
+        fn opts() -> SendWithOpts<'static> {
+            SendWithOpts {
+                channel: Some(Channel::Header("channel")),
+                forwarded_for: None,
+            }
+        }
+
+        fn metadata_str(event: &Event, key: &str) -> Option<String> {
+            event
+                .metadata()
+                .value()
+                .get(vrl::path!(key))
+                .map(|v| v.to_string_lossy().into_owned())
+        }
+
+        #[tokio::test]
+        async fn listed_token_is_accepted_and_stamped() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tokens.json");
+            write_tokens(&path, &[("named-token", "cred-1", "sender one")], true);
+            let (source, address, _guard) = token_source(&path, None).await;
+
+            let event = r#"{"event":"hello","fields":{"nano_credential_id":"forged"}}"#;
+            assert_eq!(
+                200,
+                send_with(address, "services/collector/event", event, "named-token", &opts())
+                    .await
+            );
+            assert_eq!(
+                200,
+                send_with(address, "services/collector/raw", "raw line", "named-token", &opts())
+                    .await
+            );
+            let events = collect_n(source, 2).await;
+            for event in &events {
+                assert_eq!(
+                    metadata_str(event, CREDENTIAL_ID_METADATA_KEY).as_deref(),
+                    Some("cred-1")
+                );
+                assert_eq!(
+                    metadata_str(event, CREDENTIAL_NAME_METADATA_KEY).as_deref(),
+                    Some("sender one")
+                );
+                assert!(event.metadata().splunk_hec_token().is_none());
+                assert!(!format!("{:?}", event.as_log()).contains("named-token"));
+            }
+        }
+
+        #[tokio::test]
+        async fn without_valid_tokens_unlisted_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tokens.json");
+            write_tokens(&path, &[("named-token", "cred-1", "a")], true);
+            let (_source, address, _guard) = token_source(&path, None).await;
+            assert_eq!(
+                401,
+                send_with(address, "services/collector/event", "{}", "nope", &opts()).await
+            );
+            let res = reqwest::Client::new()
+                .post(format!("http://{address}/services/collector/event"))
+                .header("x-splunk-request-channel", "channel")
+                .body("{\"event\":\"x\"}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(401, res.status().as_u16());
+
+            // A missing file never opens the source either.
+            let (_source2, address2, _guard2) =
+                token_source(&dir.path().join("absent.json"), None).await;
+            assert_eq!(
+                401,
+                send_with(address2, "services/collector/event", "{}", "x", &opts()).await
+            );
+        }
+
+        #[tokio::test]
+        async fn revoked_token_is_refused_after_reload() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tokens.json");
+            write_tokens(&path, &[("keep", "k", "k"), ("revoke-me", "r", "r")], true);
+            let (_source, address, _guard) = token_source(&path, None).await;
+            let event = r#"{"event":"x"}"#;
+            assert_eq!(
+                200,
+                send_with(address, "services/collector/event", event, "revoke-me", &opts()).await
+            );
+            write_tokens(&path, &[("keep", "k", "k")], true);
+            assert_eq!(
+                401,
+                send_with(address, "services/collector/event", event, "revoke-me", &opts()).await
+            );
+            assert_eq!(
+                200,
+                send_with(address, "services/collector/event", event, "keep", &opts()).await
+            );
+        }
+
+        #[tokio::test]
+        async fn static_token_falls_back_unless_disabled() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tokens.json");
+            write_tokens(&path, &[("named-token", "cred-1", "a")], true);
+            let (source, address, _guard) =
+                token_source(&path, Some(vec!["install-token".to_owned().into()])).await;
+            let event = r#"{"event":"x"}"#;
+            assert_eq!(
+                200,
+                send_with(address, "services/collector/event", event, "install-token", &opts())
+                    .await
+            );
+            let events = collect_n(source, 1).await;
+            assert_eq!(metadata_str(&events[0], CREDENTIAL_ID_METADATA_KEY), None);
+            assert_eq!(
+                401,
+                send_with(address, "services/collector/event", event, "wrong", &opts()).await
+            );
+
+            write_tokens(&path, &[("named-token", "cred-1", "a")], false);
+            assert_eq!(
+                401,
+                send_with(address, "services/collector/event", event, "install-token", &opts())
+                    .await
+            );
+            assert_eq!(
+                200,
+                send_with(address, "services/collector/event", event, "named-token", &opts())
+                    .await
+            );
+        }
     }
 
     #[tokio::test]
@@ -3411,6 +3661,7 @@ mod tests {
                 address,
                 token: Some(TOKEN.to_owned().into()),
                 valid_tokens: None,
+                valid_tokens_file: None,
                 tls: None,
                 acknowledgements: Default::default(),
                 store_hec_token: false,
@@ -3797,6 +4048,7 @@ mod tests {
                 address,
                 token: Some(TOKEN.to_owned().into()),
                 valid_tokens: None,
+                valid_tokens_file: None,
                 tls: None,
                 acknowledgements: ack_config,
                 store_hec_token: false,
@@ -3850,6 +4102,7 @@ mod tests {
                 address,
                 token: Some(TOKEN.to_owned().into()),
                 valid_tokens: None,
+                valid_tokens_file: None,
                 tls: None,
                 acknowledgements: ack_config,
                 store_hec_token: false,
