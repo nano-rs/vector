@@ -78,6 +78,11 @@ EXCLUDE = {
         ("nanosiem-web/", "sender template (customer-side Vector)"),
         ("nanosiem-core/src/ingest_sender_templates.rs", "sender template (customer-side Vector)"),
         ("ludus/", "Ludus lab range (endpoint agents and aggregator run upstream Vector)"),
+        # Synthetic stand-ins for the pull.rs runtime templates, keyed by RuntimeVariant (which
+        # includes aws_s3_cloudtrail, not a Vector type). The real templates are rendered by
+        # tenant_bundle/pull.rs, which is scanned and resolved through RENDERED_DYNAMIC.
+        ("workers/hosted-ingest/test/pull-runtime-config.test.js",
+         "test fixture (synthetic pull runtime templates; real ones from tenant_bundle/pull.rs)"),
         ("docs", "documentation"),
     ],
     "nano-main": [
