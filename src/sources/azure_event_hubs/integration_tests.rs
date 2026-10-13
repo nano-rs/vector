@@ -389,17 +389,90 @@ async fn azure_event_hubs_latest_restart_while_idle_skips_nothing() {
     assert_eq!(checkpointer.load().await.unwrap(), committed);
 }
 
+/// A missing Event Hub (not found) does not fail the build, which would take down every other
+/// source of the Vector: the source starts, keeps retrying, and shuts down cleanly.
 #[tokio::test]
-async fn azure_event_hubs_rejects_unknown_event_hub() {
+async fn azure_event_hubs_unknown_event_hub_does_not_fail_the_build() {
     let container = format!("checkpoints-{}", random_string(8).to_lowercase());
     create_container(&container).await;
     let config = config("does-not-exist", &container);
     let (tx, _rx) = SourceSender::new_test();
-    let error = match config.build(SourceContext::new_test(tx, None)).await {
-        Ok(_) => panic!("building a source for a missing Event Hub must fail"),
-        Err(error) => error.to_string(),
-    };
-    assert!(error.contains("does-not-exist"), "{error}");
+    let (trigger, shutdown, done) = ShutdownSignal::new_wired();
+    let mut cx = SourceContext::new_test(tx, None);
+    cx.shutdown = shutdown;
+    let source = config
+        .build(cx)
+        .await
+        .expect("a missing Event Hub must not fail the build");
+    let handle = tokio::spawn(source);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!handle.is_finished(), "the source gave up");
+    drop(trigger);
+    tokio::time::timeout(Duration::from_secs(13), async {
+        done.await;
+        handle.await.unwrap().expect("source exited cleanly");
+    })
+    .await
+    .expect("shutdown took too long");
+}
+
+/// The checkpoint container does not exist when the source starts (as with a storage account
+/// the credentials cannot read yet). The build succeeds, the source retries, and once the
+/// container exists it receives everything, without a restart.
+#[tokio::test]
+async fn azure_event_hubs_starts_without_its_checkpoints_and_receives_once_they_are_readable() {
+    let hub = "eh-startup";
+    let container = format!("checkpoints-{}", random_string(8).to_lowercase());
+    let config = config(hub, &container);
+    let run = random_string(8);
+    let expected = produce(hub, &run, 20).await;
+
+    let (tx, rx) = SourceSender::new_test();
+    let (trigger, shutdown, done) = ShutdownSignal::new_wired();
+    let mut cx = SourceContext::new_test(tx, None);
+    cx.shutdown = shutdown;
+    cx.acknowledgements = true;
+    let source = config
+        .build(cx)
+        .await
+        .expect("unreadable checkpoints must not fail the build");
+    let handle = tokio::spawn(source);
+    let mut rx = rx.map(|mut event| {
+        event
+            .take_finalizers()
+            .update_status(EventStatus::Delivered);
+        event
+    });
+
+    // Nothing is read while the checkpoints cannot be read: reading from the start position
+    // instead could re-deliver everything already checkpointed.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), rx.next())
+            .await
+            .is_err(),
+        "received events without checkpoints"
+    );
+    assert!(!handle.is_finished(), "the source gave up");
+
+    create_container(&container).await;
+    let mut received = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while !received_all(&expected, &received) {
+        let event = tokio::time::timeout_at(deadline, rx.next())
+            .await
+            .expect("timed out waiting for the events after the checkpoints became readable")
+            .expect("stream ended");
+        let message = message(&event);
+        if message.contains(&format!(r#""run":"{run}""#)) {
+            received.push(message);
+        }
+    }
+    assert_exactly_once(&expected, &received);
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(trigger);
+    done.await;
+    handle.await.unwrap().expect("source exited cleanly");
 }
 
 #[test]

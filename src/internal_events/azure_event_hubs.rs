@@ -194,3 +194,45 @@ impl InternalEvent for AzureEventHubsInitialCheckpoint<'_> {
         }
     }
 }
+
+#[derive(Debug, NamedInternalEvent)]
+pub struct AzureEventHubsStartupError<'a> {
+    pub stage: &'static str,
+    pub error: &'a str,
+    pub retry_in: std::time::Duration,
+}
+
+impl InternalEvent for AzureEventHubsStartupError<'_> {
+    fn emit(self) {
+        error!(
+            message = "Event Hubs source could not start yet. Will retry.",
+            stage_detail = %self.stage,
+            error = %self.error,
+            retry_in_secs = self.retry_in.as_secs(),
+            error_code = "failed_starting",
+            error_type = error_type::REQUEST_FAILED,
+            stage = error_stage::RECEIVING,
+        );
+        counter!(
+            CounterName::ComponentErrorsTotal,
+            "error_code" => "failed_starting",
+            "error_type" => error_type::REQUEST_FAILED,
+            "stage" => error_stage::RECEIVING,
+        )
+        .increment(1);
+    }
+}
+
+#[derive(Debug, NamedInternalEvent)]
+pub struct AzureEventHubsStarted {
+    pub failures: usize,
+}
+
+impl InternalEvent for AzureEventHubsStarted {
+    fn emit(self) {
+        info!(
+            message = "Event Hubs source started after failed attempts.",
+            failed_attempts = self.failures,
+        );
+    }
+}
