@@ -1,4 +1,6 @@
-use std::{collections::HashMap, convert::Infallible, fmt, net::SocketAddr, time::Duration};
+use std::{
+    collections::HashMap, convert::Infallible, fmt, net::SocketAddr, sync::Arc, time::Duration,
+};
 
 use bytes::Bytes;
 use futures::{FutureExt, TryFutureExt};
@@ -25,7 +27,11 @@ use warp::{
 use super::encoding::{capped_body, decompress_body};
 use crate::{
     SourceSender,
-    common::http::{ErrorMessage, server_auth::HttpServerAuthConfig},
+    common::http::{
+        ErrorMessage,
+        hashed_tokens::{HashedCredential, HashedTokenStore, TokenCheck},
+        server_auth::HttpServerAuthConfig,
+    },
     config::SourceContext,
     http::{KeepaliveConfig, MaxConnectionAgeLayer, build_http_trace_layer},
     internal_events::{
@@ -107,6 +113,13 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
         }
     }
 
+    /// nano fork (NAN-3770): the source's hashed tokens file, when configured. A request whose
+    /// `Authorization: Bearer <token>` is listed is authenticated without `auth`, and its events
+    /// are stamped with the credential. See `common::http::hashed_tokens`.
+    fn hashed_tokens(&self) -> Option<Arc<HashedTokenStore>> {
+        None
+    }
+
     fn decode(&self, encoding_header: Option<&str>, body: Bytes) -> Result<Bytes, ErrorMessage> {
         decompress_body(encoding_header, body)
     }
@@ -130,6 +143,7 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
         let auth_matcher = auth
             .map(|a| a.build(&cx.enrichment_tables, &cx.metrics_storage))
             .transpose()?;
+        let hashed_tokens = self.hashed_tokens();
         let path = path.to_owned();
         let acknowledgements = cx.do_acknowledgements(acknowledgements);
         let enable_source_ip = self.enable_source_ip();
@@ -181,15 +195,46 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
                           addr: Option<PeerAddr>| {
                         debug!(message = "Handling HTTP request.", headers = ?headers);
                         let http_path = path.as_str();
-                        let events = auth_matcher
-                            .as_ref()
-                            .map_or(Ok(None), |a| {
+                        let file_auth = hashed_tokens.as_ref().map(|store| {
+                            store.check_authorization(
+                                headers
+                                    .get(warp::http::header::AUTHORIZATION)
+                                    .and_then(|v| v.to_str().ok()),
+                                "Bearer",
+                            )
+                        });
+                        let (credential, run_auth, refused) = match file_auth {
+                            None => (None, true, false),
+                            Some(TokenCheck::Matched(credential)) => {
+                                (Some(credential), false, false)
+                            }
+                            Some(TokenCheck::NotListed { fallback_enabled })
+                                if fallback_enabled && auth_matcher.is_some() =>
+                            {
+                                (None, true, false)
+                            }
+                            // Listed tokens are the only way in: the fallback is disabled, or
+                            // there is no `auth` to fall back to (a configured file never opens
+                            // the source).
+                            Some(TokenCheck::NotListed { .. }) => (None, false, true),
+                        };
+                        let auth_result = if refused {
+                            Err(ErrorMessage::new(
+                                StatusCode::UNAUTHORIZED,
+                                "Invalid token".to_owned(),
+                            ))
+                        } else if run_auth {
+                            auth_matcher.as_ref().map_or(Ok(None), |a| {
                                 a.handle_auth(
                                     addr.as_ref().map(|a| a.0).as_ref(),
                                     &headers,
                                     path.as_str(),
                                 )
                             })
+                        } else {
+                            Ok(None)
+                        };
+                        let events = auth_result
                             .and_then(|auth_enrichment| {
                                 self.decode(encoding_header.as_deref(), body)
                                     .map(|body| (body, auth_enrichment))
@@ -223,6 +268,10 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
 
                                 if let Some(enrichment) = auth_enrichment {
                                     self.inject_auth_enrichment(&mut events, enrichment);
+                                }
+
+                                if let Some(credential) = credential.as_deref() {
+                                    stamp_credential(&mut events, credential);
                                 }
 
                                 events
@@ -291,6 +340,12 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
 
     fn enable_source_ip(&self) -> bool {
         false
+    }
+}
+
+fn stamp_credential(events: &mut [Event], credential: &HashedCredential) {
+    for event in events {
+        credential.stamp(event);
     }
 }
 

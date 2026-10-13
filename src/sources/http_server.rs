@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use bytes::{Bytes, BytesMut};
 use chrono::Utc;
@@ -17,7 +17,11 @@ use warp::http::HeaderMap;
 
 use crate::{
     codecs::{Decoder, DecodingConfig},
-    common::http::{ErrorMessage, server_auth::HttpServerAuthConfig},
+    common::http::{
+        ErrorMessage,
+        hashed_tokens::{HashedTokenStore, HashedTokensFileConfig},
+        server_auth::HttpServerAuthConfig,
+    },
     config::{Resource, SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput},
     event::Event,
     http::KeepaliveConfig,
@@ -77,6 +81,16 @@ pub struct SimpleHttpConfig {
     /// authenticated events. These metadata fields are injected into the event body (legacy
     /// namespace) or under `http_server.<field>` in event metadata (Vector namespace).
     auth: Option<HttpServerAuthConfig>,
+
+    /// A file of SHA-256-hashed bearer tokens, reloaded on change (nano fork).
+    ///
+    /// A request whose `Authorization: Bearer <token>` is listed in the file is authenticated
+    /// without consulting `auth`, and its events get the credential's id and name in event
+    /// metadata (`%nano_credential_id`, `%nano_credential_name`). A request that is not listed
+    /// is checked by `auth`, unless the file disables the fallback or `auth` is not set, in
+    /// which case it is refused with `401`.
+    #[serde(default)]
+    valid_tokens_file: Option<HashedTokensFileConfig>,
 
     /// Whether or not to treat the configured `path` as an absolute path.
     ///
@@ -211,6 +225,7 @@ impl Default for SimpleHttpConfig {
             query_parameters: Vec::new(),
             tls: None,
             auth: None,
+            valid_tokens_file: None,
             path: default_path(),
             path_key: default_path_key(),
             host_key: default_host_key(),
@@ -308,6 +323,10 @@ impl SourceConfig for SimpleHttpConfig {
             host_key: self.host_key.clone(),
             decoder,
             log_namespace,
+            hashed_tokens: self
+                .valid_tokens_file
+                .as_ref()
+                .map(|config| Arc::new(HashedTokenStore::new(config))),
         };
         source.run(
             self.address,
@@ -356,11 +375,16 @@ struct SimpleHttpSource {
     host_key: OptionalValuePath,
     decoder: Decoder,
     log_namespace: LogNamespace,
+    hashed_tokens: Option<Arc<HashedTokenStore>>,
 }
 
 impl HttpSource for SimpleHttpSource {
     fn log_namespace(&self) -> LogNamespace {
         self.log_namespace
+    }
+
+    fn hashed_tokens(&self) -> Option<Arc<HashedTokenStore>> {
+        self.hashed_tokens.clone()
     }
 
     fn name() -> &'static str {
@@ -552,6 +576,7 @@ mod tests {
                 response_code,
                 tls: None,
                 auth,
+                valid_tokens_file: None,
                 strict_path,
                 path_key,
                 host_key,
@@ -1678,6 +1703,166 @@ mod tests {
         assert_eq!(200, send_with_headers(addr, "", headers).await);
     }
 
+    // nano fork (NAN-3770): hashed tokens file.
+    mod hashed_tokens_file {
+        use std::path::Path;
+
+        use super::*;
+        use crate::common::http::hashed_tokens::{
+            CREDENTIAL_ID_METADATA_KEY, CREDENTIAL_NAME_METADATA_KEY, HashedTokensFileConfig,
+        };
+        use similar_asserts::assert_eq;
+
+        fn sha256_hex(token: &str) -> String {
+            openssl::sha::sha256(token.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        }
+
+        fn write_tokens(path: &Path, tokens: &[(&str, &str, &str)], fallback_enabled: bool) {
+            let entries: Vec<_> = tokens
+                .iter()
+                .map(|(token, id, name)| {
+                    serde_json::json!({"sha256": sha256_hex(token), "id": id, "name": name})
+                })
+                .collect();
+            let body = serde_json::json!({
+                "version": 1, "fallback_enabled": fallback_enabled, "tokens": entries
+            });
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, body.to_string()).unwrap();
+            std::fs::rename(&tmp, path).unwrap();
+        }
+
+        async fn token_source(
+            tokens_file: &Path,
+            auth: Option<HttpServerAuthConfig>,
+        ) -> (impl Stream<Item = Event> + Unpin, SocketAddr) {
+            let (sender, recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
+            let (_guard, address) = next_addr();
+            let context = SourceContext::new_test(sender, None);
+            let config = SimpleHttpConfig {
+                address,
+                auth,
+                valid_tokens_file: Some(HashedTokensFileConfig {
+                    path: tokens_file.to_path_buf(),
+                    reload_interval_secs: 0,
+                }),
+                strict_path: false,
+                ..Default::default()
+            };
+            tokio::spawn(async move {
+                config.build(context).await.unwrap().await.unwrap();
+            });
+            wait_for_tcp(address).await;
+            (Box::pin(recv), address)
+        }
+
+        fn bearer(token: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+            headers
+        }
+
+        fn metadata_str(event: &Event, key: &str) -> Option<String> {
+            event
+                .metadata()
+                .value()
+                .get(vrl::path!(key))
+                .map(|v| v.to_string_lossy().into_owned())
+        }
+
+        #[tokio::test]
+        async fn listed_token_is_accepted_and_stamped() {
+            components::init_test();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tokens.json");
+            write_tokens(&path, &[("named-token", "cred-1", "sender one")], true);
+            let (rx, addr) = token_source(&path, None).await;
+
+            let events = spawn_ok_collect_n(
+                send_with_headers(addr, "hello", bearer("named-token")),
+                rx,
+                1,
+            )
+            .await;
+            assert_eq!(
+                metadata_str(&events[0], CREDENTIAL_ID_METADATA_KEY).as_deref(),
+                Some("cred-1")
+            );
+            assert_eq!(
+                metadata_str(&events[0], CREDENTIAL_NAME_METADATA_KEY).as_deref(),
+                Some("sender one")
+            );
+            // The token itself is never written into the event.
+            let log = events[0].as_log();
+            assert!(!format!("{log:?}").contains("named-token"));
+        }
+
+        #[tokio::test]
+        async fn without_auth_unlisted_tokens_are_refused() {
+            components::init_test();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tokens.json");
+            write_tokens(&path, &[("named-token", "cred-1", "a")], true);
+            let (_rx, addr) = token_source(&path, None).await;
+            assert_eq!(401, send_with_headers(addr, "x", bearer("other")).await);
+            assert_eq!(401, send_with_headers(addr, "x", HeaderMap::new()).await);
+            // A missing file never opens a source that has no `auth`.
+            let absent = dir.path().join("absent.json");
+            let (_rx2, addr2) = token_source(&absent, None).await;
+            assert_eq!(401, send_with_headers(addr2, "x", bearer("other")).await);
+        }
+
+        #[tokio::test]
+        async fn revoked_token_is_refused_after_reload() {
+            components::init_test();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tokens.json");
+            write_tokens(
+                &path,
+                &[("keep", "cred-keep", "keep"), ("revoke-me", "cred-r", "r")],
+                true,
+            );
+            let (_rx, addr) = token_source(&path, None).await;
+            assert_eq!(200, send_with_headers(addr, "x", bearer("revoke-me")).await);
+            write_tokens(&path, &[("keep", "cred-keep", "keep")], true);
+            assert_eq!(401, send_with_headers(addr, "x", bearer("revoke-me")).await);
+            assert_eq!(200, send_with_headers(addr, "x", bearer("keep")).await);
+        }
+
+        #[tokio::test]
+        async fn unlisted_token_falls_back_to_auth() {
+            components::init_test();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tokens.json");
+            write_tokens(&path, &[("named-token", "cred-1", "a")], true);
+            let auth = HttpServerAuthConfig::Bearer {
+                token: "install-token".to_string().into(),
+            };
+            let (rx, addr) = token_source(&path, Some(auth.clone())).await;
+            let events =
+                spawn_ok_collect_n(send_with_headers(addr, "x", bearer("install-token")), rx, 1)
+                    .await;
+            assert_eq!(metadata_str(&events[0], CREDENTIAL_ID_METADATA_KEY), None);
+            assert_eq!(401, send_with_headers(addr, "x", bearer("wrong")).await);
+
+            // With the fallback disabled the `auth` token is refused too.
+            write_tokens(&path, &[("named-token", "cred-1", "a")], false);
+            assert_eq!(
+                401,
+                send_with_headers(addr, "x", bearer("install-token")).await
+            );
+            // The receiver was consumed above, so an authenticated request now fails
+            // downstream (5xx) rather than being refused.
+            assert_ne!(
+                401,
+                send_with_headers(addr, "x", bearer("named-token")).await
+            );
+        }
+    }
+
     #[test]
     fn output_schema_definition_vector_namespace() {
         let config = SimpleHttpConfig {
@@ -1813,6 +1998,7 @@ mod tests {
             host_key: OptionalValuePath::none(),
             decoder,
             log_namespace: LogNamespace::Vector,
+            hashed_tokens: None,
         };
 
         let mut log = LogEvent::default();
@@ -1876,6 +2062,7 @@ mod tests {
             host_key: OptionalValuePath::none(),
             decoder,
             log_namespace: LogNamespace::Vector,
+            hashed_tokens: None,
         };
 
         let mut log = LogEvent::default();
@@ -1932,6 +2119,7 @@ mod tests {
             host_key: OptionalValuePath::none(),
             decoder,
             log_namespace: LogNamespace::Vector,
+            hashed_tokens: None,
         };
 
         let metric = Metric::new(
