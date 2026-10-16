@@ -20,6 +20,10 @@ on:
       - "image-*-nano.*"
   workflow_dispatch:
     inputs:
+      check_only:
+        description: "Run focused OTLP codec validation without building or publishing images"
+        type: boolean
+        default: false
       nano_rev:
         description: "Image revision n (the image tag becomes <upstream version>-nano.<n>)"
         required: true
@@ -38,7 +42,34 @@ env:
   UPSTREAM_IMAGE: docker.io/timberio/vector:0.59.0-debian@sha256:98e7b4dfe50750e61470697bbd2fbeca643d12bea97f351005038ef506eab630
 
 jobs:
+  codecs:
+    if: ${{ inputs.check_only }}
+    name: OTLP codec tests and Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang cmake libclang-dev libssl-dev libxxhash-dev pkg-config protobuf-compiler
+      - name: Install repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Check codec and test targets
+        run: cargo check --locked -p codecs --no-default-features --features opentelemetry --tests
+      - name: Run OTLP protobuf regression tests
+        run: cargo test --locked -p codecs --no-default-features --features opentelemetry --lib encoding::format::otlp::tests -- --nocapture
+      - name: Clippy
+        run: cargo clippy --locked -p codecs --no-default-features --features opentelemetry --tests -- -D warnings
+
   meta:
+    if: ${{ !inputs.check_only }}
     name: Resolve version
     runs-on: ubuntu-24.04
     timeout-minutes: 10
