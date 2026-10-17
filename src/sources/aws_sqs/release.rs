@@ -216,7 +216,7 @@ pub(crate) async fn release(
         }
     };
     // A timeout here is reported as `not_released`.
-    let _ = tokio::time::timeout_at(deadline, work).await;
+    let _release_result = tokio::time::timeout_at(deadline, work).await;
     emit!(SourceMessagesReleased {
         component_type,
         released,

@@ -178,7 +178,7 @@ mod transform_buffer_tests {
         fn event(burst: usize, receipt: usize) -> EventArray {
             let mut log = LogEvent::default();
             log.insert(
-                "message",
+                vector_lib::lookup::event_path!("message"),
                 format!("{burst}/{receipt}:{}", "x".repeat(64 * 1024)),
             );
             EventArray::from(log)

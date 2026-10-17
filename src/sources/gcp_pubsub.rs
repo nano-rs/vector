@@ -1123,7 +1123,7 @@ mod shutdown_release_tests {
                     .map(|id| ReceivedMessage {
                         ack_id: id.to_string(),
                         message: Some(PubsubMessage {
-                            data: id.as_bytes().to_vec().into(),
+                            data: id.as_bytes().to_vec(),
                             message_id: id.to_string(),
                             ..Default::default()
                         }),
