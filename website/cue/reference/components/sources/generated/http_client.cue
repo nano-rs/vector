@@ -59,6 +59,11 @@ generated: components: sources: http_client: configuration: {
 			}
 		}
 	}
+	max_response_bytes: {
+		description: "Maximum response body size in bytes. Oversize responses are refused and counted as errors."
+		required:    false
+		type: uint: default: 33554432
+	}
 	method: {
 		description: "Specifies the method of the HTTP request."
 		required:    false
@@ -107,9 +112,8 @@ generated: components: sources: http_client: configuration: {
 	}
 	scrape_interval_secs: {
 		description: """
-			The interval between scrapes. Requests are run concurrently so if a scrape takes longer
-			than the interval a new scrape will be started. This can take extra resources, set the timeout
-			to a value lower than the scrape interval to prevent this from happening.
+			The interval between scrapes. Only one request runs at a time per source.
+			Missed ticks are skipped after a stall.
 			"""
 		required: false
 		type: uint: {
@@ -118,7 +122,7 @@ generated: components: sources: http_client: configuration: {
 		}
 	}
 	scrape_timeout_secs: {
-		description: "The timeout for each scrape request."
+		description: "The timeout for each scrape request, including reading the response body."
 		required:    false
 		type: float: {
 			default: 5.0

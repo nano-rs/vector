@@ -47,21 +47,24 @@ pub struct PrometheusScrapeConfig {
     #[serde(alias = "hosts")]
     endpoints: Vec<String>,
 
-    /// The interval between scrapes. Requests are run concurrently so if a scrape takes longer
-    /// than the interval a new scrape will be started. This can take extra resources, set the timeout
-    /// to a value lower than the scrape interval to prevent this from happening.
+    /// The interval between scrapes. Only one request runs at a time per source.
+    /// Missed ticks are skipped after a stall.
     #[serde(default = "default_interval")]
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     #[serde(rename = "scrape_interval_secs")]
     #[configurable(metadata(docs::human_name = "Scrape Interval"))]
     interval: Duration,
 
-    /// The timeout for each scrape request.
+    /// The timeout for each scrape request, including reading the response body.
     #[serde(default = "default_timeout")]
     #[serde_as(as = "serde_with:: DurationSecondsWithFrac<f64>")]
     #[serde(rename = "scrape_timeout_secs")]
     #[configurable(metadata(docs::human_name = "Scrape Timeout"))]
     timeout: Duration,
+
+    /// Maximum response body size in bytes. Oversize responses are refused and counted as errors.
+    #[serde(default = "crate::sources::util::http_client::default_max_response_bytes")]
+    max_response_bytes: usize,
 
     /// The tag name added to each event representing the scraped instance's `host:port`.
     ///
@@ -127,6 +130,7 @@ impl GenerateConfig for PrometheusScrapeConfig {
             endpoints: vec!["http://localhost:9090/metrics".to_string()],
             interval: default_interval(),
             timeout: default_timeout(),
+            max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
             instance_tag: Some("instance".to_string()),
             endpoint_tag: Some("endpoint".to_string()),
             honor_labels: false,
@@ -164,6 +168,7 @@ impl SourceConfig for PrometheusScrapeConfig {
             urls,
             interval: self.interval,
             timeout: self.timeout,
+            max_response_bytes: self.max_response_bytes,
             headers,
             content_type: "text/plain".to_string(),
             auth: self.auth.clone(),
@@ -375,6 +380,7 @@ mod test {
             endpoints: vec![format!("http://{in_addr}/metrics")],
             interval: Duration::from_secs(1),
             timeout: default_timeout(),
+            max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
             instance_tag: Some("instance".to_string()),
             endpoint_tag: Some("endpoint".to_string()),
             honor_labels: true,
@@ -416,6 +422,7 @@ mod test {
             endpoints: vec![format!("http://{in_addr}/metrics")],
             interval: Duration::from_secs(1),
             timeout: default_timeout(),
+            max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
             instance_tag: Some("instance".to_string()),
             endpoint_tag: Some("endpoint".to_string()),
             honor_labels: true,
@@ -469,6 +476,7 @@ mod test {
             endpoints: vec![format!("http://{in_addr}/metrics")],
             interval: Duration::from_secs(1),
             timeout: default_timeout(),
+            max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
             instance_tag: Some("instance".to_string()),
             endpoint_tag: Some("endpoint".to_string()),
             honor_labels: false,
@@ -536,6 +544,7 @@ mod test {
             endpoints: vec![format!("http://{in_addr}/metrics")],
             interval: Duration::from_secs(1),
             timeout: default_timeout(),
+            max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
             instance_tag: Some("instance".to_string()),
             endpoint_tag: Some("endpoint".to_string()),
             honor_labels: true,
@@ -592,6 +601,7 @@ mod test {
             endpoints: vec![format!("http://{in_addr}/metrics?key1=val1")],
             interval: Duration::from_secs(1),
             timeout: default_timeout(),
+            max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
             instance_tag: Some("instance".to_string()),
             endpoint_tag: Some("endpoint".to_string()),
             honor_labels: false,
@@ -714,6 +724,7 @@ mod test {
                 headers: HashMap::new(),
                 interval: Duration::from_secs(1),
                 timeout: default_timeout(),
+                max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
                 tls: None,
                 auth: None,
             },
@@ -802,6 +813,7 @@ mod integration_tests {
             endpoints: vec!["http://prometheus:9090/metrics".into()],
             interval: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
+            max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
             instance_tag: Some("instance".to_string()),
             endpoint_tag: Some("endpoint".to_string()),
             honor_labels: false,
