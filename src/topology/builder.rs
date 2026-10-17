@@ -118,7 +118,110 @@ pub(crate) fn set_ready_array_capacity(size: usize) {
         .unwrap_or_else(|_| panic!("double ready_array_capacity initialization"));
 }
 
-pub(crate) const TOPOLOGY_BUFFER_SIZE: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+const DEFAULT_TRANSFORM_BUFFER_SIZE: usize = 100;
+
+/// Honor small source chunks at transform boundaries too. Otherwise a collector
+/// using one-event chunks still retains 100 whole HTTP scrapes at every edge.
+/// Keep the historical ceiling for ordinary (default 1000-event) pipelines.
+pub(crate) fn transform_buffer_size() -> NonZeroUsize {
+    bounded_transform_buffer_size(
+        NonZeroUsize::new(vector_lib::source_sender::chunk_size_events()).unwrap(),
+    )
+}
+
+fn bounded_transform_buffer_size(chunk_size: NonZeroUsize) -> NonZeroUsize {
+    NonZeroUsize::new(chunk_size.get().min(DEFAULT_TRANSFORM_BUFFER_SIZE)).unwrap()
+}
+
+#[cfg(test)]
+mod transform_buffer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn blocked_transform_queue_resumes_without_losing_receipts() {
+        use crate::event::LogEvent;
+        use std::time::Duration;
+
+        let capacity = bounded_transform_buffer_size(NonZeroUsize::new(1).unwrap());
+        let (mut tx, mut rx) = TopologyBuilder::<EventArray>::standalone_memory(
+            capacity,
+            WhenFull::Block,
+            &Span::none(),
+            None,
+            None,
+        );
+        // A whole-response event can contain megabytes; a stalled consumer
+        // must backpressure on the second receipt, rather than retain 100.
+        let first = EventArray::from(LogEvent::from("a".repeat(4 * 1024 * 1024)));
+        let second = EventArray::from(LogEvent::from("b".repeat(4 * 1024 * 1024)));
+        tx.send(first.clone(), None).await.unwrap();
+        let pending = tx.send(second.clone(), None);
+        tokio::pin!(pending);
+        assert!(
+            timeout(Duration::from_millis(10), &mut pending)
+                .await
+                .is_err()
+        );
+        assert_eq!(rx.next().await, Some(first));
+        timeout(Duration::from_secs(1), &mut pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rx.next().await, Some(second));
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_catches_up_after_repeated_consumer_stalls() {
+        use crate::event::LogEvent;
+        use std::time::Duration;
+
+        fn event(burst: usize, receipt: usize) -> EventArray {
+            let mut log = LogEvent::default();
+            log.insert(
+                vector_lib::lookup::event_path!("message"),
+                format!("{burst}/{receipt}:{}", "x".repeat(64 * 1024)),
+            );
+            EventArray::from(log)
+        }
+
+        // Model a durable source with a backlog; only the current send is
+        // resident. After each stall the consumer services faster than arrivals.
+        for burst in 0..8 {
+            let capacity = bounded_transform_buffer_size(NonZeroUsize::new(1).unwrap());
+            let (mut tx, mut rx) = TopologyBuilder::<EventArray>::standalone_memory(
+                capacity,
+                WhenFull::Block,
+                &Span::none(),
+                None,
+                None,
+            );
+            let producer = tokio::spawn(async move {
+                for receipt in 0..32 {
+                    tx.send(event(burst, receipt), None).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            for receipt in 0..32 {
+                assert_eq!(
+                    timeout(Duration::from_secs(1), rx.next()).await.unwrap(),
+                    Some(event(burst, receipt))
+                );
+                tokio::task::yield_now().await;
+            }
+            producer.await.unwrap();
+            assert!(rx.next().await.is_none());
+        }
+    }
+
+    #[test]
+    fn small_chunks_backpressure_before_retaining_a_hundred_scrapes() {
+        for (chunk, expected) in [(1, 1), (8, 8), (100, 100), (1000, 100)] {
+            let size = bounded_transform_buffer_size(NonZeroUsize::new(chunk).unwrap());
+            assert_eq!(size.get(), expected);
+        }
+    }
+}
 
 static TRANSFORM_CONCURRENCY_LIMIT: LazyLock<usize> = LazyLock::new(|| {
     crate::app::worker_threads()
@@ -607,7 +710,7 @@ impl<'a> Builder<'a> {
 
         let metrics = ChannelMetricMetadata::new(BufferChannelKind::Transform, None);
         let (input_tx, input_rx) = TopologyBuilder::standalone_memory(
-            TOPOLOGY_BUFFER_SIZE,
+            transform_buffer_size(),
             WhenFull::Block,
             &Span::current(),
             Some(metrics),

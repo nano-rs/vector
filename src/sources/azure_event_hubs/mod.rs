@@ -70,7 +70,7 @@ pub enum StartPositionConfig {
 }
 
 impl StartPositionConfig {
-    fn start_position(self) -> StartPosition {
+    const fn start_position(self) -> StartPosition {
         StartPosition {
             location: match self {
                 Self::Earliest => StartLocation::Earliest,
@@ -530,7 +530,7 @@ impl SourceConfig for AzureEventHubsSourceConfig {
             partition_ids: self.partition_ids.clone(),
             checkpointer: checkpointer.clone(),
         };
-        let start_position = self.start_position.clone();
+        let start_position = self.start_position;
         let prefetch = self.prefetch;
         let owner_level = self.owner_level;
         let checkpoint_interval = self.checkpoint_interval_secs;
