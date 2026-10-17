@@ -59,6 +59,7 @@ impl ValidatableComponent for HttpClientConfig {
             endpoint: uri.to_string(),
             interval: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
+            max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
             decoding: DeserializerConfig::Json(Default::default()),
             ..Default::default()
         };
@@ -100,6 +101,7 @@ async fn bytes_decoding() {
         endpoint: format!("http://{in_addr}/endpoint"),
         interval: INTERVAL,
         timeout: TIMEOUT,
+        max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
         query: HashMap::new(),
         decoding: default_decoding(),
         framing: default_framing_message_based(),
@@ -130,6 +132,7 @@ async fn json_decoding_newline_delimited() {
         endpoint: format!("http://{in_addr}/endpoint"),
         interval: INTERVAL,
         timeout: TIMEOUT,
+        max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
         query: HashMap::new(),
         decoding: DeserializerConfig::Json(Default::default()),
         framing: FramingConfig::NewlineDelimited(Default::default()),
@@ -160,6 +163,7 @@ async fn json_decoding_character_delimited() {
         endpoint: format!("http://{in_addr}/endpoint"),
         interval: INTERVAL,
         timeout: TIMEOUT,
+        max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
         query: HashMap::new(),
         decoding: DeserializerConfig::Json(Default::default()),
         framing: FramingConfig::CharacterDelimited(CharacterDelimitedDecoderConfig {
@@ -195,6 +199,7 @@ async fn request_query_applied() {
         endpoint: format!("http://{in_addr}/endpoint?key1=val1"),
         interval: INTERVAL,
         timeout: TIMEOUT,
+        max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
         query: HashMap::from([
             (
                 "key1".to_string(),
@@ -265,6 +270,7 @@ async fn request_query_vrl_applied() {
         endpoint: format!("http://{in_addr}/endpoint"),
         interval: INTERVAL,
         timeout: TIMEOUT,
+        max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
         query: HashMap::from([
             // Test a single VRL parameter with concatenation
             (
@@ -399,6 +405,7 @@ async fn request_query_vrl_dynamic_updates() {
         endpoint: format!("http://{in_addr}/endpoint"),
         interval: Duration::from_millis(100),
         timeout: TIMEOUT,
+        max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
         query: HashMap::from([(
             "timestamp".to_string(),
             QueryParameterValue::SingleParam(ParameterValue::Typed {
@@ -472,6 +479,7 @@ async fn headers_applied() {
         endpoint: format!("http://{in_addr}/endpoint"),
         interval: INTERVAL,
         timeout: TIMEOUT,
+        max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
         query: HashMap::new(),
         decoding: default_decoding(),
         framing: default_framing_message_based(),
@@ -505,6 +513,7 @@ async fn accept_header_override() {
         endpoint: format!("http://{in_addr}/endpoint"),
         interval: INTERVAL,
         timeout: TIMEOUT,
+        max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
         query: HashMap::new(),
         decoding: DeserializerConfig::Bytes,
         framing: default_framing_message_based(),
@@ -542,6 +551,7 @@ async fn post_with_body() {
         endpoint: format!("http://{in_addr}/endpoint"),
         interval: INTERVAL,
         timeout: TIMEOUT,
+        max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
         query: HashMap::new(),
         decoding: DeserializerConfig::Json(Default::default()),
         framing: default_framing_message_based(),
@@ -586,6 +596,7 @@ async fn post_without_body() {
         endpoint: format!("http://{in_addr}/endpoint"),
         interval: INTERVAL,
         timeout: TIMEOUT,
+        max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
         query: HashMap::new(),
         decoding: DeserializerConfig::Json(Default::default()),
         framing: default_framing_message_based(),
@@ -616,6 +627,7 @@ async fn post_with_custom_content_type() {
         endpoint: format!("http://{in_addr}/endpoint"),
         interval: INTERVAL,
         timeout: TIMEOUT,
+        max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
         query: HashMap::new(),
         decoding: DeserializerConfig::Json(Default::default()),
         framing: default_framing_message_based(),
@@ -650,6 +662,7 @@ async fn post_with_vrl_body() {
         endpoint: format!("http://{in_addr}/endpoint"),
         interval: INTERVAL,
         timeout: TIMEOUT,
+        max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
         query: HashMap::new(),
         decoding: DeserializerConfig::Json(Default::default()),
         framing: default_framing_message_based(),
@@ -691,6 +704,7 @@ async fn query_vrl_compilation_error() {
         endpoint: "http://localhost:9999/endpoint".to_string(),
         interval: INTERVAL,
         timeout: TIMEOUT,
+        max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
         query: HashMap::from([(
             "bad_vrl".to_string(),
             QueryParameterValue::SingleParam(ParameterValue::Typed {
@@ -736,6 +750,7 @@ async fn body_vrl_compilation_error() {
         endpoint: "http://localhost:9999/endpoint".to_string(),
         interval: INTERVAL,
         timeout: TIMEOUT,
+        max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
         query: HashMap::new(),
         decoding: DeserializerConfig::Json(Default::default()),
         framing: default_framing_message_based(),
@@ -797,6 +812,7 @@ async fn requests_through_authenticated_proxy() {
             endpoint: format!("http://{in_addr}/endpoint"),
             interval: INTERVAL,
             timeout: TIMEOUT,
+            max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
             query: HashMap::new(),
             decoding: DeserializerConfig::Json(Default::default()),
             framing: default_framing_message_based(),
@@ -840,4 +856,38 @@ async fn requests_through_authenticated_proxy() {
             .headers
             .contains_key(header::PROXY_AUTHORIZATION)
     );
+}
+
+#[test]
+fn response_limit_is_defaulted_and_configurable() {
+    let default: HttpClientConfig = serde_json::from_value(serde_json::json!({
+        "endpoint": "http://localhost/logs"
+    }))
+    .unwrap();
+    assert_eq!(default.max_response_bytes, 32 * 1024 * 1024);
+    let configured: HttpClientConfig = serde_json::from_value(serde_json::json!({
+        "endpoint": "http://localhost/logs", "max_response_bytes": 1024
+    }))
+    .unwrap();
+    assert_eq!(configured.max_response_bytes, 1024);
+}
+
+#[tokio::test]
+async fn oversized_response_is_refused_and_counted() {
+    let (_guard, in_addr) = next_addr();
+    let server = tokio::spawn(warp::serve(warp::any().map(|| "12345")).run(in_addr));
+    wait_for_tcp(in_addr).await;
+    let events = crate::test_util::components::run_and_assert_source_error(
+        HttpClientConfig {
+            endpoint: format!("http://{in_addr}/"),
+            max_response_bytes: 4,
+            interval: Duration::from_millis(50),
+            ..Default::default()
+        },
+        Duration::from_millis(300),
+        &["url", "error_type", "stage"],
+    )
+    .await;
+    assert!(events.is_empty());
+    server.abort();
 }

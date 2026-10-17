@@ -8,6 +8,7 @@ sources:
         - value1
         - value2
     honor_labels: false
+    max_response_bytes: 33554432
     query:
       match[]:
         - '{job="somejob"}'

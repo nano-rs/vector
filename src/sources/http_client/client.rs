@@ -58,21 +58,24 @@ pub struct HttpClientConfig {
     #[configurable(metadata(docs::examples = "http://127.0.0.1:9898/logs"))]
     pub endpoint: String,
 
-    /// The interval between scrapes. Requests are run concurrently so if a scrape takes longer
-    /// than the interval a new scrape will be started. This can take extra resources, set the timeout
-    /// to a value lower than the scrape interval to prevent this from happening.
+    /// The interval between scrapes. Only one request runs at a time per source.
+    /// Missed ticks are skipped after a stall.
     #[serde(default = "default_interval")]
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     #[serde(rename = "scrape_interval_secs")]
     #[configurable(metadata(docs::human_name = "Scrape Interval"))]
     pub interval: Duration,
 
-    /// The timeout for each scrape request.
+    /// The timeout for each scrape request, including reading the response body.
     #[serde(default = "default_timeout")]
     #[serde_as(as = "serde_with:: DurationSecondsWithFrac<f64>")]
     #[serde(rename = "scrape_timeout_secs")]
     #[configurable(metadata(docs::human_name = "Scrape Timeout"))]
     pub timeout: Duration,
+
+    /// Maximum response body size in bytes. Oversize responses are refused and counted as errors.
+    #[serde(default = "crate::sources::util::http_client::default_max_response_bytes")]
+    pub max_response_bytes: usize,
 
     /// Custom parameters for the HTTP request query string.
     ///
@@ -212,6 +215,7 @@ impl Default for HttpClientConfig {
             query: HashMap::new(),
             interval: default_interval(),
             timeout: default_timeout(),
+            max_response_bytes: crate::sources::util::http_client::default_max_response_bytes(),
             decoding: default_decoding(),
             framing: default_framing_message_based(),
             headers: HashMap::new(),
@@ -369,6 +373,7 @@ impl SourceConfig for HttpClientConfig {
             urls,
             interval: self.interval,
             timeout: self.timeout,
+            max_response_bytes: self.max_response_bytes,
             headers,
             content_type,
             auth: self.auth.clone(),

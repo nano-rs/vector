@@ -13,8 +13,8 @@
 
 use std::{collections::HashMap, future::ready, time::Duration};
 
-use bytes::Bytes;
-use futures_util::{FutureExt, StreamExt, TryFutureExt, stream};
+use bytes::{Bytes, BytesMut};
+use futures_util::{FutureExt, StreamExt, stream};
 use http::{
     HeaderMap, Uri,
     header::{HeaderName, HeaderValue},
@@ -47,6 +47,8 @@ pub(crate) struct GenericHttpClientInputs {
     pub interval: Duration,
     /// Timeout for the HTTP request.
     pub timeout: Duration,
+    /// Maximum buffered HTTP response size in bytes.
+    pub max_response_bytes: usize,
     /// Map of Header+Value to apply to HTTP request.
     pub headers: HeaderMap<HeaderValue>,
     /// Content type of the HTTP request, determined by the source.
@@ -103,6 +105,59 @@ pub(crate) const fn default_interval() -> Duration {
 /// The default timeout for the HTTP request if none is configured.
 pub(crate) const fn default_timeout() -> Duration {
     Duration::from_secs(5)
+}
+
+/// Default maximum buffered response: 32 MiB.
+pub(crate) const fn default_max_response_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+fn scrape_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+async fn collect_response(
+    mut body: Body,
+    max_response_bytes: usize,
+) -> Result<Bytes, crate::Error> {
+    use hyper::body::HttpBody;
+
+    // Check each chunk before copying; never collect an unbounded body first.
+    let mut bytes = BytesMut::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        if chunk.len() > max_response_bytes.saturating_sub(bytes.len()) {
+            return Err(
+                format!("HTTP response exceeds max_response_bytes ({max_response_bytes})").into(),
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes.freeze())
+}
+
+async fn fetch_response(
+    client: HttpClient,
+    request: Request<Body>,
+    timeout: Duration,
+    max_response_bytes: usize,
+) -> Result<(Parts, Bytes), crate::Error> {
+    tokio::time::timeout(timeout, async move {
+        let response = client.send(request).await?;
+        let (header, body) = response.into_parts();
+        let body = collect_response(body, max_response_bytes).await?;
+        Ok((header, body))
+    })
+    .await
+    .map_err(|_| -> crate::Error {
+        format!(
+            "Timeout error: request including response body exceeded {}s",
+            timeout.as_secs_f64()
+        )
+        .into()
+    })?
 }
 
 /// Builds the context, allowing the source-specific implementation to leverage data from the
@@ -203,7 +258,7 @@ pub(crate) async fn call<
     // proxy and tls settings.
     let client =
         HttpClient::new(inputs.tls.clone(), &inputs.proxy).expect("Building HTTP client failed");
-    let mut stream = IntervalStream::new(tokio::time::interval(inputs.interval))
+    let mut stream = IntervalStream::new(scrape_interval(inputs.interval))
         .take_until(inputs.shutdown)
         .map(move |_| stream::iter(inputs.urls.clone()))
         .flatten()
@@ -259,27 +314,16 @@ pub(crate) async fn call<
                 auth.apply(&mut request);
             }
 
-            tokio::time::timeout(inputs.timeout, client.send(request))
-                .then(move |result| async move {
-                    match result {
-                        Ok(Ok(response)) => Ok(response),
-                        Ok(Err(error)) => Err(error.into()),
-                        Err(_) => Err(format!(
-                            "Timeout error: request exceeded {}s",
-                            inputs.timeout.as_secs_f64()
-                        )
-                        .into()),
+            fetch_response(client, request, inputs.timeout, inputs.max_response_bytes)
+                .map(move |response| {
+                    if let Ok((_, body)) = &response {
+                        emit!(EndpointBytesReceived {
+                            byte_size: body.len(),
+                            protocol: "http",
+                            endpoint: endpoint.as_str(),
+                        });
                     }
-                })
-                .and_then(|response| async move {
-                    let (header, body) = response.into_parts();
-                    let body = http_body::Body::collect(body).await?.to_bytes();
-                    emit!(EndpointBytesReceived {
-                        byte_size: body.len(),
-                        protocol: "http",
-                        endpoint: endpoint.as_str(),
-                    });
-                    Ok((header, body))
+                    response
                 })
                 .into_stream()
                 .filter_map(move |response| {
@@ -333,7 +377,7 @@ pub(crate) async fn call<
                 .flatten()
                 .boxed()
         })
-        .flatten_unordered(None)
+        .flatten_unordered(Some(1))
         .boxed();
 
     match out.send_event_stream(&mut stream).await {
@@ -352,6 +396,135 @@ pub(crate) async fn call<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn missed_scrapes_do_not_burst() {
+        let mut interval = scrape_interval(Duration::from_secs(10));
+        interval.tick().await;
+        tokio::time::advance(Duration::from_secs(95)).await;
+        interval.tick().await;
+        assert!(interval.tick().now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(interval.tick().now_or_never().is_some());
+    }
+
+    #[tokio::test]
+    async fn response_body_limit_accepts_exact_size_and_rejects_larger() {
+        assert_eq!(
+            collect_response(Body::from("abcd"), 4).await.unwrap(),
+            "abcd"
+        );
+        assert!(collect_response(Body::from("abcde"), 4).await.is_err());
+        let (mut sender, body) = Body::channel();
+        tokio::spawn(async move {
+            sender.send_data(Bytes::from_static(b"abc")).await.unwrap();
+            drop(sender.send_data(Bytes::from_static(b"de")).await);
+        });
+        assert!(collect_response(body, 4).await.is_err());
+    }
+
+    fn test_server(
+        handler: impl Fn(Request<Body>) -> hyper::Response<Body> + Send + Sync + 'static,
+    ) -> (Uri, tokio::task::JoinHandle<()>) {
+        use hyper::service::{make_service_fn, service_fn};
+        use std::{convert::Infallible, sync::Arc};
+        let handler = Arc::new(handler);
+        let server = hyper::Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(make_service_fn(
+            move |_| {
+                let handler = Arc::clone(&handler);
+                async move {
+                    Ok::<_, Infallible>(service_fn(move |request| {
+                        ready(Ok::<_, Infallible>(handler(request)))
+                    }))
+                }
+            },
+        ));
+        let url = format!("http://{}/", server.local_addr()).parse().unwrap();
+        (url, tokio::spawn(async move { server.await.unwrap() }))
+    }
+
+    #[tokio::test]
+    async fn timeout_covers_stalled_response_body() {
+        let senders = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let retained = std::sync::Arc::clone(&senders);
+        let (url, server) = test_server(move |_| {
+            let (sender, body) = Body::channel();
+            retained.lock().unwrap().push(sender);
+            hyper::Response::new(body)
+        });
+        let client = HttpClient::new(TlsSettings::default(), &ProxyConfig::default()).unwrap();
+        let error = fetch_response(
+            client,
+            Request::get(url).body(Body::empty()).unwrap(),
+            Duration::from_millis(100),
+            1024,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("including response body"));
+        assert_eq!(senders.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[derive(Clone)]
+    struct EmptyContext;
+    impl HttpClientBuilder for EmptyContext {
+        type Context = Self;
+        fn build(&self, _: &Uri) -> Self {
+            self.clone()
+        }
+    }
+    impl HttpClientContext for EmptyContext {
+        fn on_response(&mut self, _: &Uri, _: &Parts, _: &Bytes) -> Option<Vec<Event>> {
+            Some(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn source_allows_only_one_in_flight_request_across_endpoints_and_ticks() {
+        let senders = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let retained = std::sync::Arc::clone(&senders);
+        let (url, server) = test_server(move |_| {
+            let (sender, body) = Body::channel();
+            retained.lock().unwrap().push(sender);
+            hyper::Response::new(body)
+        });
+        let (out, _rx) = SourceSender::new_test();
+        let cx = crate::config::SourceContext::new_test(out.clone(), None);
+        let inputs = GenericHttpClientInputs {
+            urls: vec![url.clone(), url],
+            interval: Duration::from_millis(10),
+            timeout: Duration::from_secs(5),
+            max_response_bytes: 1024,
+            headers: HeaderMap::new(),
+            content_type: "text/plain".into(),
+            auth: None,
+            tls: TlsSettings::default(),
+            proxy: ProxyConfig::default(),
+            shutdown: cx.shutdown,
+        };
+        let task = tokio::spawn(call(inputs, EmptyContext, out, HttpMethod::Get));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while senders.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(senders.lock().unwrap().len(), 1);
+        senders.lock().unwrap().clear(); // Complete the first body, permitting the second endpoint.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while senders.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(senders.lock().unwrap().len(), 1);
+        task.abort();
+        server.abort();
+    }
 
     #[test]
     fn headers_are_normalized_and_sensitive() {
