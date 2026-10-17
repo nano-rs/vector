@@ -42,6 +42,8 @@ sources-vector
 # Self-observability.
 sources-internal_logs
 sources-internal_metrics
+# NAN-4028: native ops Prometheus scraping (including aggregated self metrics).
+sources-prometheus_scrape
 # Region log shipper DaemonSet (nano-main hosted-shared-region-log-shipping.ts).
 sources-kubernetes_logs
 # The base bundle's opt-in templates (sources/{file,syslog}.toml.disabled).
@@ -69,4 +71,6 @@ sinks-blackhole
 sinks-clickhouse
 sinks-console
 sinks-http
+# NAN-4028: native OTLP metric serialization and delivery.
+sinks-opentelemetry
 sinks-prometheus

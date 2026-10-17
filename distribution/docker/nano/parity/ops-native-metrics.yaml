@@ -1,0 +1,44 @@
+# NAN-4028: retain exporter aggregation before native scraping (Distribution is not OTLP).
+sources:
+  self_metrics:
+    type: internal_metrics
+  scrape:
+    type: prometheus_scrape
+    endpoints: [http://127.0.0.1:9598/metrics]
+    scrape_interval_secs: 60
+    instance_tag: null
+    endpoint_tag: null
+transforms:
+  identity:
+    type: remap
+    inputs: [scrape]
+    source: |
+      .tags."resource.service.name" = "ops-telemetry-collector"
+      .tags."resource.cloud.region" = "parity-region"
+      .tags."scope.name" = "nano-ops-telemetry"
+sinks:
+  exporter:
+    type: prometheus_exporter
+    inputs: [self_metrics]
+    address: 127.0.0.1:9598
+  otlp:
+    type: opentelemetry
+    inputs: [identity]
+    buffer:
+      type: memory
+      max_size: 16777216
+      when_full: drop_newest
+    protocol:
+      type: http
+      uri: http://parity.invalid/v1/metrics
+      encoding:
+        codec: otlp
+      batch:
+        max_bytes: 524288
+        timeout_secs: 10
+      request:
+        concurrency: 1
+        timeout_secs: 30
+        retry_initial_backoff_secs: 2
+        retry_max_duration_secs: 30
+        retry_jitter_mode: Full

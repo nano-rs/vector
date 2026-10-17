@@ -12,6 +12,7 @@ Sources:
 - kafka
 - kubernetes_logs
 - opentelemetry
+- prometheus_scrape
 - splunk_hec
 - stdin
 - syslog
@@ -37,6 +38,7 @@ Sinks:
 - clickhouse
 - console
 - http
+- opentelemetry
 - prometheus_exporter
 - prometheus_remote_write
 - unit_test
