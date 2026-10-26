@@ -55,6 +55,13 @@ pub struct S3Response {
     events_byte_size: GroupedCountByteSize,
 }
 
+#[cfg(test)]
+impl S3Response {
+    pub(crate) fn for_test(events_byte_size: GroupedCountByteSize) -> Self {
+        Self { events_byte_size }
+    }
+}
+
 impl DriverResponse for S3Response {
     fn event_status(&self) -> EventStatus {
         EventStatus::Delivered

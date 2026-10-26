@@ -50,6 +50,7 @@ use crate::{
 pub mod status {
     pub const FORBIDDEN: u16 = 403;
     pub const NOT_FOUND: u16 = 404;
+    pub const CONFLICT: u16 = 409;
     pub const TOO_MANY_REQUESTS: u16 = 429;
 }
 
