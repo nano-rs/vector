@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::OnceLock,
+};
 
 use aws_sdk_s3::{
     Client as S3Client,
@@ -10,6 +13,7 @@ use aws_smithy_runtime_api::{
     http::StatusCode,
 };
 use futures::FutureExt;
+use regex::Regex;
 use snafu::Snafu;
 use vector_lib::configurable::configurable_component;
 
@@ -319,6 +323,46 @@ fn is_retriable_response(res: &HttpResponse, errors_to_retry: Option<Vec<u16>>) 
     }
 }
 
+static CLOUDFLARE_EDGE_ERROR: OnceLock<Regex> = OnceLock::new();
+
+/// Returns true when a 409 response was produced by the Cloudflare edge rather
+/// than by the S3-compatible origin (R2).
+///
+/// Cloudflare answers some edge-side failures (for example `1001`, a DNS
+/// resolution error inside Cloudflare) with HTTP 409 and a body of the form
+/// `error code: 1xxx`, or an HTML error page carrying a `cf-error-code`. The
+/// request never reached R2, so no object was written or modified and the PUT
+/// is safe to repeat. A genuine S3/R2 409 carries an XML `<Error><Code>` body
+/// (`OperationAborted`, `BucketAlreadyExists`, ...) and is not matched here,
+/// so its handling is unchanged.
+///
+/// 5xx edge pages need no special case: every 5xx is already retriable.
+/// Other 4xx edge pages (for example a 403 `1020` firewall block) are left
+/// non-retriable, because they reflect a standing policy decision and retrying
+/// them would wedge the sink rather than recover.
+fn is_cloudflare_edge_conflict(res: &HttpResponse) -> bool {
+    if res.status().as_u16() != status::CONFLICT {
+        return false;
+    }
+    let Some(body) = res.body().bytes() else {
+        return false;
+    };
+    let body = String::from_utf8_lossy(body);
+    let re = CLOUDFLARE_EDGE_ERROR.get_or_init(|| {
+        Regex::new(r#"(?i)\A\s*error code:\s*1\d{3}\s*\z|cf-error-code"?>\s*1\d{3}\s*<"#)
+            .expect("invalid regex")
+    });
+    re.is_match(body.as_ref())
+}
+
+fn is_cloudflare_edge_error(error: &SdkError<PutObjectError, HttpResponse>) -> bool {
+    match error {
+        SdkError::ResponseError(err) => is_cloudflare_edge_conflict(err.raw()),
+        SdkError::ServiceError(err) => is_cloudflare_edge_conflict(err.raw()),
+        _ => false,
+    }
+}
+
 fn should_retry_error(
     errors_to_retry: Option<Vec<u16>>,
     error: &SdkError<PutObjectError, HttpResponse>,
@@ -356,6 +400,8 @@ pub enum RetryStrategy {
     ///     - `"RequestTimeout"`
     ///     - `"RequestExpired"`
     ///     - `"ThrottlingException"`
+    ///   - HTTP status is 409 and the body is a Cloudflare edge error page
+    ///     (`error code: 1xxx`), which never reached the S3-compatible origin
     /// - Fallback: Any unknown error variant
     #[default]
     Default,
@@ -378,10 +424,12 @@ impl RetryLogic for RetryStrategy {
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
         match self {
             RetryStrategy::None => false,
-            RetryStrategy::Default => is_retriable_error(error),
+            RetryStrategy::Default => is_retriable_error(error) || is_cloudflare_edge_error(error),
             RetryStrategy::All => true,
             RetryStrategy::Custom { status_codes } => {
-                is_retriable_error(error) || should_retry_error(Some(status_codes.clone()), error)
+                is_retriable_error(error)
+                    || is_cloudflare_edge_error(error)
+                    || should_retry_error(Some(status_codes.clone()), error)
             }
         }
     }
@@ -452,8 +500,97 @@ pub async fn create_service(
 
 #[cfg(test)]
 mod tests {
-    use super::S3StorageClass;
-    use crate::serde::json::to_string;
+    use aws_sdk_s3::operation::put_object::PutObjectError;
+    use aws_smithy_runtime_api::{
+        client::{orchestrator::HttpResponse, result::SdkError},
+        http::StatusCode,
+    };
+    use aws_smithy_types::{body::SdkBody, error::ErrorMetadata};
+    use vector_lib::request_metadata::GroupedCountByteSize;
+
+    use super::{RetryStrategy, S3StorageClass};
+    use crate::{
+        serde::json::to_string,
+        sinks::{
+            s3_common::service::S3Response,
+            util::retries::{RetryAction, RetryLogic},
+        },
+    };
+
+    fn put_error(status: u16, body: &'static str) -> SdkError<PutObjectError, HttpResponse> {
+        let raw = HttpResponse::new(StatusCode::try_from(status).unwrap(), SdkBody::from(body));
+        SdkError::service_error(
+            PutObjectError::generic(ErrorMetadata::builder().build()),
+            raw,
+        )
+    }
+
+    const S3_OPERATION_ABORTED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>OperationAborted</Code><Message>A conflicting conditional operation is currently in progress against this resource.</Message></Error>"#;
+
+    const S3_BUCKET_ALREADY_EXISTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>BucketAlreadyExists</Code><Message>The requested bucket name is not available.</Message></Error>"#;
+
+    const CF_HTML_1001: &str = r#"<!DOCTYPE html><html><head><title>DNS resolution error | example.r2.cloudflarestorage.com | Cloudflare</title></head>
+<body><h1><span class="inline-block">DNS resolution error</span><span class="code-label">Error code <span class="cf-error-code">1001</span></span></h1></body></html>"#;
+
+    // NAN-4619: R2 behind the Cloudflare edge answered a Bronze PUT with
+    // `409` + `error code: 1001`; the sink dropped the batch as non-retriable.
+    #[test]
+    fn cloudflare_edge_409_is_retried() {
+        let strategy = RetryStrategy::Default;
+        assert!(strategy.is_retriable_error(&put_error(409, "error code: 1001")));
+        assert!(strategy.is_retriable_error(&put_error(409, "error code: 1001\n")));
+        assert!(strategy.is_retriable_error(&put_error(409, "Error Code: 1014")));
+        assert!(strategy.is_retriable_error(&put_error(409, CF_HTML_1001)));
+
+        let custom = RetryStrategy::Custom {
+            status_codes: vec![418],
+        };
+        assert!(custom.is_retriable_error(&put_error(409, "error code: 1001")));
+    }
+
+    #[test]
+    fn cloudflare_edge_5xx_is_retried() {
+        let strategy = RetryStrategy::Default;
+        assert!(strategy.is_retriable_error(&put_error(502, "error code: 502")));
+        assert!(strategy.is_retriable_error(&put_error(520, "error code: 520")));
+        assert!(strategy.is_retriable_error(&put_error(530, "error code: 1016")));
+    }
+
+    #[test]
+    fn real_s3_409_is_unchanged() {
+        let strategy = RetryStrategy::Default;
+        assert!(!strategy.is_retriable_error(&put_error(409, S3_OPERATION_ABORTED)));
+        assert!(!strategy.is_retriable_error(&put_error(409, S3_BUCKET_ALREADY_EXISTS)));
+        assert!(!strategy.is_retriable_error(&put_error(409, "")));
+        // A body that merely mentions an edge code inside other text is not an edge page.
+        assert!(!strategy.is_retriable_error(&put_error(
+            409,
+            "<Error><Code>OperationAborted</Code><Message>error code: 1001</Message></Error>"
+        )));
+    }
+
+    #[test]
+    fn cloudflare_edge_non_409_4xx_is_unchanged() {
+        // A firewall block is a standing policy; retrying would only wedge the sink.
+        let strategy = RetryStrategy::Default;
+        assert!(!strategy.is_retriable_error(&put_error(403, "error code: 1020")));
+    }
+
+    #[test]
+    fn none_strategy_still_never_retries() {
+        assert!(!RetryStrategy::None.is_retriable_error(&put_error(409, "error code: 1001")));
+    }
+
+    #[test]
+    fn ok_response_is_successful() {
+        let response = S3Response::for_test(GroupedCountByteSize::new_untagged());
+        assert!(matches!(
+            RetryStrategy::Default.should_retry_response(&response),
+            RetryAction::Successful
+        ));
+    }
 
     #[test]
     fn storage_class_names() {
