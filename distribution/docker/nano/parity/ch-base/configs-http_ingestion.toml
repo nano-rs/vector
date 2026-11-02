@@ -1,0 +1,24 @@
+# Parity unit rendered by materialise-parity.py from nanosiem feat/NAN-4904-vector-061:config/vector/sources/configs/http_ingestion.toml;
+# env references replaced by their defaults (or a parity- literal).
+# Auto-generated routing rules for system-level source: HTTP Ingestion
+# DO NOT EDIT - changes will be overwritten
+# Generated at: 2026-06-24T13:08:57.536389+00:00
+
+[transforms.http_ingestion_route]
+inputs = ["source_type_extract"]
+source = """
+# Apply routing rules to set source_type
+if .source_type == "apache_access" {
+    .source_type = "apache_access"
+} else if .source_type == "windows_sysmon" {
+    .source_type = "windows_sysmon"
+} else if .source_type == "aws_cloudtrail" {
+    .source_type = "aws_cloudtrail"
+} else if .source_type == "conduit" {
+    .source_type = "conduit"
+} else if .source_type == "windows_event" {
+    .source_type = "windows_event"
+}
+# else: passthrough — keep existing .source_type
+"""
+type = "remap"

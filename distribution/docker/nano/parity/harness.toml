@@ -1,7 +1,6 @@
-# Parity config (NAN-3604): the shapes nano's test harnesses run this image with
-# (nanosiem tenant_bundle/pipe_native_tests.rs: stdin -> route -> blackhole;
-# scripts/verify-vector-generation-rollback.sh: demo_logs -> remap -> blackhole;
-# nanosiem-lake-worker fixture regeneration: stdin -> remap -> console).
+# Parity config: the shapes nanosiem's test harnesses run this image with
+# (stdin -> route -> blackhole; scripts/verify-vector-generation-rollback.sh:
+# demo_logs -> remap -> blackhole; stdin -> console).
 [sources.events]
 type = "stdin"
 

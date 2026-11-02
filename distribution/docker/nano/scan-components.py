@@ -19,7 +19,7 @@ read from the generator code itself (CLASSIC_SOURCES below).
 
 Usage (each repo as NAME=PATH@REF; NAME selects the include/exclude rules below):
 
-  scan-components.py nanosiem=~/Projects/nanosiem@origin/main \
+  scan-components.py nanosiem=~/Projects/nanosiem@origin/clickhouse/dev \
                      nano-main=~/Projects/nano-main@origin/main \
                      parsers=~/.cache/parsers@origin/main \
                      vector=.@HEAD
@@ -78,6 +78,7 @@ EXCLUDE = {
         ("nanosiem-web/", "sender template (customer-side Vector)"),
         ("nanosiem-core/src/ingest_sender_templates.rs", "sender template (customer-side Vector)"),
         ("ludus/", "Ludus lab range (endpoint agents and aggregator run upstream Vector)"),
+        ("deploy/src/deploy.js", "customer-side agent deployer (runs upstream Vector)"),
         ("docs", "documentation"),
     ],
     "nano-main": [
@@ -184,10 +185,9 @@ RETIRED_FIXTURES: tuple = ()
 
 # Built although no scanned config uses them yet. Listed so the inventory says why.
 KEPT = {
-    ("enrichment_table", "file"): "kept for NAN-3489 (all enrichment traverses Vector); built in",
-    ("enrichment_table", "geoip"): "kept for NAN-3489 (all enrichment traverses Vector)",
-    ("enrichment_table", "mmdb"): "kept for NAN-3489 (lake-lane IPinfo MMDB lookup may move into VRL)",
-    ("enrichment_table", "memory"): "kept for NAN-3489 (all enrichment traverses Vector)",
+    ("enrichment_table", "file"): "self-hosted IOC/asset enrichment in VRL; built in",
+    ("enrichment_table", "geoip"): "self-hosted geo/ASN enrichment in VRL",
+    ("enrichment_table", "mmdb"): "self-hosted geo/ASN enrichment in VRL",
 }
 
 DYNAMIC_VALUES: dict = {}
