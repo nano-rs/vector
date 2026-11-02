@@ -23,7 +23,6 @@ headers = ["Content-Type", "X-Source-Type", "X-Api-Key"]
 
 # Request body size limit (10MB default)
 # Requirement 3.3: Maximum request body size
-max_body_size = 10485760
 
 # =============================================================================
 # HTTP NDJSON Endpoint
@@ -38,7 +37,6 @@ encoding = "ndjson"
 strict_path = true
 
 # Request body size limit (10MB default)
-max_body_size = 10485760
 
 # =============================================================================
 # HTTP Text Endpoint
@@ -53,7 +51,6 @@ encoding = "text"
 strict_path = true
 
 # Request body size limit (10MB default)
-max_body_size = 10485760
 
 # =============================================================================
 # Webhook Endpoint
@@ -68,7 +65,6 @@ encoding = "json"
 strict_path = false  # Allow subpaths like /webhook/github, /webhook/slack
 
 # Request body size limit (10MB default)
-max_body_size = 10485760
 
 # =============================================================================
 # Health Check Endpoint
@@ -82,4 +78,3 @@ path = "/health"
 encoding = "text"
 
 # Health check doesn't need large body size
-max_body_size = 1024

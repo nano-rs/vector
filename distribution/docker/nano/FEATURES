@@ -1,55 +1,55 @@
-# Cargo features for the nano-rs/vector image (NAN-3604): only the components nano ships or
-# renders, plus the runtime pieces they need. Built with --no-default-features.
+# Cargo features for the nano-rs/vector image: only the components the single-tenant
+# ClickHouse product (nanosiem clickhouse/*) ships or renders, plus the runtime pieces they
+# need. Built with --no-default-features.
 #
-# Derived from `scan-components.py` (see REBASE.md, "Component set"). The image's `vector list`
-# must equal COMPONENTS exactly; the nano-image workflow's parity job checks it.
+# Derived from `scan-components.py` run against nanosiem clickhouse/dev (see REBASE.md,
+# "Component set"). The image's `vector list` must equal COMPONENTS exactly; the nano-image
+# workflow's parity job checks it.
 # One feature per line; `#` starts a comment. The Dockerfile joins the lines with commas.
+#
+# nano/v0.61 dropped, relative to nano/v0.59 (lake / hosted-only): codecs-parquet (Bronze
+# parquet sink), sinks-aws_s3 (R2 raw handoff), sinks-opentelemetry + sources-prometheus_scrape
+# (hosted ops metrics, NAN-4028), sources-http_client (hosted thin pullers, NAN-3489),
+# sources-kubernetes_logs (hosted region log shipper), transforms-sample (tenant lane sampling),
+# enrichment-tables-memory.
 
 # --- runtime (the non-component part of upstream's target-<triple>-unknown-linux-gnu set) ---
-# GraphQL API + health endpoint: [api] enabled in the platform base; `vector top` / `vector tap`.
+# GraphQL API + health endpoint: [api] is enabled in config/vector/00-base.toml.
 api
 api-client
 # Allocator, as upstream's Linux release targets.
 tikv-jemallocator
-# Full VRL standard library (crypto, env, network, system functions): tenant parser VRL may use
-# any stdlib function, and the platform VRL uses get_env_var and sha2.
+# Full VRL standard library (crypto, env, network, system functions): parser VRL may use any
+# stdlib function, and the platform VRL uses get_env_var and sha2.
 vrl/stdlib
-# Parquet batch encoding of the Bronze sink (ocsf_parquet_bronze); brings codecs-arrow.
-codecs-parquet
-# Enrichment tables, kept for NAN-3489 (all enrichment traverses Vector; the lake-lane IPinfo
-# MMDB lookup is a candidate to move into VRL). The `file` (CSV) table is always built in.
+# GeoIP / MMDB enrichment tables (self-hosted geo/ASN enrichment in VRL). The `file` (CSV)
+# table is always built in.
 enrichment-tables-geoip
 enrichment-tables-mmdb
-enrichment-tables-memory
 
 # --- sources ---
-# Pull sources (nanosiem tenant_bundle/pull.rs, nano-main pull-bundle.ts).
-sources-aws_s3
-sources-aws_sqs
-sources-azure_event_hubs
-sources-gcp_pubsub
-# Classic / open-core Kafka sources (nanosiem source_configs generate_kafka_source, emitted at
-# runtime; SASL PLAIN / SCRAM-SHA-256/512 over SASL_SSL). librdkafka is built from source with
-# cmake, as upstream's Linux release targets do. GSSAPI is NOT enabled (no nano config offers
-# it), so libsasl2 is not linked. Hosted pull no longer renders kafka (NAN-3604).
-sources-kafka
-rdkafka?/cmake_build
-# Push ingest (platform base, cells, open core).
+# Push ingest (config/vector 00-base, 01-vector-source, 02-hec-source, 03-otlp-source).
 sources-http_server
 sources-opentelemetry
 sources-splunk_hec
 sources-vector
-# Self-observability.
-sources-internal_logs
-sources-internal_metrics
-# Region log shipper DaemonSet (nano-main hosted-shared-region-log-shipping.ts).
-sources-kubernetes_logs
-# The base bundle's opt-in templates (sources/{file,syslog}.toml.disabled).
+# Classic source generator (nanosiem-core source_configs: kafka, aws_s3 via SQS, gcp_pubsub)
+# plus the Azure Event Hubs source this fork adds (NAN-3599). librdkafka is built from source
+# with cmake, as upstream's Linux release targets do; SASL PLAIN / SCRAM over SASL_SSL need only
+# OpenSSL, so GSSAPI (libsasl2) is not enabled.
+sources-aws_s3
+sources-aws_sqs
+sources-azure_event_hubs
+sources-gcp_pubsub
+sources-kafka
+rdkafka?/cmake_build
+# Opt-in templates (config/vector/sources/{file,syslog,http}.toml.disabled).
 sources-file
 sources-syslog
-# NAN-3489 thin pullers (vendor API polling through the tenant Vector).
-sources-http_client
-# Test harnesses that run this image (pipe_native_tests.rs, verify-vector-generation-rollback.sh).
+# Self-observability (92-metrics.toml).
+sources-internal_logs
+sources-internal_metrics
+# Test harnesses that run this image (verify-vector-generation-rollback.sh, parser tests).
 sources-demo_logs
 sources-stdin
 
@@ -59,14 +59,14 @@ transforms-filter
 transforms-metric_to_log
 transforms-remap
 transforms-route
-transforms-sample
 transforms-throttle
 transforms-trace_to_log
 
 # --- sinks ---
-sinks-aws_s3
 sinks-blackhole
 sinks-clickhouse
 sinks-console
+# Opt-in forwarding template (90-sinks.toml.disabled).
 sinks-http
+# prometheus_exporter (92-metrics.toml); the feature also builds prometheus_remote_write.
 sinks-prometheus

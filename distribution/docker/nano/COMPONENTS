@@ -5,12 +5,10 @@ Sources:
 - demo_logs
 - file
 - gcp_pubsub
-- http_client
 - http_server
 - internal_logs
 - internal_metrics
 - kafka
-- kubernetes_logs
 - opentelemetry
 - splunk_hec
 - stdin
@@ -23,15 +21,12 @@ Transforms:
 - dedupe
 - filter
 - metric_to_log
-- reduce
 - remap
 - route
-- sample
 - throttle
 - trace_to_log
 
 Sinks:
-- aws_s3
 - azure_blob
 - blackhole
 - clickhouse
@@ -45,5 +40,4 @@ Sinks:
 Enrichment tables:
 - file
 - geoip
-- memory
 - mmdb

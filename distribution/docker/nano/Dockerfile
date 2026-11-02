@@ -18,7 +18,7 @@
 # `--build-arg FEATURES=target-x86_64-unknown-linux-gnu` for upstream's full release set.
 
 ARG RUST_VERSION=1.96.1
-ARG DEBIAN_DIGEST=sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+ARG DEBIAN_DIGEST=sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 
 FROM docker.io/rust:${RUST_VERSION}-trixie AS builder
 

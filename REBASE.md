@@ -19,22 +19,41 @@ removed" below). Only the fork's own workflows (`.github/workflows/nano-*.yml`) 
 
 ## The patch series
 
-Every patch is a self-contained commit (squash-merge each PR), in this order:
+`nano/v0.61` (cut from upstream `v0.61.0`, NAN-4904) serves the single-tenant ClickHouse
+product (nanosiem `clickhouse/*`). Every patch is a self-contained commit, in this order:
 
-1. `feat(azure_event_hubs source): …` (NAN-3599): `src/sources/azure_event_hubs/`,
+1. `feat(sources): add azure_event_hubs source` (NAN-3599): `src/sources/azure_event_hubs/`,
    `src/internal_events/azure_event_hubs.rs`, docs (`website/…/azure_event_hubs*`),
    `changelog.d/4261_azure_event_hubs_source.feature.md`, emulator test config in
    `tests/integration/azure/config/`, and small hunks in `Cargo.toml` (dependencies and
-   features), `src/sources/mod.rs` and `src/internal_events/mod.rs`.
-2. `chore(nano): fork tooling`: this file and `distribution/docker/nano/`; NAN-3604 added
-   `.github/workflows/nano-image.yml` and `distribution/docker/nano/parity/`.
-3. `chore(nano): neutralise upstream workflows` (NAN-3604): deletes every upstream file in
+   features), `src/sources/mod.rs` and `src/internal_events/mod.rs`. Follow-ups on top:
+   initial checkpoint at connect (NAN-3604), deterministic replay test (NAN-3706), refused
+   credentials no longer fail the config build (NAN-3730, Event Hubs half), clippy fixes.
+2. `chore(nano): neutralise upstream workflows` (NAN-3604): deletes every upstream file in
    `.github/workflows/` and `.github/dependabot.yml`. See "Upstream CI is removed".
+3. `ci(nano): build + push fork image to GHCR` + `feat(nano): build only nano's Vector
+   components` + `fix(nano): build kafka again`: `.github/workflows/nano-image.yml`,
+   `distribution/docker/nano/` (Dockerfile, FEATURES, COMPONENTS, scanner, parity).
 4. `feat(splunk_hec, http_server sources): valid_tokens_file` (NAN-3770): hashed, hot-reloaded
-   per-sender ingest tokens for nanosiem open core. New file `src/common/http/hashed_tokens.rs`;
-   small hunks in `src/common/http/mod.rs`, `src/sources/util/http/prelude.rs`,
-   `src/sources/http_server.rs` and `src/sources/splunk_hec/mod.rs`; parity config
-   `distribution/docker/nano/parity/open-ingest-tokens.toml`.
+   per-sender ingest tokens. New file `src/common/http/hashed_tokens.rs`; small hunks in
+   `src/common/http/mod.rs`, `src/sources/util/http/prelude.rs`, `src/sources/http_server.rs`
+   and `src/sources/splunk_hec/mod.rs`; parity config `parity/open-ingest-tokens.toml`.
+5. `chore(nano): ClickHouse component set`: FEATURES/COMPONENTS/parity for the CH product.
+
+Not carried from `nano/v0.59` (it stays the rollback point for the lake images):
+
+| nano/v0.59 patch | Why not on nano/v0.61 |
+| --- | --- |
+| #7 docs: 0.59.0-nano.2 superseded | 0.59-only note. |
+| #8 aws_s3 `s3_event_time` (half of the commit) | Hosted pull point-forward start; adds a field to every aws_s3 event. |
+| #9, #11 release unacknowledged messages on shutdown (gcp_pubsub, aws_sqs, aws_s3) | Upstream rewrote `aws_s3/sqs.rs` and reworked gcp_pubsub shutdown in 0.60-0.61; without it messages redeliver after their visibility timeout / ack deadline (duplicates, no loss). Re-port only if restart duplicates matter. |
+| #12 gcp_pubsub / aws_sqs halves | Built on #9; collides with upstream's 0.61 gcp_pubsub rework. A refused GCP credential fails the config build again, as on upstream. |
+| #14 scanner: hosted pull templates | Hosted pull only. |
+| #15 OTLP encoder `resourceSpans` | Only the OTLP lake sink encoded logs as OTLP. |
+| #16 transform queues bounded by small chunk size | No effect at the default chunk size; served hosted ops collectors. |
+| #17 HTTP scrape bounds | `http_client` / `prometheus_scrape` are not built. |
+| #18 native Prometheus scraping + OTLP sink | Hosted ops metrics (NAN-4028). |
+| #19 aws_s3 sink: Cloudflare edge 409 retry | R2 raw handoff (lake); `aws_s3` sink is not built. |
 
 Rules that keep rebases cheap:
 
@@ -49,10 +68,10 @@ Rules that keep rebases cheap:
 
 ```sh
 git fetch upstream --tags
-OLD=v0.59.0 NEW=v0.60.0                       # example
-git switch -c nano/v0.60 "$NEW"
+OLD=v0.61.0 NEW=v0.62.0                       # example
+git switch -c nano/v0.62 "$NEW"
 # Replay our commits (oldest first) from the previous nano branch:
-git cherry-pick $(git rev-list --reverse "$OLD"..origin/nano/v0.59)
+git cherry-pick $(git rev-list --reverse "$OLD"..origin/nano/v0.61)
 ```
 
 Re-delete upstream CI on the new branch. Replaying the deletion commit stops with
@@ -142,20 +161,20 @@ as the entrypoint, `/var/lib/vector` present, and `/etc/vector` holding exactly 
 "Component set" below) with thin LTO and 16 codegen units (`LTO=fat CODEGEN_UNITS=1`
 reproduces upstream's profile). It fails if `vector list` lacks `azure_event_hubs`.
 
-Version scheme: `<upstream version>-nano.<n>`, for example `0.59.0-nano.1`. `<n>` starts at 1
+Version scheme: `<upstream version>-nano.<n>`, for example `0.61.0-nano.1`. `<n>` starts at 1
 and increments for every image cut from the same upstream version; the workflow refuses a
 version that does not start with the `Cargo.toml` version or that already exists in GHCR.
-The git tag is `image-<version>` (`image-0.59.0-nano.1`). The `image-` prefix keeps it clear
+The git tag is `image-<version>` (`image-0.61.0-nano.1`). The `image-` prefix keeps it clear
 of upstream's release tag filters (`v0.*`), which still exist on mirrored branches.
 
-1. Pick `n`: one more than the newest `0.59.0-nano.*` tag at
+1. Pick `n`: one more than the newest `0.61.0-nano.*` tag at
    https://github.com/nano-rs/vector/pkgs/container/vector.
 2. Start the build, either way:
 
    ```sh
-   git tag image-0.59.0-nano.2 origin/nano/v0.59 && git push origin image-0.59.0-nano.2
+   git tag image-0.61.0-nano.2 origin/nano/v0.61 && git push origin image-0.61.0-nano.2
    # or
-   gh workflow run nano-image.yml --repo nano-rs/vector --ref nano/v0.59 -f nano_rev=2
+   gh workflow run nano-image.yml --repo nano-rs/vector --ref nano/v0.61 -f nano_rev=2
    ```
 
 3. Wait (about 2-4 h; amd64 and arm64 build in parallel on native runners). The jobs:
@@ -180,9 +199,9 @@ that step and its credentials belong to nano-main, not to this repository.
 
 ## Invariants
 
-- The crate version stays the upstream version (`0.59.0`); the nano suffix exists only in
+- The crate version stays the upstream version (`0.61.0`); the nano suffix exists only in
   image tags. `vector --version` must keep matching nanosiem's `VECTOR_VERSION_RE`
-  (`^vector \d+\.\d+\.\d+(\s|$)`), which refuses `0.59.0-nano.1`. Never bump `version` in
+  (`^vector \d+\.\d+\.\d+(\s|$)`), which refuses `0.61.0-nano.1`. Never bump `version` in
   `Cargo.toml`; the image identity goes into `VECTOR_BUILD_DESC` (after the target triple).
 - `/etc/vector` in the image equals upstream's (only `examples/`). nano's entrypoints untar
   the config bundle there and run `--config-dir /etc/vector`, so a default config in the image
@@ -241,24 +260,14 @@ cmake (`rdkafka?/cmake_build` in `FEATURES`, as upstream's Linux targets; cmake 
 
 Built on purpose although no product config renders them yet:
 
-- Enrichment tables `geoip`, `mmdb`, `memory` and the built-in `file` (CSV) table: kept for
-  NAN-3489 (all enrichment traverses the tenant Vector; the lake lane's IPinfo MMDB lookup may
-  move into VRL). `KEPT` in the scanner; `parity/enrichment/` loads each from committed fixtures
-  and reads it with `get_enrichment_table_record` (the workflow runs a full `vector validate`
-  on that unit so the tables are actually opened).
+- Enrichment tables `geoip`, `mmdb` and the built-in `file` (CSV) table: self-hosted
+  geo/ASN/IOC enrichment in VRL. `parity/enrichment/` loads each from committed fixtures and
+  reads it with `get_enrichment_table_record` (the workflow runs a full `vector validate` on
+  that unit so the tables are actually opened). The `memory` table is no longer built.
 - `file`, `syslog` sources: the base bundle's opt-in templates (`sources/*.toml.disabled`, an
   operator enables one by renaming it). The scanner counts `*.toml.disabled` as shipped;
   `parity/opt-in-templates/` enables them.
-- `http_client` source: NAN-3489 thin pullers (`parity/pull-http_client.toml`). Note the base's
-  `sources/http.toml.disabled` template is `http_server`, not `http_client`.
-
-Retired in one scope only (`RETIRED`, scoped; still built for the classic generator):
-
-- `kafka` in HOSTED pull: the never-shipped Azure-over-Kafka pull kind, replaced by
-  `azure_event_hubs`. Rendering kafka from nanosiem `tenant_bundle/pull*.rs`, nano-main
-  `pull-bundle.ts` or the nano-main `nan3381-pull-bundle` fixtures is a `--check` ERROR.
-  `RETIRED_FIXTURES` is empty: nano-main#2131 dropped kafka from hosted pull and regenerated
-  those fixtures, and must merge before the guards (nanosiem#6187, nano-main#2127) go green.
+- `azure_event_hubs` source: this fork's own source (`parity/classic-azure_event_hubs.toml`).
 
 Deliberately left out, though something still mentions them:
 

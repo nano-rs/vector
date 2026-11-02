@@ -1,7 +1,7 @@
 # nano-rs/vector: build the fork image and push it to ghcr.io/nano-rs/vector (NAN-3604).
 #
 # Runs only on demand: a pushed tag `image-<upstream version>-nano.<n>` (for example
-# `image-0.59.0-nano.1`) or a manual dispatch with `nano_rev`. Never on branch pushes or PRs.
+# `image-0.61.0-nano.1`) or a manual dispatch with `nano_rev`. Never on branch pushes or PRs.
 # The tag prefix `image-` deliberately does not match upstream's release tag filters (`v0.*`).
 #
 # Flow: meta -> build (amd64 + arm64, native runners, pushed by digest, untagged)
@@ -34,8 +34,8 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/nano-rs/vector
-  # timberio/vector:0.59.0-debian (index). Bump together with the upstream base of nano/vX.Y.
-  UPSTREAM_IMAGE: docker.io/timberio/vector:0.59.0-debian@sha256:98e7b4dfe50750e61470697bbd2fbeca643d12bea97f351005038ef506eab630
+  # timberio/vector:0.61.0-debian (index). Bump together with the upstream base of nano/vX.Y.
+  UPSTREAM_IMAGE: docker.io/timberio/vector:0.61.0-debian@sha256:f6c23b5a7e16fb2838d33619ef7acf4bad2289a7cf22bc90efc2371f520c4ea2
 
 jobs:
   meta:
