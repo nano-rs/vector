@@ -799,7 +799,12 @@ mod tests {
 
         let latest = StartPosition::default();
         let store = Arc::new(MemoryCheckpointStore::default());
-        let checkpointer = Checkpointer::new(store.clone(), "ns", "hub", "$Default");
+        let checkpointer = Checkpointer::new(
+            Arc::<MemoryCheckpointStore>::clone(&store),
+            "ns",
+            "hub",
+            "$Default",
+        );
         let mut partition = FakePartition::default();
         partition.enqueue(10); // History from before the source existed: never read.
 

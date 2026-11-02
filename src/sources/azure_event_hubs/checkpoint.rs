@@ -324,7 +324,7 @@ pub enum InitialCheckpoint {
 
 impl InitialCheckpoint {
     /// The position the partition resumes after.
-    pub fn position(&self) -> &Position {
+    pub const fn position(&self) -> &Position {
         match self {
             Self::Created(position) | Self::Existing(position) | Self::Unreadable(position) => {
                 position
@@ -524,7 +524,7 @@ pub(super) mod tests {
     async fn checkpointer_round_trip_is_case_insensitive() {
         let store = Arc::new(MemoryCheckpointStore::default());
         let writer = Checkpointer::new(
-            store.clone(),
+            Arc::<MemoryCheckpointStore>::clone(&store),
             "NS.servicebus.windows.net",
             "Hub",
             "$Default",
@@ -575,7 +575,7 @@ pub(super) mod tests {
 
     fn checkpointer(store: &Arc<MemoryCheckpointStore>) -> Checkpointer {
         Checkpointer::new(
-            store.clone(),
+            Arc::<MemoryCheckpointStore>::clone(store),
             "ns.servicebus.windows.net",
             "hub",
             "$Default",
