@@ -594,7 +594,7 @@ impl SourceConfig for AzureEventHubsSourceConfig {
                 Err(_) => debug!(message = "Event Hubs client still shared at shutdown."),
             }
             if results.iter().any(Result::is_err) {
-                Err(())
+                Err("one or more Event Hubs partition readers failed".into())
             } else {
                 Ok(())
             }
@@ -809,7 +809,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         drop(trigger);
         done.await;
-        assert_eq!(source.await.unwrap(), Ok(()));
+        assert!(source.await.unwrap().is_ok());
     }
 
     /// Bad configuration still fails the build.

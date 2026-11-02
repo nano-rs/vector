@@ -127,15 +127,15 @@ impl CheckpointStoreConfig {
                 // conditional create (`AzureBlobCheckpointStore::create_checkpoint`) gets its own
                 // client for the same container.
                 let client = build_client(
-                    auth.clone(),
-                    parsed.clone(),
+                    auth.as_ref(),
+                    &parsed,
                     container_url.clone(),
                     proxy,
                     None,
                 )?;
                 let client = Arc::try_unwrap(client)
                     .map_err(|_| "`checkpoint_store`: storage client unexpectedly shared")?;
-                let container = build_client(auth.clone(), parsed, container_url, proxy, None)?;
+                let container = build_client(auth.as_ref(), &parsed, container_url, proxy, None)?;
                 Ok(Arc::new(AzureBlobCheckpointStore {
                     store: BlobCheckpointStore::new(client),
                     container,
