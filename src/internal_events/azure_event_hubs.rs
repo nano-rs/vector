@@ -136,3 +136,61 @@ impl InternalEvent for AzureEventHubsCheckpointCommitted<'_> {
         );
     }
 }
+
+#[derive(Debug, NamedInternalEvent)]
+pub struct AzureEventHubsPartitionPropertiesError<'a> {
+    pub partition_id: &'a str,
+    pub error: azure_messaging_eventhubs::EventHubsError,
+}
+
+impl InternalEvent for AzureEventHubsPartitionPropertiesError<'_> {
+    fn emit(self) {
+        error!(
+            message = "Failed to read Event Hubs partition properties. Will retry.",
+            partition_id = %self.partition_id,
+            error = %self.error,
+            error_code = "failed_reading_partition_properties",
+            error_type = error_type::REQUEST_FAILED,
+            stage = error_stage::RECEIVING,
+        );
+        counter!(
+            CounterName::ComponentErrorsTotal,
+            "error_code" => "failed_reading_partition_properties",
+            "error_type" => error_type::REQUEST_FAILED,
+            "stage" => error_stage::RECEIVING,
+        )
+        .increment(1);
+    }
+}
+
+#[derive(Debug, NamedInternalEvent)]
+pub struct AzureEventHubsInitialCheckpoint<'a> {
+    pub partition_id: &'a str,
+    pub outcome: &'a crate::sources::azure_event_hubs::InitialCheckpoint,
+}
+
+impl InternalEvent for AzureEventHubsInitialCheckpoint<'_> {
+    fn emit(self) {
+        use crate::sources::azure_event_hubs::InitialCheckpoint;
+        match self.outcome {
+            InitialCheckpoint::Created(position) => info!(
+                message = "Wrote initial Event Hubs checkpoint at the partition's last enqueued event.",
+                partition_id = %self.partition_id,
+                offset = ?position.offset,
+                sequence_number = ?position.sequence_number,
+            ),
+            InitialCheckpoint::Existing(position) => info!(
+                message = "Event Hubs partition got a checkpoint from another writer; resuming from it.",
+                partition_id = %self.partition_id,
+                offset = ?position.offset,
+                sequence_number = ?position.sequence_number,
+            ),
+            InitialCheckpoint::Unreadable(position) => warn!(
+                message = "Event Hubs partition has a checkpoint without a position; kept it and starting after the last enqueued event.",
+                partition_id = %self.partition_id,
+                offset = ?position.offset,
+                sequence_number = ?position.sequence_number,
+            ),
+        }
+    }
+}

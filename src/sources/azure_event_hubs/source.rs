@@ -17,8 +17,8 @@ use vector_lib::{
     finalization::AddBatchNotifier,
     finalizer::OrderedFinalizer,
     internal_event::{
-        ByteSize, BytesReceived, CountByteSize, EventsReceived, InternalEventHandle as _,
-        Protocol, Registered,
+        ByteSize, BytesReceived, CountByteSize, EventsReceived, InternalEventHandle as _, Protocol,
+        Registered,
     },
     shutdown::ShutdownSignal,
 };
@@ -29,13 +29,14 @@ use vrl::{
 
 use super::{
     AzureEventHubsSourceConfig,
-    checkpoint::{Checkpointer, Position},
+    checkpoint::{Checkpointer, InitialCheckpoint, Position},
 };
 use crate::{
     SourceSender,
     internal_events::{
         AzureEventHubsCheckpointCommitted, AzureEventHubsCheckpointError,
-        AzureEventHubsConnectError, AzureEventHubsDeliveryFailed, AzureEventHubsReceiveError,
+        AzureEventHubsConnectError, AzureEventHubsDeliveryFailed, AzureEventHubsInitialCheckpoint,
+        AzureEventHubsPartitionPropertiesError, AzureEventHubsReceiveError,
         AzureEventHubsUnsupportedBody, StreamClosedError,
     },
 };
@@ -57,6 +58,11 @@ pub(super) struct PartitionReader {
     pub initial_position: Option<Position>,
     /// Where to start when there is no checkpoint.
     pub default_start: StartPosition,
+    /// When the partition has no checkpoint, resolve what `latest` means now and write it as the
+    /// first checkpoint before reading (`start_position = "latest"` with a checkpoint store).
+    /// Without it, a restart before the partition's first event would start at `latest` again
+    /// and skip everything enqueued while the source was down.
+    pub initial_checkpoint: bool,
     pub prefetch: Option<u32>,
     pub owner_level: Option<i64>,
     pub checkpoint_interval: Duration,
@@ -99,6 +105,21 @@ impl PositionState {
         Self {
             committed: initial.clone(),
             acknowledged: initial,
+            ..Default::default()
+        }
+    }
+
+    /// The state after [`Checkpointer::initialize`]: the partition resumes after the position it
+    /// returned, which is what the store now holds (or keeps, see [`InitialCheckpoint`]).
+    fn initialized(outcome: &InitialCheckpoint) -> Self {
+        Self::new(Some(outcome.position().clone()))
+    }
+
+    /// The state when the initial checkpoint could not be written: read after `latest` anyway,
+    /// and let the periodic commit retry writing it.
+    fn uncommitted(latest: Position) -> Self {
+        Self {
+            acknowledged: Some(latest),
             ..Default::default()
         }
     }
@@ -151,7 +172,16 @@ impl PartitionReader {
     pub async fn run(mut self) -> Result<(), ()> {
         let bytes_received = register!(BytesReceived::from(Protocol::from("amqp")));
         let events_received = register!(EventsReceived);
-        let mut positions = PositionState::new(self.initial_position.take());
+        let mut positions = match (self.initial_position.take(), &self.checkpointer) {
+            (None, Some(checkpointer)) if self.initial_checkpoint => {
+                match self.initialize_checkpoint(checkpointer).await {
+                    Some(positions) => positions,
+                    // Shut down before the partition was opened: nothing to drain or commit.
+                    None => return Ok(()),
+                }
+            }
+            (initial, _) => PositionState::new(initial),
+        };
         let (mut finalizer, mut acks) =
             OrderedFinalizer::<Position>::maybe_new(self.acknowledgements, None);
         let mut checkpoint_tick = tokio::time::interval(self.checkpoint_interval);
@@ -303,6 +333,64 @@ impl PartitionReader {
         }
         self.commit(&mut positions).await;
         result
+    }
+
+    /// Resolves the position `latest` means right now (the partition's last enqueued event) and
+    /// writes it as the partition's first checkpoint, create-only. Reading then starts right
+    /// after that position rather than at `latest`, so nothing enqueued between the two is
+    /// missed, and a restart before the first event resumes after it too.
+    ///
+    /// Reading the partition properties is retried until it succeeds, as opening a receiver is.
+    /// If the checkpoint write fails, the partition is read anyway and the periodic commit retries
+    /// the write. That retry is an ordinary (unconditional) checkpoint write: it could only
+    /// replace a checkpoint that another consumer of the same partition and consumer group wrote
+    /// in the meantime, which this source does not coordinate with in any case (see
+    /// `owner_level`).
+    ///
+    /// Returns `None` on shutdown.
+    async fn initialize_checkpoint(&self, checkpointer: &Checkpointer) -> Option<PositionState> {
+        let mut shutdown = self.shutdown.clone();
+        let mut backoff = BACKOFF_INITIAL;
+        let latest = loop {
+            let properties = tokio::select! {
+                biased;
+                _ = &mut shutdown => return None,
+                properties = self.client.get_partition_properties(&self.partition_id) => properties,
+            };
+            match properties {
+                Ok(properties) => break Position::last_enqueued(&properties),
+                Err(error) => {
+                    emit!(AzureEventHubsPartitionPropertiesError {
+                        partition_id: &self.partition_id,
+                        error,
+                    });
+                    if !sleep_or_shutdown(&mut backoff, &mut shutdown).await {
+                        return None;
+                    }
+                }
+            }
+        };
+        let result = tokio::select! {
+            biased;
+            _ = &mut shutdown => return None,
+            result = checkpointer.initialize(&self.partition_id, latest.clone()) => result,
+        };
+        Some(match result {
+            Ok(outcome) => {
+                emit!(AzureEventHubsInitialCheckpoint {
+                    partition_id: &self.partition_id,
+                    outcome: &outcome,
+                });
+                PositionState::initialized(&outcome)
+            }
+            Err(error) => {
+                emit!(AzureEventHubsCheckpointError {
+                    partition_id: &self.partition_id,
+                    error,
+                });
+                PositionState::uncommitted(latest)
+            }
+        })
     }
 
     /// Writes the acknowledged position, if it changed. Failures are retried on the next tick.
@@ -593,27 +681,42 @@ mod tests {
     fn positions_without_checkpoint() {
         let default = StartPosition::default();
         let mut state = PositionState::new(None);
-        assert_eq!(describe(&state.reconnect_start(&default)), describe(&default));
+        assert_eq!(
+            describe(&state.reconnect_start(&default)),
+            describe(&default)
+        );
         assert!(state.pending_commit().is_none());
 
         state.on_received(pos(1), false);
         state.on_received(pos(2), false);
         // Reconnects continue after the events in flight.
-        assert_eq!(describe(&state.reconnect_start(&default)), describe(&pos(2).after()));
+        assert_eq!(
+            describe(&state.reconnect_start(&default)),
+            describe(&pos(2).after())
+        );
         // Replays before any acknowledgement start at the first received event, inclusive.
         state.reset_to_acknowledged();
-        assert_eq!(describe(&state.replay_start(&default)), describe(&pos(1).at()));
+        assert_eq!(
+            describe(&state.replay_start(&default)),
+            describe(&pos(1).at())
+        );
 
         state.on_acknowledged(pos(1));
         assert_eq!(state.pending_commit(), Some(&pos(1)));
-        assert_eq!(describe(&state.replay_start(&default)), describe(&pos(1).after()));
+        assert_eq!(
+            describe(&state.replay_start(&default)),
+            describe(&pos(1).after())
+        );
     }
 
     #[test]
     fn positions_with_checkpoint() {
         let default = StartPosition::default();
         let mut state = PositionState::new(Some(pos(5)));
-        assert_eq!(describe(&state.reconnect_start(&default)), describe(&pos(5).after()));
+        assert_eq!(
+            describe(&state.reconnect_start(&default)),
+            describe(&pos(5).after())
+        );
         assert!(state.pending_commit().is_none());
         state.on_received(pos(6), true);
         assert_eq!(state.pending_commit(), Some(&pos(6)));
@@ -622,9 +725,156 @@ mod tests {
     }
 
     #[test]
+    fn positions_after_initial_checkpoint() {
+        let latest = StartPosition::default();
+        let state = PositionState::initialized(&InitialCheckpoint::Created(pos(9)));
+        assert_eq!(
+            describe(&state.reconnect_start(&latest)),
+            describe(&pos(9).after())
+        );
+        assert_eq!(
+            describe(&state.replay_start(&latest)),
+            describe(&pos(9).after())
+        );
+        // The store already holds it.
+        assert!(state.pending_commit().is_none());
+
+        let state = PositionState::initialized(&InitialCheckpoint::Existing(pos(5)));
+        assert_eq!(
+            describe(&state.reconnect_start(&latest)),
+            describe(&pos(5).after())
+        );
+        assert!(state.pending_commit().is_none());
+
+        // The write failed: read after `latest` anyway, and commit it on the next tick.
+        let state = PositionState::uncommitted(pos(9));
+        assert_eq!(
+            describe(&state.reconnect_start(&latest)),
+            describe(&pos(9).after())
+        );
+        assert_eq!(state.pending_commit(), Some(&pos(9)));
+    }
+
+    /// One partition, filtered the way the service applies a receiver's start position. Event
+    /// `n` has sequence number `n` and offset `n * 100`, like [`pos`].
+    #[derive(Default)]
+    struct FakePartition {
+        len: i64,
+    }
+
+    impl FakePartition {
+        fn enqueue(&mut self, count: i64) {
+            self.len += count;
+        }
+
+        fn properties(&self) -> azure_messaging_eventhubs::models::EventHubPartitionProperties {
+            let last = self.len - 1;
+            let offset = if last < 0 {
+                "-1".to_string()
+            } else {
+                (last * 100).to_string()
+            };
+            super::super::checkpoint::tests::partition_properties(last, &offset)
+        }
+
+        /// The sequence number of the first event a receiver opened now at `start` reads.
+        fn open(&self, start: &StartPosition) -> i64 {
+            use azure_messaging_eventhubs::StartLocation;
+            let skip = i64::from(!start.inclusive);
+            match &start.location {
+                StartLocation::Earliest => 0,
+                StartLocation::Latest => self.len,
+                StartLocation::SequenceNumber(n) => n + skip,
+                StartLocation::Offset(offset) => {
+                    let offset: i64 = offset.parse().unwrap();
+                    if offset < 0 { 0 } else { offset / 100 + skip }
+                }
+                StartLocation::EnqueuedTime(_) => unimplemented!(),
+            }
+        }
+
+        /// The events a receiver opened at sequence number `first` has read by now.
+        fn read(&self, first: i64) -> Vec<i64> {
+            (first..self.len).collect()
+        }
+    }
+
+    /// The partition is idle when the source starts, the source stops before any event arrives,
+    /// events are enqueued while it is down, and it starts again: every one of them is read.
+    #[tokio::test]
+    async fn restart_while_idle_reads_everything_enqueued_while_down() {
+        use super::super::checkpoint::MemoryCheckpointStore;
+
+        let latest = StartPosition::default();
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let checkpointer = Checkpointer::new(store.clone(), "ns", "hub", "$Default");
+        let mut partition = FakePartition::default();
+        partition.enqueue(10); // History from before the source existed: never read.
+
+        // First start: no checkpoint, so the initial one is written at the last enqueued event.
+        assert!(checkpointer.load().await.unwrap().is_empty());
+        let outcome = checkpointer
+            .initialize("0", Position::last_enqueued(&partition.properties()))
+            .await
+            .unwrap();
+        assert_eq!(outcome, InitialCheckpoint::Created(pos(9)));
+        let state = PositionState::initialized(&outcome);
+        let first = partition.open(&state.reconnect_start(&latest));
+        assert_eq!(partition.read(first), Vec::<i64>::new());
+        // Stopped while idle; nothing else was committed.
+
+        partition.enqueue(5); // Enqueued while the source is down.
+
+        // Restart: the initial checkpoint is loaded like any other.
+        let loaded = checkpointer.load().await.unwrap();
+        assert_eq!(loaded.get("0"), Some(&pos(9)));
+        let state = PositionState::new(loaded.get("0").cloned());
+        let first = partition.open(&state.reconnect_start(&latest));
+        assert_eq!(partition.read(first), vec![10, 11, 12, 13, 14]);
+
+        // Without the initial checkpoint the restart starts at `latest` and skips all five.
+        let first = partition.open(&PositionState::new(None).reconnect_start(&latest));
+        assert_eq!(partition.read(first), Vec::<i64>::new());
+
+        // A third start finds the checkpoint and never re-initializes or overwrites it.
+        let again = checkpointer
+            .initialize("0", Position::last_enqueued(&partition.properties()))
+            .await
+            .unwrap();
+        assert_eq!(again, InitialCheckpoint::Existing(pos(9)));
+    }
+
+    /// A partition that never had an event: the initial checkpoint is "before the first event",
+    /// so the first events, even those enqueued while the source was down, are read.
+    #[tokio::test]
+    async fn restart_of_a_new_empty_partition_reads_its_first_events() {
+        use super::super::checkpoint::MemoryCheckpointStore;
+
+        let latest = StartPosition::default();
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let checkpointer = Checkpointer::new(store, "ns", "hub", "$Default");
+        let mut partition = FakePartition::default();
+
+        let outcome = checkpointer
+            .initialize("0", Position::last_enqueued(&partition.properties()))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, InitialCheckpoint::Created(_)));
+        partition.enqueue(3);
+
+        let loaded = checkpointer.load().await.unwrap();
+        let state = PositionState::new(loaded.get("0").cloned());
+        let first = partition.open(&state.reconnect_start(&latest));
+        assert_eq!(partition.read(first), vec![0, 1, 2]);
+    }
+
+    #[test]
     fn body_variants() {
         assert_eq!(
-            body_bytes(&AmqpMessageBody::Binary(vec![b"ab".to_vec(), b"cd".to_vec()])),
+            body_bytes(&AmqpMessageBody::Binary(vec![
+                b"ab".to_vec(),
+                b"cd".to_vec()
+            ])),
             Ok(Some(Bytes::from_static(b"abcd")))
         );
         assert_eq!(
@@ -649,6 +899,9 @@ mod tests {
             simple_value(&AmqpSimpleValue::String("x".into())),
             Value::from("x")
         );
-        assert_eq!(simple_value(&AmqpSimpleValue::Boolean(true)), Value::Boolean(true));
+        assert_eq!(
+            simple_value(&AmqpSimpleValue::Boolean(true)),
+            Value::Boolean(true)
+        );
     }
 }
