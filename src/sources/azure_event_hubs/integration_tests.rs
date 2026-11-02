@@ -18,6 +18,7 @@ use vector_lib::{config::LogNamespace, event::EventStatus, shutdown::ShutdownSig
 
 use super::{
     AzureEventHubsSourceConfig, CheckpointStoreConfig, StartPositionConfig,
+    checkpoint::{Checkpointer, Position},
     sas::{EventHubsConnectionString, SasTokenCredential},
 };
 use crate::{
@@ -70,7 +71,10 @@ async fn create_container(name: &str) {
         None,
     )
     .unwrap();
-    client.create(None).await.expect("create checkpoint container");
+    client
+        .create(None)
+        .await
+        .expect("create checkpoint container");
 }
 
 fn config(hub: &str, container: &str) -> AzureEventHubsSourceConfig {
@@ -241,6 +245,100 @@ async fn azure_event_hubs_replays_after_failed_delivery() {
     for body in &more {
         assert!(received.contains(body), "missing event {body}");
     }
+}
+
+fn checkpointer(config: &AzureEventHubsSourceConfig, hub: &str) -> Checkpointer {
+    let store = config
+        .checkpoint_store
+        .as_ref()
+        .unwrap()
+        .build(&Default::default())
+        .unwrap();
+    Checkpointer::new(
+        store,
+        &config.connection().unwrap().namespace,
+        hub,
+        &config.consumer_group,
+    )
+}
+
+/// Starts the source with no traffic, waits until every partition has a checkpoint, and shuts it
+/// down. Returns the checkpoints.
+async fn start_idle(
+    config: &AzureEventHubsSourceConfig,
+    checkpointer: &Checkpointer,
+    partitions: usize,
+) -> HashMap<String, Position> {
+    let (trigger, shutdown, done) = ShutdownSignal::new_wired();
+    let (tx, _rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+    let mut cx = SourceContext::new_test(tx, None);
+    cx.shutdown = shutdown;
+    cx.acknowledgements = true;
+    let handle = tokio::spawn(config.build(cx).await.expect("build source"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let checkpoints = loop {
+        let checkpoints = checkpointer.load().await.unwrap();
+        if checkpoints.len() >= partitions {
+            break checkpoints;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for initial checkpoints: {checkpoints:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    drop(trigger);
+    done.await;
+    handle.await.unwrap().expect("source exited cleanly");
+    checkpoints
+}
+
+/// `start_position = "latest"`: the source starts while the partitions are idle and stops before
+/// any event arrives. It wrote an initial checkpoint per partition, so after a restart it reads
+/// every event enqueued while it was down, and none from before its first start.
+#[tokio::test]
+async fn azure_event_hubs_latest_restart_while_idle_skips_nothing() {
+    let hub = "eh-idle";
+    let container = format!("checkpoints-{}", random_string(8).to_lowercase());
+    create_container(&container).await;
+    let mut config = config(hub, &container);
+    config.start_position = StartPositionConfig::Latest;
+    let checkpointer = checkpointer(&config, hub);
+    let run = random_string(10);
+
+    // History from before the source's first start, tagged with its own run so that its bodies
+    // differ from the later ones: `latest` never reads it.
+    let history_run = format!("{run}-history");
+    let history = produce(hub, &history_run, 20).await;
+    let initial = start_idle(&config, &checkpointer, 2).await;
+    assert_eq!(initial.len(), 2, "{initial:?}");
+
+    let while_down = produce(hub, &run, 60).await;
+    let (tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+    let (history_tx, history_rx) = futures::channel::mpsc::unbounded();
+    // Everything the restarted source reads goes to `rx`; copy the history events aside.
+    let rx = rx.inspect(move |event| {
+        let message = message(event);
+        if message.contains(&format!(r#""run":"{history_run}""#)) {
+            history_tx.unbounded_send(message).unwrap();
+        }
+    });
+    let received = run_source(&config, tx, rx, &run, |n| n >= while_down.len()).await;
+    assert_exactly_once(&while_down, &received);
+    let history_read: Vec<String> = history_rx.collect().await;
+    assert!(
+        history_read.is_empty(),
+        "read {} of {} history events: {history_read:?}",
+        history_read.len(),
+        history.len()
+    );
+
+    // An existing checkpoint is never replaced by an initial one: an idle start leaves the
+    // checkpoints exactly as the previous run committed them.
+    let committed = checkpointer.load().await.unwrap();
+    assert_ne!(committed, initial);
+    assert_eq!(start_idle(&config, &checkpointer, 2).await, committed);
+    assert_eq!(checkpointer.load().await.unwrap(), committed);
 }
 
 #[tokio::test]
