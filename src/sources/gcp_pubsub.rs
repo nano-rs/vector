@@ -490,6 +490,17 @@ impl PubsubSource {
                 .metadata_mut()
                 .insert("authorization", authorization);
         }
+        // Credentials files that name a quota project (authorized_user ADC with
+        // `quota_project_id`, for example) bill requests to it (NAN-4935).
+        if let Some(project) = self
+            .auth
+            .quota_project()
+            .and_then(|project| MetadataValue::try_from(project).ok())
+        {
+            request
+                .metadata_mut()
+                .insert("x-goog-user-project", project);
+        }
         debug!("Starting streaming pull.");
         let stream = tokio::select! {
             _ = &mut self.shutdown => return State::Shutdown,
