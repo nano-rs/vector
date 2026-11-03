@@ -442,3 +442,26 @@ fn impersonated_service_account_refuses_other_sources() {
         GcpError::UnsupportedCredentials { .. }
     ));
 }
+
+#[tokio::test]
+async fn service_account_parse_errors_never_echo_values() {
+    // A type mismatch on a later field: serde's own message would quote the value.
+    let raw = r#"{"type":"service_account","project_id":"p","private_key_id":"k","private_key":"-----SECRET-----","client_email":"a@b","client_id":"1","auth_uri":"u","token_uri":7,"auth_provider_x509_cert_url":"u","client_x509_cert_url":"u"}"#;
+    let file = temp_file(raw);
+    let error = GcpAuthenticator::from_file(file.path().to_str().unwrap(), Scope::PubSub)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Invalid GCP service_account credentials"),
+        "{error}"
+    );
+    assert_no_secrets(&error);
+
+    let file = temp_file(r#"{"type":"service_account","project_id":"p"}"#);
+    let error = GcpAuthenticator::from_file(file.path().to_str().unwrap(), Scope::PubSub)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("missing field"), "{error}");
+}

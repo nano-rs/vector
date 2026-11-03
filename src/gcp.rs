@@ -201,10 +201,9 @@ impl TokenSource {
     fn from_json(raw: &str, scope: Scope) -> Result<(Self, Option<String>), GcpError> {
         Ok(match CredentialKind::detect(raw)? {
             CredentialKind::ServiceAccount => {
-                // goauth's own parse error ("missing field ...") names a field, never a value.
-                let creds = raw
-                    .parse::<Credentials>()
-                    .context(InvalidCredentialsSnafu)?;
+                // Parsed through `credentials::parse` so a type mismatch never echoes a value
+                // (serde's "invalid type: string ..." text would quote the private key).
+                let creds: Credentials = credentials::parse("service_account", raw)?;
                 (Self::ServiceAccount(creds, scope), None)
             }
             CredentialKind::AuthorizedUser => {
