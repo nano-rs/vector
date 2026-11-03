@@ -78,11 +78,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=builder /usr/bin/vector /usr/bin/vector
 COPY --from=builder /var/lib/vector /var/lib/vector
 
-# /etc/vector matches the upstream image exactly: only the package's examples/, no default
-# config. nano's entrypoints run `--config-dir /etc/vector`, so any file here would be loaded.
+# /etc/vector matches the upstream image exactly: the package's examples/ plus, since 0.61,
+# the package's comment-only /etc/vector/vector.yaml (no components; loading it is a no-op).
+# nano's entrypoints run `--config-dir /etc/vector`, so any other file here would be loaded.
 # (Dockerfile.dockerignore next to this file admits config/examples into the build context.)
 COPY config/examples/*.yaml /etc/vector/examples/
-RUN chmod 0755 /etc/vector /etc/vector/examples && chmod 0644 /etc/vector/examples/*.yaml
+COPY distribution/debian/vector.yaml /etc/vector/vector.yaml
+RUN chmod 0755 /etc/vector /etc/vector/examples && chmod 0644 /etc/vector/vector.yaml /etc/vector/examples/*.yaml
 
 # Smoke test
 RUN ["vector", "--version"]
