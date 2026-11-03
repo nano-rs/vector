@@ -23,6 +23,14 @@ use vector_lib::{configurable::configurable_component, sensitive_string::Sensiti
 
 use crate::{config::ProxyConfig, http::client_v1::HttpClient, tls::MaybeTlsSettings};
 
+mod credentials;
+mod egress;
+use credentials::{AuthorizedUser, CredentialKind, ExternalAccount, ImpersonatedServiceAccount};
+
+/// Header that bills a request to a quota project. Sent only when the credentials file names
+/// one (`quota_project_id`), as Google's client libraries do.
+const USER_PROJECT_HEADER: &str = "x-goog-user-project";
+
 const SERVICE_ACCOUNT_TOKEN_URL: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
 
@@ -62,6 +70,33 @@ pub enum GcpError {
     TokenJsonFromStr { source: serde_json::Error },
     #[snafu(display("Failed to build HTTP client: {}", source))]
     BuildHttpClient { source: crate::Error },
+    #[snafu(display("Cannot read GCP credentials file {:?}: {}", path, source))]
+    ReadCredentials {
+        path: String,
+        source: std::io::Error,
+    },
+    #[snafu(display(
+        "Unsupported GCP credentials type {:?}: use service_account, authorized_user, external_account (file or url source) or impersonated_service_account",
+        kind
+    ))]
+    UnsupportedCredentials { kind: String },
+    #[snafu(display("Invalid GCP {} credentials: {}", kind, reason))]
+    MalformedCredentials { kind: &'static str, reason: String },
+    #[snafu(display(
+        "GCP token request to {} failed (HTTP {}): {}",
+        endpoint,
+        status,
+        error
+    ))]
+    TokenEndpoint {
+        endpoint: String,
+        status: u16,
+        error: String,
+    },
+    #[snafu(display("Failed to obtain the external_account subject token: {}", reason))]
+    SubjectToken { reason: String },
+    #[snafu(display("GCP credentials {} refused: {}", what, reason))]
+    EgressRefused { what: &'static str, reason: String },
 }
 
 /// Configuration of the authentication strategy for interacting with GCP services.
@@ -86,7 +121,17 @@ pub struct GcpAuthConfig {
     /// [gcp_api_key]: https://cloud.google.com/docs/authentication/api-keys
     pub api_key: Option<SensitiveString>,
 
-    /// Path to a [service account][gcp_service_account_credentials] credentials JSON file.
+    /// Path to a [service account][gcp_service_account_credentials] credentials JSON file, or to any other
+    /// Application Default Credentials file: `authorized_user` (written by
+    /// `gcloud auth application-default login`), `external_account` (workload identity federation
+    /// with a file or URL credential source) or `impersonated_service_account` (with
+    /// `authorized_user` source credentials). Only service-account keys carry a project id; the
+    /// project always comes from the component's own configuration.
+    ///
+    /// Endpoints a credentials file names must be HTTPS `*.googleapis.com` token, STS or IAM
+    /// Credentials paths. An `external_account` file source must sit under
+    /// `VECTOR_GCP_WIF_FILE_ROOT` (default `/var/run/secrets/nano-gcp-wif`); a URL source must be
+    /// HTTPS to a public host, or the metadata server when `VECTOR_GCP_WIF_ALLOW_METADATA=true`.
     ///
     /// Either an API key or a path to a service account credentials JSON file can be specified.
     ///
@@ -122,31 +167,142 @@ impl GcpAuthConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum GcpAuthenticator {
     Credentials(Arc<InnerCreds>),
     ApiKey(Box<str>),
     None,
 }
 
-#[derive(Debug)]
 pub struct InnerCreds {
-    creds: Option<(Credentials, Scope)>,
+    source: TokenSource,
     token: RwLock<Token>,
+    quota_project: Option<String>,
+}
+
+/// Never prints the API key or the access token (NAN-4935 review P2).
+impl std::fmt::Debug for GcpAuthenticator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Credentials(inner) => f.debug_tuple("Credentials").field(inner).finish(),
+            Self::ApiKey(_) => f.write_str("ApiKey(**REDACTED**)"),
+            Self::None => f.write_str("None"),
+        }
+    }
+}
+
+impl std::fmt::Debug for InnerCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InnerCreds")
+            .field("source", &self.source)
+            .field("token", &"**REDACTED**")
+            .field("quota_project", &self.quota_project)
+            .finish()
+    }
+}
+
+/// Where access tokens come from. Every variant except `Metadata` is a credentials file.
+enum TokenSource {
+    ServiceAccount(Credentials, Scope),
+    AuthorizedUser(AuthorizedUser),
+    ExternalAccount(ExternalAccount, Scope),
+    ImpersonatedServiceAccount(ImpersonatedServiceAccount, Scope),
+    Metadata,
+}
+
+/// Names the kind only: goauth's `Credentials` derives a `Debug` that prints the private key.
+impl std::fmt::Debug for TokenSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ServiceAccount(..) => "ServiceAccount",
+            Self::AuthorizedUser(_) => "AuthorizedUser",
+            Self::ExternalAccount(..) => "ExternalAccount",
+            Self::ImpersonatedServiceAccount(..) => "ImpersonatedServiceAccount",
+            Self::Metadata => "Metadata",
+        })
+    }
+}
+
+impl TokenSource {
+    /// Parse a credentials file of any supported `type`. The project is never read from it:
+    /// only service-account keys carry one, and components take theirs from their own config.
+    fn from_json(raw: &str, scope: Scope) -> Result<(Self, Option<String>), GcpError> {
+        Ok(match CredentialKind::detect(raw)? {
+            CredentialKind::ServiceAccount => {
+                // Parsed through `credentials::parse` so a type mismatch never echoes a value
+                // (serde's "invalid type: string ..." text would quote the private key).
+                let creds: Credentials = credentials::parse("service_account", raw)?;
+                // The signed JWT assertion is posted to token_uri: it must be Google's.
+                egress::check_google_endpoint(
+                    &creds.token_uri(),
+                    egress::GoogleEndpoint::OAuthToken,
+                )?;
+                (Self::ServiceAccount(creds, scope), None)
+            }
+            CredentialKind::AuthorizedUser => {
+                let creds = AuthorizedUser::from_json(raw)?;
+                let quota = creds.quota_project_id.clone();
+                (Self::AuthorizedUser(creds), quota)
+            }
+            CredentialKind::ExternalAccount => {
+                let creds = ExternalAccount::from_json(raw)?;
+                let quota = creds.quota_project_id.clone();
+                (Self::ExternalAccount(creds, scope), quota)
+            }
+            CredentialKind::ImpersonatedServiceAccount => {
+                let creds = ImpersonatedServiceAccount::from_json(raw)?;
+                let quota = creds.quota_project_id.clone();
+                (Self::ImpersonatedServiceAccount(creds, scope), quota)
+            }
+        })
+    }
+
+    async fn fetch(&self) -> crate::Result<Token> {
+        Ok(match self {
+            Self::ServiceAccount(creds, scope) => fetch_token(creds, scope).await?,
+            Self::AuthorizedUser(creds) => creds.fetch_token().await?,
+            Self::ExternalAccount(creds, scope) => creds.fetch_token(&scope.url()).await?,
+            Self::ImpersonatedServiceAccount(creds, scope) => {
+                creds.fetch_token(&scope.url()).await?
+            }
+            Self::Metadata => get_token_implicit().await?,
+        })
+    }
 }
 
 impl GcpAuthenticator {
     async fn from_file(path: &str, scope: Scope) -> crate::Result<Self> {
-        let creds = Credentials::from_file(path).context(InvalidCredentialsSnafu)?;
-        let token = RwLock::new(fetch_token(&creds, &scope).await?);
-        let creds = Some((creds, scope));
-        Ok(Self::Credentials(Arc::new(InnerCreds { creds, token })))
+        let raw = std::fs::read_to_string(path).context(ReadCredentialsSnafu { path })?;
+        Self::from_json(&raw, scope).await
+    }
+
+    async fn from_json(raw: &str, scope: Scope) -> crate::Result<Self> {
+        let (source, quota_project) = TokenSource::from_json(raw, scope)?;
+        let token = RwLock::new(source.fetch().await?);
+        Ok(Self::Credentials(Arc::new(InnerCreds {
+            source,
+            token,
+            quota_project,
+        })))
     }
 
     async fn new_implicit() -> crate::Result<Self> {
         let token = RwLock::new(get_token_implicit().await?);
-        let creds = None;
-        Ok(Self::Credentials(Arc::new(InnerCreds { creds, token })))
+        Ok(Self::Credentials(Arc::new(InnerCreds {
+            source: TokenSource::Metadata,
+            token,
+            quota_project: None,
+        })))
+    }
+
+    /// The quota project named by the credentials file, if any. Callers that build requests
+    /// themselves (gRPC) send it as `x-goog-user-project`; [`Self::apply`] does so already.
+    #[must_use]
+    pub fn quota_project(&self) -> Option<&str> {
+        match self {
+            Self::Credentials(inner) => inner.quota_project.as_deref(),
+            Self::ApiKey(_) | Self::None => None,
+        }
     }
 
     fn from_api_key(api_key: &str) -> crate::Result<Self> {
@@ -173,6 +329,9 @@ impl GcpAuthenticator {
                 .headers_mut()
                 .insert(AUTHORIZATION, token.parse().unwrap());
         }
+        if let Some(project) = self.quota_project().and_then(|p| p.parse().ok()) {
+            request.headers_mut().insert(USER_PROJECT_HEADER, project);
+        }
         self.apply_uri(request.uri_mut());
     }
 
@@ -186,6 +345,9 @@ impl GcpAuthenticator {
             request
                 .headers_mut()
                 .insert(AUTHORIZATION_V1, token.parse().unwrap());
+        }
+        if let Some(project) = self.quota_project().and_then(|p| p.parse().ok()) {
+            request.headers_mut().insert(USER_PROJECT_HEADER, project);
         }
         self.apply_uri_v1(request.uri_mut());
     }
@@ -293,10 +455,7 @@ impl GcpAuthenticator {
 
 impl InnerCreds {
     async fn regenerate_token(&self) -> crate::Result<()> {
-        let token = match &self.creds {
-            Some((creds, scope)) => fetch_token(creds, scope).await?,
-            None => get_token_implicit().await?,
-        };
+        let token = self.source.fetch().await?;
         *self.token.write().unwrap() = token;
         Ok(())
     }
