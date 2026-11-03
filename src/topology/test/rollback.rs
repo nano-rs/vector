@@ -82,7 +82,10 @@ async fn failed_reload_that_rewires_an_unchanged_upstream_rolls_back_without_pan
         .message_key_target_path()
         .expect("message key");
     let message = log.get(message_key).unwrap().to_string_lossy().into_owned();
-    assert_eq!(message, "after rollback combined", "the OLD wiring (in -> prepare -> combined) is back");
+    assert_eq!(
+        message, "after rollback combined",
+        "the OLD wiring (in -> prepare -> combined) is back"
+    );
 
     topology.stop().await;
 }
@@ -116,7 +119,10 @@ async fn failed_reload_that_removes_a_component_rolls_back_without_panicking() {
     let result = topology
         .reload_config_and_respawn(new.build().unwrap(), ExtraContext::default())
         .await;
-    assert!(matches!(result, Err(ReloadError::TopologyBuildFailed)), "{result:?}");
+    assert!(
+        matches!(result, Err(ReloadError::TopologyBuildFailed)),
+        "{result:?}"
+    );
 
     in_tx
         .send_event(Event::Log(LogEvent::from("after rollback")))
@@ -124,7 +130,10 @@ async fn failed_reload_that_removes_a_component_rolls_back_without_panicking() {
         .unwrap();
     let delivered = tokio::time::timeout(Duration::from_secs(5), out_rx.next()).await;
     let crashed = tokio::time::timeout(Duration::from_millis(500), crash.next()).await;
-    assert!(crashed.is_err(), "the restored topology crashed: {crashed:?}");
+    assert!(
+        crashed.is_err(),
+        "the restored topology crashed: {crashed:?}"
+    );
     assert!(
         matches!(delivered, Ok(Some(_))),
         "the event never reached the sink after the rollback"
