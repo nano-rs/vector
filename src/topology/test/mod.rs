@@ -47,6 +47,7 @@ mod doesnt_reload;
 mod end_to_end;
 mod latency_metrics;
 mod panic;
+mod rollback;
 #[cfg(all(
     feature = "sources-prometheus",
     feature = "sinks-prometheus",

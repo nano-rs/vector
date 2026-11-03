@@ -82,6 +82,13 @@ pub struct RunningTopology {
     pending_reload: Option<HashSet<ComponentKey>>,
     sink_confinement_gauges: HashMap<ComponentKey, Gauge>,
     orphaned_disk_buffer_scanner: OrphanedDiskBufferScanner,
+    /// (component, input) pairs whose fanout entry `remove_inputs` PAUSED (kept, sender taken)
+    /// rather than removed. `setup_inputs` may only send `ControlMessage::Replace` for these;
+    /// every other connection is gone from the fanout and must be re-`Add`ed. Tracking what was
+    /// actually sent, instead of re-deriving it from configs, is what keeps the rollback path of
+    /// a failed reload correct (NAN-4936): there `self.config` is the OLD config, while the
+    /// pauses/removals were decided against the failed NEW config.
+    paused_inputs: HashSet<(ComponentKey, OutputId)>,
 }
 
 impl RunningTopology {
@@ -109,6 +116,7 @@ impl RunningTopology {
             pending_reload: None,
             sink_confinement_gauges: HashMap::new(),
             orphaned_disk_buffer_scanner: OrphanedDiskBufferScanner::new(),
+            paused_inputs: HashSet::new(),
         }
     }
 
@@ -1031,21 +1039,18 @@ impl RunningTopology {
     ) {
         let (tx, inputs) = new_pieces.inputs.remove(key).unwrap();
 
-        let old_inputs = self
-            .config
-            .inputs_for_node(key)
-            .into_iter()
-            .flatten()
-            .cloned()
-            .collect::<HashSet<_>>();
-
-        let new_inputs = inputs.iter().cloned().collect::<HashSet<_>>();
-        let inputs_to_add = &new_inputs - &old_inputs;
-
         for input in inputs {
             let output = self.outputs.get_mut(&input).expect("unknown output");
 
-            if diff.contains(&input.component) || inputs_to_add.contains(&input) {
+            // Replace only a connection `remove_inputs` paused. Everything else (a new input, an
+            // input whose component changed, or one `remove_inputs` removed because the config
+            // it was comparing against dropped it) is no longer in the fanout and must be added.
+            // NAN-4936: this used to re-derive "was it paused?" from `self.config`, which is the
+            // OLD config on the rollback path of a failed reload. An input the failed config had
+            // dropped was then sent `Replace` for a sink the fanout had already removed, and
+            // `Fanout::replace` panicked on the next event through that upstream.
+            let paused = self.paused_inputs.remove(&(key.clone(), input.clone()));
+            if diff.contains(&input.component) || !paused {
                 // If the input we're connecting to is changing, that means its outputs will have been
                 // recreated, so instead of replacing a paused sink, we have to add it to this new
                 // output for the first time, since there's nothing to actually replace at this point.
@@ -1103,6 +1108,7 @@ impl RunningTopology {
                     // Case 3: This component is no longer connected to the input from new config.
                     debug!(component_id = %key, fanout_id = %input, "Removing component input from fanout.");
 
+                    self.paused_inputs.remove(&(key.clone(), input.clone()));
                     _ = output.send(ControlMessage::Remove(key.clone()));
                 } else {
                     // We know that if this component is connected to a given input, and it isn't being
@@ -1110,6 +1116,7 @@ impl RunningTopology {
                     // now to pause further sends through that component until we reconnect:
                     debug!(component_id = %key, fanout_id = %input, "Pausing component input in fanout.");
 
+                    self.paused_inputs.insert((key.clone(), input.clone()));
                     _ = output.send(ControlMessage::Pause(key.clone()));
                 }
             }

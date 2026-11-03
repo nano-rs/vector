@@ -14,8 +14,8 @@ use self::{
         PanicSinkConfig,
     },
     sources::{
-        BackpressureSourceConfig, BasicSourceConfig, ErrorSourceConfig, PanicSourceConfig,
-        TripwireSourceConfig,
+        BackpressureSourceConfig, BasicSourceConfig, BuildErrorSourceConfig, ErrorSourceConfig,
+        PanicSourceConfig, TripwireSourceConfig,
     },
     transforms::{BasicTransformConfig, ErrorDefinitionTransformConfig},
 };
@@ -52,6 +52,12 @@ pub fn basic_source_with_event_counter(
     source.set_force_shutdown(force_shutdown);
 
     (tx, source, event_counter)
+}
+
+/// A source whose `build` always fails (drives a reload into its rollback path).
+#[must_use]
+pub fn build_error_source() -> BuildErrorSourceConfig {
+    BuildErrorSourceConfig::default()
 }
 
 #[must_use]
