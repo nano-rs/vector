@@ -8,11 +8,20 @@ use wiremock::{
 };
 
 use super::*;
-use crate::gcp::{GcpAuthenticator, Scope};
+use crate::gcp::{GcpAuthenticator, Scope, egress::test_support};
+
+/// A wiremock server exempted (on this thread only) from the https/googleapis host rule.
+async fn mock() -> MockServer {
+    let server = MockServer::start().await;
+    test_support::allow_mock_server(&server.uri());
+    server
+}
 
 const REFRESH_TOKEN: &str = "1//refresh-SECRET-value";
 const CLIENT_SECRET: &str = "client-SECRET-value";
 const SUBJECT_TOKEN: &str = "subject-SECRET-jwt";
+const IMPERSONATION_PATH: &str =
+    "/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken";
 
 fn authorized_user_json(token_uri: Option<&str>, quota: Option<&str>) -> String {
     let mut v = serde_json::json!({
@@ -48,7 +57,13 @@ fn temp_file(contents: &str) -> tempfile::NamedTempFile {
 }
 
 fn assert_no_secrets(text: &str) {
-    for secret in [REFRESH_TOKEN, CLIENT_SECRET, SUBJECT_TOKEN, "SECRET"] {
+    for secret in [
+        REFRESH_TOKEN,
+        CLIENT_SECRET,
+        SUBJECT_TOKEN,
+        "SECRET",
+        "ya29.",
+    ] {
         assert!(!text.contains(secret), "secret leaked into: {text}");
     }
 }
@@ -116,7 +131,7 @@ fn debug_output_redacts_secrets() {
 
 #[tokio::test]
 async fn authorized_user_refresh_flow() {
-    let server = MockServer::start().await;
+    let server = mock().await;
     Mock::given(method("POST"))
         .and(path("/token"))
         .and(header("content-type", "application/x-www-form-urlencoded"))
@@ -154,7 +169,7 @@ fn authorized_user_defaults_to_googles_token_endpoint() {
 
 #[tokio::test]
 async fn token_endpoint_error_reports_oauth_error_only() {
-    let server = MockServer::start().await;
+    let server = mock().await;
     Mock::given(method("POST"))
         .and(path("/token"))
         .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
@@ -176,7 +191,7 @@ async fn token_endpoint_error_reports_oauth_error_only() {
 
 #[tokio::test]
 async fn authenticator_from_authorized_user_file() {
-    let server = MockServer::start().await;
+    let server = mock().await;
     Mock::given(method("POST"))
         .and(path("/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(token_body("ya29.file")))
@@ -209,7 +224,7 @@ async fn authenticator_from_authorized_user_file() {
 
 #[tokio::test]
 async fn no_quota_header_without_quota_project() {
-    let server = MockServer::start().await;
+    let server = mock().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(token_body("ya29.q")))
         .mount(&server)
@@ -257,7 +272,7 @@ fn external_account_json(server: &str, source: &serde_json::Value, impersonate: 
 
 #[tokio::test]
 async fn external_account_file_source_without_impersonation() {
-    let server = MockServer::start().await;
+    let server = mock().await;
     Mock::given(method("POST"))
         .and(path("/v1/token"))
         .and(body_string_contains(
@@ -279,10 +294,13 @@ async fn external_account_file_source_without_impersonation() {
         .expect(1)
         .mount(&server)
         .await;
-    let subject = temp_file(&format!("{SUBJECT_TOKEN}\n"));
+    let root = tempfile::tempdir().unwrap();
+    test_support::set_file_root(Some(root.path().to_path_buf()));
+    let subject = root.path().join("token");
+    std::fs::write(&subject, format!("{SUBJECT_TOKEN}\n")).unwrap();
     let raw = external_account_json(
         &server.uri(),
-        &serde_json::json!({"file": subject.path().to_str().unwrap()}),
+        &serde_json::json!({"file": subject.to_str().unwrap()}),
         false,
     );
     let file = temp_file(&raw);
@@ -294,10 +312,10 @@ async fn external_account_file_source_without_impersonation() {
 
 #[tokio::test]
 async fn external_account_url_json_source_with_impersonation() {
-    let server = MockServer::start().await;
+    let server = mock().await;
     Mock::given(method("GET"))
         .and(path("/subject"))
-        .and(header("metadata", "True"))
+        .and(header("authorization", "Bearer hdr-SECRET"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({ "access_token": SUBJECT_TOKEN })),
@@ -338,7 +356,7 @@ async fn external_account_url_json_source_with_impersonation() {
         &server.uri(),
         &serde_json::json!({
             "url": format!("{}/subject", server.uri()),
-            "headers": {"Metadata": "True"},
+            "headers": {"Authorization": "Bearer hdr-SECRET"},
             "format": {"type": "json", "subject_token_field_name": "access_token"},
         }),
         true,
@@ -390,7 +408,7 @@ fn external_account_refuses_unsupported_sources() {
 
 #[tokio::test]
 async fn impersonated_service_account_from_authorized_user() {
-    let server = MockServer::start().await;
+    let server = mock().await;
     Mock::given(method("POST"))
         .and(path("/token"))
         .and(body_string_contains("grant_type=refresh_token"))
@@ -399,7 +417,7 @@ async fn impersonated_service_account_from_authorized_user() {
         .await;
     let expire = (Utc::now() + chrono::Duration::seconds(3600)).to_rfc3339();
     Mock::given(method("POST"))
-        .and(path("/v1/sa:generateAccessToken"))
+        .and(path(IMPERSONATION_PATH))
         .and(header("authorization", "Bearer ya29.user"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "accessToken": "ya29.impersonated",
@@ -414,7 +432,7 @@ async fn impersonated_service_account_from_authorized_user() {
     .unwrap();
     let raw = serde_json::json!({
         "type": "impersonated_service_account",
-        "service_account_impersonation_url": format!("{}/v1/sa:generateAccessToken", server.uri()),
+        "service_account_impersonation_url": format!("{}{IMPERSONATION_PATH}", server.uri()),
         "source_credentials": source,
         "delegates": [],
     })
@@ -464,4 +482,10 @@ async fn service_account_parse_errors_never_echo_values() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("missing field"), "{error}");
+}
+
+#[test]
+fn authenticator_debug_never_prints_the_api_key() {
+    let auth = GcpAuthenticator::ApiKey("AIza-SECRET-key".into());
+    assert_eq!(format!("{auth:?}"), "ApiKey(**REDACTED**)");
 }

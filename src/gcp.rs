@@ -24,6 +24,7 @@ use vector_lib::{configurable::configurable_component, sensitive_string::Sensiti
 use crate::{config::ProxyConfig, http::client_v1::HttpClient, tls::MaybeTlsSettings};
 
 mod credentials;
+mod egress;
 use credentials::{AuthorizedUser, CredentialKind, ExternalAccount, ImpersonatedServiceAccount};
 
 /// Header that bills a request to a quota project. Sent only when the credentials file names
@@ -94,6 +95,8 @@ pub enum GcpError {
     },
     #[snafu(display("Failed to obtain the external_account subject token: {}", reason))]
     SubjectToken { reason: String },
+    #[snafu(display("GCP credentials {} refused: {}", what, reason))]
+    EgressRefused { what: &'static str, reason: String },
 }
 
 /// Configuration of the authentication strategy for interacting with GCP services.
@@ -124,6 +127,11 @@ pub struct GcpAuthConfig {
     /// with a file or URL credential source) or `impersonated_service_account` (with
     /// `authorized_user` source credentials). Only service-account keys carry a project id; the
     /// project always comes from the component's own configuration.
+    ///
+    /// Endpoints a credentials file names must be HTTPS `*.googleapis.com` token, STS or IAM
+    /// Credentials paths. An `external_account` file source must sit under
+    /// `VECTOR_GCP_WIF_FILE_ROOT` (default `/var/run/secrets/nano-gcp-wif`); a URL source must be
+    /// HTTPS to a public host, or the metadata server when `VECTOR_GCP_WIF_ALLOW_METADATA=true`.
     ///
     /// Either an API key or a path to a service account credentials JSON file can be specified.
     ///
@@ -159,18 +167,38 @@ impl GcpAuthConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum GcpAuthenticator {
     Credentials(Arc<InnerCreds>),
     ApiKey(Box<str>),
     None,
 }
 
-#[derive(Debug)]
 pub struct InnerCreds {
     source: TokenSource,
     token: RwLock<Token>,
     quota_project: Option<String>,
+}
+
+/// Never prints the API key or the access token (NAN-4935 review P2).
+impl std::fmt::Debug for GcpAuthenticator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Credentials(inner) => f.debug_tuple("Credentials").field(inner).finish(),
+            Self::ApiKey(_) => f.write_str("ApiKey(**REDACTED**)"),
+            Self::None => f.write_str("None"),
+        }
+    }
+}
+
+impl std::fmt::Debug for InnerCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InnerCreds")
+            .field("source", &self.source)
+            .field("token", &"**REDACTED**")
+            .field("quota_project", &self.quota_project)
+            .finish()
+    }
 }
 
 /// Where access tokens come from. Every variant except `Metadata` is a credentials file.
@@ -204,6 +232,11 @@ impl TokenSource {
                 // Parsed through `credentials::parse` so a type mismatch never echoes a value
                 // (serde's "invalid type: string ..." text would quote the private key).
                 let creds: Credentials = credentials::parse("service_account", raw)?;
+                // The signed JWT assertion is posted to token_uri: it must be Google's.
+                egress::check_google_endpoint(
+                    &creds.token_uri(),
+                    egress::GoogleEndpoint::OAuthToken,
+                )?;
                 (Self::ServiceAccount(creds, scope), None)
             }
             CredentialKind::AuthorizedUser => {

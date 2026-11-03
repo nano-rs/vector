@@ -30,9 +30,12 @@ use chrono::{DateTime, Utc};
 use goauth::auth::Token;
 use http_body_util::{BodyExt as _, Collected};
 use serde::{Deserialize, de::DeserializeOwned};
-use vector_http::{empty_body, full_body};
+use vector_http::full_body;
 
-use super::GcpError;
+use super::{
+    GcpError,
+    egress::{self, GoogleEndpoint},
+};
 use crate::{config::ProxyConfig, http::client_v1::HttpClient, tls::MaybeTlsSettings};
 
 pub(super) const DEFAULT_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
@@ -151,6 +154,7 @@ impl AuthorizedUser {
                 reason: "refresh_token is empty".into(),
             });
         }
+        egress::check_google_endpoint(creds.token_uri(), GoogleEndpoint::OAuthToken)?;
         Ok(creds)
     }
 
@@ -178,6 +182,7 @@ impl AuthorizedUser {
             ("client_secret", self.client_secret.expose()),
             ("refresh_token", self.refresh_token.expose()),
         ]);
+        egress::check_google_endpoint(self.token_uri(), GoogleEndpoint::OAuthToken)?;
         let response: OAuthTokenResponse = post_form(self.token_uri(), body, None).await?;
         response.into_token()
     }
@@ -217,7 +222,7 @@ struct CredentialSource {
     #[serde(default)]
     url: Option<String>,
     #[serde(default)]
-    headers: BTreeMap<String, String>,
+    headers: BTreeMap<String, Secret>,
     #[serde(default)]
     format: Option<SubjectTokenFormat>,
     #[serde(default)]
@@ -254,6 +259,16 @@ impl ExternalAccount {
                 reason: "credential_source must set exactly one of file or url".into(),
             });
         }
+        egress::check_google_endpoint(&creds.token_url, GoogleEndpoint::StsToken)?;
+        if let Some(url) = &creds.service_account_impersonation_url {
+            egress::check_google_endpoint(url, GoogleEndpoint::Impersonation)?;
+        }
+        if let Some(path) = &source.file {
+            egress::check_subject_file_lexically(path)?;
+        }
+        if let Some(url) = &source.url {
+            egress::check_subject_url_form(url)?;
+        }
         if let Some(format) = &source.format {
             match format.kind.as_deref() {
                 None | Some("text") => {}
@@ -280,31 +295,22 @@ impl ExternalAccount {
     async fn subject_token(&self) -> Result<Secret, GcpError> {
         let source = &self.credential_source;
         let raw = if let Some(path) = &source.file {
-            tokio::fs::read_to_string(path)
+            let path = path.clone();
+            let root = egress::file_root()?;
+            tokio::task::spawn_blocking(move || egress::read_subject_file_in(&path, &root))
                 .await
-                .map_err(|error| GcpError::SubjectToken {
-                    reason: format!("cannot read credential_source.file {path:?}: {error}"),
-                })?
+                .map_err(|_| GcpError::SubjectToken {
+                    reason: "credential_source.file read task failed".into(),
+                })??
         } else {
-            let url = source.url.as_deref().unwrap_or_default();
-            let mut builder = http_1::Request::get(url);
-            for (name, value) in &source.headers {
-                builder = builder.header(name.as_str(), value.as_str());
-            }
-            let request = builder
-                .body(empty_body())
-                .map_err(|error| GcpError::SubjectToken {
-                    reason: format!("invalid credential_source.url request: {error}"),
-                })?;
-            let (status, bytes) = send(request).await?;
-            if !status.is_success() {
-                return Err(GcpError::SubjectToken {
-                    reason: format!("credential_source.url returned HTTP {status}"),
-                });
-            }
-            String::from_utf8(bytes.to_vec()).map_err(|_| GcpError::SubjectToken {
-                reason: "credential_source.url returned a non-UTF-8 body".into(),
-            })?
+            let (url, addrs) =
+                egress::resolve_subject_url(source.url.as_deref().unwrap_or_default()).await?;
+            let headers: Vec<(String, String)> = source
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.expose().to_owned()))
+                .collect();
+            egress::fetch_pinned(&url, &addrs, &headers).await?
         };
 
         let token = match &source.format {
@@ -371,6 +377,7 @@ impl ExternalAccount {
         if let Some(options) = &options {
             fields.push(("options", options));
         }
+        egress::check_google_endpoint(&self.token_url, GoogleEndpoint::StsToken)?;
         let sts: OAuthTokenResponse =
             post_form(&self.token_url, form(&fields), client_auth.as_deref()).await?;
         let sts = sts.into_token()?;
@@ -419,6 +426,10 @@ impl ImpersonatedServiceAccount {
                 });
             }
         }
+        egress::check_google_endpoint(
+            &parsed.service_account_impersonation_url,
+            GoogleEndpoint::Impersonation,
+        )?;
         Ok(Self {
             source: AuthorizedUser::from_json(&source_raw)?,
             url: parsed.service_account_impersonation_url,
@@ -451,6 +462,7 @@ async fn impersonate(
         access_token: Secret,
         expire_time: String,
     }
+    egress::check_google_endpoint(url, GoogleEndpoint::Impersonation)?;
     debug!(message = "Impersonating GCP service account.", url = %url);
     let body = serde_json::json!({
         "scope": [scope_url],
