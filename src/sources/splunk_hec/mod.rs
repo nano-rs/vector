@@ -839,9 +839,10 @@ impl SplunkSource {
         T: Send + DeserializeOwned + 'static,
     {
         warp::header::optional::<HeaderValue>(CONTENT_TYPE.as_str())
+            .and(Self::gzip())
             .and(capped_body())
             .and_then(
-                |ctype: Option<HeaderValue>, body: bytes::Bytes| async move {
+                |ctype: Option<HeaderValue>, gzip: bool, body: bytes::Bytes| async move {
                     let ok = ctype
                         .as_ref()
                         .and_then(|v| v.to_str().ok())
@@ -851,8 +852,21 @@ impl SplunkSource {
                         return Err(warp::reject::custom(ApiError::UnsupportedContentType));
                     }
 
-                    let value = serde_json::from_slice::<T>(&body)
-                        .map_err(|_| warp::reject::custom(ApiError::BadRequest))?;
+                    // NAN-4976: Vector's own `splunk_hec` sink compresses the ack
+                    // query with its configured `compression` and sets
+                    // `Content-Encoding: gzip` (Splunk's HEC accepts that on every
+                    // endpoint). Parsing the compressed bytes as JSON answered every
+                    // indexer-ack poll 400, so senders fell back to the plain 200.
+                    let value = if gzip {
+                        // Same decompression cap as the event endpoint (gzip bomb).
+                        let data = CappedDecoder::gzip(body.reader())
+                            .decompress()
+                            .map_err(|_| warp::reject::custom(ApiError::BadRequest))?;
+                        serde_json::from_slice::<T>(&data)
+                    } else {
+                        serde_json::from_slice::<T>(&body)
+                    }
+                    .map_err(|_| warp::reject::custom(ApiError::BadRequest))?;
 
                     Ok(value)
                 },
@@ -3377,6 +3391,9 @@ mod tests {
         })
         .await;
     }
+
+    #[path = "ack_gzip_tests.rs"]
+    mod ack_gzip_tests;
 
     #[derive(Deserialize)]
     struct HecAckEventResponse {
