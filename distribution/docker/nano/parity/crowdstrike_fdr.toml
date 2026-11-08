@@ -1,0 +1,31 @@
+# Parity config (NAN-5005): the crowdstrike_fdr source this fork adds. No nanosiem renderer emits
+# it yet; this unit keeps it built and parsing. Synthetic placeholders only: .invalid hosts,
+# inert credentials.
+
+[sources.parity_fdr]
+type = "crowdstrike_fdr"
+region = "us-west-2"
+queue_url = "https://sqs.us-west-2.amazonaws.com/000000000000/parity-fdr-queue"
+visibility_timeout_secs = 300
+max_hold_secs = 36000
+file_concurrency = 4
+max_inflight_manifests = 64
+checksum = "verify"
+start_from = "now"
+decoding.codec = "json"
+acknowledgements = true
+
+[sources.parity_fdr.auth]
+access_key_id = "AKIAPARITY0000000000"
+secret_access_key = "parity-not-a-secret"
+
+[transforms.parity_fdr_route]
+type = "remap"
+inputs = ["parity_fdr"]
+source = '''
+.source_type = "crowdstrike_fdr"
+'''
+
+[sinks.parity_out]
+type = "blackhole"
+inputs = ["parity_fdr_route", "parity_fdr.lookups"]

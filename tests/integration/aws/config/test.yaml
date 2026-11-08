@@ -25,6 +25,8 @@ paths:
   - "src/aws/**"
   - "src/internal_events/aws_*"
   - "src/sources/aws_*/**"
+  - "src/sources/crowdstrike_fdr/**"
+  - "src/internal_events/crowdstrike_fdr.rs"
   - "src/sources/util/**"
   - "src/sinks/aws_*/**"
   - "src/sinks/util/**"

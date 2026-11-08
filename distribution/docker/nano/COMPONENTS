@@ -2,6 +2,7 @@ Sources:
 - aws_s3
 - aws_sqs
 - azure_event_hubs
+- crowdstrike_fdr
 - demo_logs
 - file
 - gcp_pubsub

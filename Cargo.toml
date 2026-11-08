@@ -471,6 +471,7 @@ libc.workspace = true
 lru = { version = "0.18.2", default-features = false }
 maxminddb = { version = "0.27.0", default-features = false, optional = true, features = ["simdutf8"] }
 md-5 = { version = "0.10", default-features = false, optional = true }
+sha2 = { version = "0.10.9", default-features = false, optional = true }
 mongodb = { version = "3.7.0", default-features = false, optional = true, features = ["compat-3-0-0", "dns-resolver", "rustls-tls"] }
 async-nats = { version = "0.49.0", default-features = false, optional = true, features = ["ring", "websockets", "jetstream", "nkeys"] }
 nkeys = { version = "0.4.5", default-features = false, optional = true }
@@ -730,6 +731,7 @@ sources-logs = [
   "sources-aws_s3",
   "sources-aws_sqs",
   "sources-azure_event_hubs",
+  "sources-crowdstrike_fdr",
   "sources-datadog_agent",
   "sources-demo_logs",
   "sources-docker_logs",
@@ -783,6 +785,7 @@ sources-aws_ecs_metrics = ["sources-utils-http-client"]
 sources-aws_kinesis_firehose = ["dep:base64", "sources-http_server", "sources-utils-http-encoding"]
 sources-aws_s3 = ["aws-core", "dep:aws-sdk-sqs", "dep:aws-sdk-s3", "dep:async-compression", "sources-aws_sqs", "tokio-util/io"]
 sources-aws_sqs = ["aws-core", "dep:aws-sdk-sqs"]
+sources-crowdstrike_fdr = ["sources-aws_s3", "dep:md-5", "dep:sha2", "dep:hex"]
 sources-azure_event_hubs = ["sinks-azure_blob", "dep:azure_core_amqp", "dep:azure_messaging_eventhubs", "dep:azure_messaging_eventhubs_checkpointstore_blob", "dep:base64"]
 sources-datadog_agent = ["sources-utils-http-encoding", "dep:datadog-proto", "dep:prost"]
 sources-demo_logs = ["dep:fakedata"]
@@ -1098,6 +1101,7 @@ aws-integration-tests = [
   "aws-s3-integration-tests",
   "aws-sqs-integration-tests",
   "aws-sns-integration-tests",
+  "crowdstrike-fdr-integration-tests",
 ]
 
 azure-integration-tests = [
@@ -1115,6 +1119,7 @@ aws-kinesis-streams-integration-tests = ["sinks-aws_kinesis_streams"]
 aws-s3-integration-tests = ["sinks-aws_s3", "sources-aws_s3"]
 aws-sqs-integration-tests = ["sinks-aws_sqs"]
 aws-sns-integration-tests = ["sinks-aws_sns"]
+crowdstrike-fdr-integration-tests = ["sources-crowdstrike_fdr"]
 axiom-integration-tests = ["sinks-axiom"]
 azure-blob-integration-tests = ["sinks-azure_blob"]
 azure-event-hubs-integration-tests = ["sources-azure_event_hubs"]
