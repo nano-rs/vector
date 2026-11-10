@@ -385,6 +385,8 @@ enum FileError {
     },
     #[snafu(display("pipeline closed"))]
     Closed,
+    #[snafu(display("timed out handing events to the pipeline"))]
+    SendTimeout,
     #[snafu(display("shutting down"))]
     ShuttingDown,
 }
@@ -399,6 +401,7 @@ impl FileError {
             Self::TooLarge { .. } => ("object_too_large", error_type::CONDITION_FAILED),
             Self::Checksum { .. } => ("checksum_mismatch", error_type::CONDITION_FAILED),
             Self::Decode { .. } => ("failed_decompressing_object", error_type::PARSER_FAILED),
+            Self::SendTimeout => ("send_timed_out", error_type::TIMED_OUT),
             Self::Closed | Self::ShuttingDown => ("pipeline_closed", error_type::WRITER_FAILED),
         }
     }
@@ -990,7 +993,9 @@ async fn send(
     };
     match result {
         Ok(()) => Ok(()),
-        Err(SendError::Closed | SendError::Timeout) => Err(FileError::Closed),
+        Err(SendError::Closed) => Err(FileError::Closed),
+        // The pipeline is up but did not take the events in time: a failure, retried later.
+        Err(SendError::Timeout) => Err(FileError::SendTimeout),
     }
 }
 

@@ -89,14 +89,15 @@ pub struct CrowdstrikeFdrConfig {
 
     /// How often to extend a held message's visibility, in seconds.
     ///
-    /// Defaults to half of `visibility_timeout_secs`, and may not exceed it.
+    /// Defaults to half of `visibility_timeout_secs`, and may not exceed that half.
     #[configurable(metadata(docs::type_unit = "seconds"))]
     heartbeat_interval_secs: Option<u32>,
 
     /// The longest a manifest is held, in seconds.
     ///
     /// After this, visibility is no longer extended and the source stops waiting for the
-    /// manifest's acknowledgements, so the message re-delivers.
+    /// manifest's acknowledgements, so the message re-delivers. At most 43200 (12 hours), the
+    /// longest SQS lets a received message stay invisible.
     #[serde(default = "default_max_hold_secs")]
     #[configurable(metadata(docs::type_unit = "seconds"))]
     max_hold_secs: u64,
@@ -225,8 +226,11 @@ pub struct CrowdstrikeFdrConfig {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     queue_depth_interval_secs: u64,
 
-    /// Specifies which addressing style to use for S3.
-    #[serde(default = "default_true")]
+    /// Whether to address S3 path-style (`https://s3.<region>.amazonaws.com/<bucket>/<key>`).
+    ///
+    /// Off by default: FDR buckets are read through S3 access-point aliases, which AWS serves
+    /// virtual-hosted (the SDK default). Turn it on for S3-compatible endpoints such as LocalStack.
+    #[serde(default)]
     force_path_style: bool,
 
     tls: Option<TlsConfig>,
@@ -242,6 +246,10 @@ pub struct CrowdstrikeFdrConfig {
     #[serde(default)]
     log_namespace: Option<bool>,
 }
+
+/// SQS keeps a received message invisible for at most 12 hours in total, however often its
+/// visibility is extended.
+const SQS_MAX_VISIBILITY_SECS: u64 = 43_200;
 
 const fn default_poll_secs() -> u32 {
     20
@@ -338,6 +346,20 @@ enum ConfigError {
     Timeouts { poll: u32 },
     #[snafu(display("`{field}` must be at least 1"))]
     Zero { field: &'static str },
+    #[snafu(display(
+        "`max_hold_secs` must not exceed 43200 (SQS caps a message's total visibility at 12 hours), not {value}"
+    ))]
+    MaxHold { value: u64 },
+}
+
+/// Without end-to-end acknowledgements a message is deleted once its events enter the pipeline,
+/// so a sink that later fails loses them. Say so at startup.
+fn warn_unless_acknowledged(acknowledgements: bool) {
+    if !acknowledgements {
+        warn!(
+            message = "End-to-end acknowledgements are off: FDR messages are deleted once their events enter the pipeline, not once sinks deliver them. Enable `acknowledgements` to hold each message until delivery."
+        );
+    }
 }
 
 fn parse_start_from(value: &str) -> Result<StartFrom, ConfigError> {
@@ -399,6 +421,11 @@ impl CrowdstrikeFdrConfig {
         if self.max_hold_secs == 0 {
             return Err(ConfigError::Zero {
                 field: "max_hold_secs",
+            });
+        }
+        if self.max_hold_secs > SQS_MAX_VISIBILITY_SECS {
+            return Err(ConfigError::MaxHold {
+                value: self.max_hold_secs,
             });
         }
         if self.stream_idle_timeout_secs == 0 {
@@ -474,6 +501,7 @@ impl SourceConfig for CrowdstrikeFdrConfig {
         let (start_from, heartbeat_secs) = self.validate()?;
         let log_namespace = cx.log_namespace(self.log_namespace);
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
+        warn_unless_acknowledged(acknowledgements);
 
         let cursor = match start_from {
             StartFrom::Cursor => {

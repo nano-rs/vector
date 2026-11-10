@@ -152,6 +152,34 @@ components: sources: crowdstrike_fdr: {
 
 				`max_inflight_manifests` and `max_inflight_bytes` bound how many manifests are held at
 				once; the source stops polling while the limit is reached.
+
+				What counts as delivered follows Vector's acknowledgement rules: a sink error
+				(`Errored`) or rejection (`Rejected`) on any one event releases the whole manifest
+				(a rejection deletes it only with `delete_failed_message`), and so does a pipeline
+				that closes or times out while events are handed to it. An event a transform drops
+				on purpose (for example a `filter`) counts as delivered. Without acknowledgements the
+				source warns at startup and deletes each message once its events enter the pipeline.
+				"""
+		}
+		restarts: {
+			title: "Restarts and duplicates"
+			body: """
+				Delivery is at least once. On shutdown the source stops receiving, hands every
+				unfinished manifest back to the queue at once, and keeps waiting for the
+				acknowledgements of manifests already fully emitted until Vector's shutdown deadline.
+				Any manifest that was not deleted re-delivers whole: events that already reached a
+				sink are emitted again, with the same `fdr.file` and `fdr.line`, so a sink keyed on
+				those two drops them. A manifest is never deleted before all of its events are
+				acknowledged, so a restart does not lose events.
+				"""
+		}
+		addressing: {
+			title: "Access-point aliases"
+			body: """
+				FDR manifests name an S3 access-point alias as the bucket. The source reads it like a
+				bucket, with virtual-hosted addressing (`force_path_style: false`, the default) in
+				the source's `region`. Set `force_path_style: true` only for S3-compatible endpoints
+				such as LocalStack.
 				"""
 		}
 		checksums: {

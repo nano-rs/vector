@@ -111,15 +111,20 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 		type: uint: default: 4
 	}
 	force_path_style: {
-		description: "Specifies which addressing style to use for S3."
-		required:    false
-		type: bool: default: true
+		description: """
+			Whether to address S3 path-style (`https://s3.<region>.amazonaws.com/<bucket>/<key>`).
+
+			Off by default: FDR buckets are read through S3 access-point aliases, which AWS serves
+			virtual-hosted (the SDK default). Turn it on for S3-compatible endpoints such as LocalStack.
+			"""
+		required: false
+		type: bool: default: false
 	}
 	heartbeat_interval_secs: {
 		description: """
 			How often to extend a held message's visibility, in seconds.
 
-			Defaults to half of `visibility_timeout_secs`, and may not exceed it.
+			Defaults to half of `visibility_timeout_secs`, and may not exceed that half.
 			"""
 		required: false
 		type: uint: unit: "seconds"
@@ -129,7 +134,8 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 			The longest a manifest is held, in seconds.
 
 			After this, visibility is no longer extended and the source stops waiting for the
-			manifest's acknowledgements, so the message re-delivers.
+			manifest's acknowledgements, so the message re-delivers. At most 43200 (12 hours), the
+			longest SQS lets a received message stay invisible.
 			"""
 		required: false
 		type: uint: {

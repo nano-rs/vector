@@ -306,6 +306,7 @@ struct MockQueue {
     /// Re-queue a message (new receipt, receive count + 1) when it is released.
     redeliver_on_release: bool,
     start: Mutex<Option<Instant>>,
+    depth_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl MockQueue {
@@ -381,6 +382,9 @@ impl Queue for MockQueue {
     }
 
     async fn depth(&self) -> Result<QueueDepth, DepthError> {
+        // As an FDR queue policy that grants Receive/Delete/ChangeVisibility only.
+        self.depth_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(DepthError::Denied)
     }
 }
@@ -1030,4 +1034,276 @@ async fn oversized_object_fails_and_releases() {
     .await;
     assert_eq!(queue.deletes(), 0);
     harness.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// False delivery (NAN-5004 class): nothing downstream that fails to land an event may delete the
+// message. Each case must release (re-deliver), never `DeleteMessage`.
+
+/// One message, one file of `lines` events; returns the queue, store and a running harness.
+fn single_file_case(
+    id: &str,
+    lines: &[&str],
+    redeliver: bool,
+    config: Settings,
+) -> (Arc<MockQueue>, Arc<MockStore>, Harness) {
+    let a = gzip(lines);
+    let body = manifest_body(
+        Utc::now().timestamp_millis(),
+        &[file_entry("cid0/data/u/part-0.gz", &a)],
+    );
+    let queue = MockQueue::with(vec![message(id, &body)], redeliver);
+    let store = MockStore::with(vec![("cid0/data/u/part-0.gz", Object::Data(a))], &queue);
+    let harness = start(Arc::clone(&queue), Arc::clone(&store), config, None);
+    (queue, store, harness)
+}
+
+#[tokio::test(start_paused = true)]
+async fn sink_rejection_releases_and_never_deletes() {
+    let (queue, _store, mut harness) =
+        single_file_case("m-reject", &[r#"{"n":1}"#, r#"{"n":2}"#], false, settings());
+    let events = harness.take(2).await;
+    finalize(events, EventStatus::Rejected);
+    until("release", || {
+        queue
+            .calls()
+            .contains(&Call::Visibility("m-reject#1".to_owned(), RETRY_DELAY))
+    })
+    .await;
+    // Long after: still never deleted.
+    tokio::time::sleep(Duration::from_mins(10)).await;
+    assert_eq!(
+        queue.deletes(),
+        0,
+        "a rejected batch must not delete the message"
+    );
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn sink_rejection_deletes_only_when_delete_failed_message_is_set() {
+    let mut config = settings();
+    config.delete_failed_message = true;
+    let (queue, _store, mut harness) =
+        single_file_case("m-reject-del", &[r#"{"n":1}"#], false, config);
+    let events = harness.take(1).await;
+    finalize(events, EventStatus::Rejected);
+    until("delete", || queue.deletes() == 1).await;
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_errored_event_among_delivered_ones_releases() {
+    let (queue, _store, mut harness) = single_file_case(
+        "m-partial",
+        &[r#"{"n":1}"#, r#"{"n":2}"#, r#"{"n":3}"#],
+        false,
+        settings(),
+    );
+    let mut events = harness.take(3).await;
+    let dropped = events.pop().unwrap();
+    finalize(events, EventStatus::Delivered);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(queue.deletes(), 0);
+    finalize(vec![dropped], EventStatus::Errored);
+    until("release", || {
+        queue
+            .calls()
+            .contains(&Call::Visibility("m-partial#1".to_owned(), RETRY_DELAY))
+    })
+    .await;
+    assert_eq!(
+        queue.deletes(),
+        0,
+        "a partially delivered batch must not delete"
+    );
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn closed_pipeline_releases_and_never_deletes() {
+    let (queue, _store, harness) = single_file_case("m-closed", &[r#"{"n":1}"#], false, settings());
+    // The downstream side goes away before anything is read: every send fails.
+    let Harness {
+        trigger,
+        events,
+        lookups,
+        task,
+    } = harness;
+    drop(events);
+    drop(lookups);
+    until("release", || {
+        queue
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Visibility(receipt, _) if receipt == "m-closed#1"))
+    })
+    .await;
+    assert_eq!(queue.deletes(), 0, "an undelivered batch must not delete");
+    drop(trigger);
+    drop(tokio::time::timeout(Duration::from_mins(1), task).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn poisoned_file_retries_the_whole_batch_without_loss() {
+    let good = gzip(&[r#"{"f":"a","n":1}"#, r#"{"f":"a","n":2}"#]);
+    let fixed = gzip(&[r#"{"f":"b","n":1}"#]);
+    // A gzip member cut short: the checksum (none here) passes, decompression fails.
+    let poisoned = fixed.slice(..fixed.len() - 6);
+    let entry = |path: &str| format!(r#"{{"path":"{path}"}}"#);
+    let body = manifest_body(
+        Utc::now().timestamp_millis(),
+        &[
+            entry("cid0/data/u/part-a.gz"),
+            entry("cid0/data/u/part-b.gz"),
+        ],
+    );
+    let queue = MockQueue::with(vec![message("m-poison", &body)], true);
+    let store = MockStore::with(
+        vec![
+            ("cid0/data/u/part-a.gz", Object::Data(good)),
+            ("cid0/data/u/part-b.gz", Object::Data(poisoned)),
+        ],
+        &queue,
+    );
+    let mut config = settings();
+    config.checksum = ChecksumMode::Off;
+    config.file_concurrency = 1;
+    let mut harness = start(Arc::clone(&queue), Arc::clone(&store), config, None);
+
+    // First delivery: part-a is emitted and even acknowledged, part-b fails to decode.
+    let first = harness.take(2).await;
+    finalize(first, EventStatus::Delivered);
+    until("release", || {
+        queue
+            .calls()
+            .contains(&Call::Visibility("m-poison#1".to_owned(), RETRY_DELAY))
+    })
+    .await;
+    assert_eq!(
+        queue.deletes(),
+        0,
+        "a batch with a failed file must not delete"
+    );
+
+    // The object is readable on the next delivery: every event of the batch is re-emitted
+    // (part-a again, at the same file/line, so a sink can dedupe), then the message deletes.
+    store
+        .objects
+        .lock()
+        .unwrap()
+        .insert("cid0/data/u/part-b.gz".to_owned(), Object::Data(fixed));
+    let second = harness.take(3).await;
+    let mut keys: Vec<_> = second
+        .iter()
+        .map(|event| {
+            (
+                field(event, "fdr.file").unwrap().to_string(),
+                field(event, "fdr.line").unwrap().as_integer().unwrap(),
+            )
+        })
+        .collect();
+    keys.sort();
+    assert_eq!(keys.len(), 3);
+    assert_eq!(keys[2].1, 0);
+    finalize(second, EventStatus::Delivered);
+    until("delete", || queue.deletes() == 1).await;
+    assert!(
+        queue
+            .calls()
+            .contains(&Call::Delete("m-poison#2".to_owned()))
+    );
+    harness.stop().await;
+}
+
+#[test]
+fn max_hold_cannot_exceed_the_sqs_visibility_ceiling() {
+    let error = config("max_hold_secs = 43201").validate().unwrap_err();
+    assert!(error.to_string().contains("max_hold_secs"), "{error}");
+    config("max_hold_secs = 43200").validate().unwrap();
+}
+
+#[test]
+fn virtual_hosted_addressing_is_the_default() {
+    // S3 access-point aliases are addressed like buckets; virtual-hosted is the SDK default.
+    assert!(!config("").force_path_style);
+}
+
+#[tokio::test(start_paused = true)]
+async fn denied_queue_depth_stops_asking_and_ingestion_continues() {
+    let mut config = settings();
+    config.queue_depth_interval = Some(Duration::from_secs(10));
+    let (queue, _store, mut harness) = single_file_case("m-depth", &[r#"{"n":1}"#], false, config);
+    let events = harness.take(1).await;
+    finalize(events, EventStatus::Delivered);
+    until("delete", || queue.deletes() == 1).await;
+    tokio::time::sleep(Duration::from_mins(5)).await;
+    assert_eq!(
+        queue.depth_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "GetQueueAttributes is asked once, then the gauge is disabled"
+    );
+    harness.stop().await;
+}
+
+/// Two one-file manifests; returns whether the second's object was fetched while the first
+/// was still held (unacknowledged).
+async fn second_fetched_while_first_held(config: Settings) -> bool {
+    let a = gzip(&[r#"{"m":1}"#]);
+    let b = gzip(&[r#"{"m":2}"#]);
+    let now = Utc::now().timestamp_millis();
+    let queue = MockQueue::with(
+        vec![
+            message(
+                "m-in1",
+                &manifest_body(now, &[file_entry("cid0/data/1/part-0.gz", &a)]),
+            ),
+            message(
+                "m-in2",
+                &manifest_body(now, &[file_entry("cid0/data/2/part-0.gz", &b)]),
+            ),
+        ],
+        false,
+    );
+    let store = MockStore::with(
+        vec![
+            ("cid0/data/1/part-0.gz", Object::Data(a)),
+            ("cid0/data/2/part-0.gz", Object::Data(b)),
+        ],
+        &queue,
+    );
+    let mut harness = start(Arc::clone(&queue), store, config, None);
+    let first = harness.take(1).await;
+    tokio::time::sleep(Duration::from_mins(1)).await;
+    let gets = || {
+        queue
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, Call::Get(_)))
+            .count()
+    };
+    let concurrent = gets() == 2;
+    finalize(first, EventStatus::Delivered);
+    let second = harness.take(1).await;
+    finalize(second, EventStatus::Delivered);
+    until("both deleted", || queue.deletes() == 2).await;
+    harness.stop().await;
+    concurrent
+}
+
+#[tokio::test(start_paused = true)]
+async fn inflight_limits_hold_back_further_manifests() {
+    // Unbounded enough: both manifests are worked on at once.
+    assert!(second_fetched_while_first_held(settings()).await);
+
+    // max_inflight_manifests = 1: the second is not even received until the first deletes.
+    let mut config = settings();
+    config.max_inflight_manifests = 1;
+    assert!(!second_fetched_while_first_held(config).await);
+
+    // max_inflight_bytes = 1 KiB (each manifest rounds up to 1 KiB): the second is received but
+    // waits for budget, heartbeating, before any download.
+    let mut config = settings();
+    config.max_inflight_kib = Some(1);
+    assert!(!second_fetched_while_first_held(config).await);
 }

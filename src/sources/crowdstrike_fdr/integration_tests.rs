@@ -190,6 +190,7 @@ queue_url = "{}"
 poll_secs = 1
 retry_delay_secs = 1
 queue_depth_interval_secs = 0
+force_path_style = true
 auth.access_key_id = "dummy"
 auth.secret_access_key = "dummy"
 decoding.codec = "json"
