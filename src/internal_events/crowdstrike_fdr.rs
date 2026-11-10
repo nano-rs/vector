@@ -23,6 +23,15 @@ pub enum FdrManifestStatus {
 }
 
 impl FdrManifestStatus {
+    /// Every status, for registering the counters up front.
+    pub const ALL: [Self; 5] = [
+        Self::Received,
+        Self::Acked,
+        Self::Released,
+        Self::Skipped,
+        Self::Parked,
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Received => "received",
@@ -62,6 +71,72 @@ impl InternalEvent for CrowdstrikeFdrManifest<'_> {
             "status" => self.status.as_str(),
         )
         .increment(1);
+    }
+}
+
+/// The source's own metrics, registered (at zero) when the source starts and kept for its
+/// lifetime. Vector expires internal metrics that are idle for `expire_metrics_secs` (default
+/// 300 s) unless a handle to them is still held; a batch source can be idle far longer than
+/// that, and these series are the record that a batch was received, deleted or released.
+pub struct CrowdstrikeFdrMetrics {
+    _counters: Vec<metrics::Counter>,
+    _gauges: Vec<metrics::Gauge>,
+}
+
+impl CrowdstrikeFdrMetrics {
+    /// Registers every series. Call inside the component's span, so the series carry its tags.
+    pub fn register() -> Self {
+        let mut counters = Vec::new();
+        let mut gauges = Vec::new();
+        for status in FdrManifestStatus::ALL {
+            let counter = counter!(
+                CounterName::CrowdstrikeFdrManifestsTotal,
+                "status" => status.as_str(),
+            );
+            counter.increment(0);
+            counters.push(counter);
+        }
+        for name in [
+            CounterName::CrowdstrikeFdrFilesFetchedTotal,
+            CounterName::CrowdstrikeFdrBytesFetchedTotal,
+            CounterName::CrowdstrikeFdrFilesSkippedTotal,
+        ] {
+            let counter = counter!(name);
+            counter.increment(0);
+            counters.push(counter);
+        }
+        for name in [
+            GaugeName::CrowdstrikeFdrInflightManifests,
+            GaugeName::CrowdstrikeFdrInflightBytes,
+        ] {
+            let gauge = gauge!(name);
+            gauge.increment(0.0);
+            gauges.push(gauge);
+        }
+        Self {
+            _counters: counters,
+            _gauges: gauges,
+        }
+    }
+}
+
+/// Files of a re-delivered batch skipped because an earlier delivery already landed them.
+#[derive(Debug, NamedInternalEvent)]
+pub struct CrowdstrikeFdrFilesSkipped<'a> {
+    pub message_id: &'a str,
+    pub skipped: usize,
+    pub remaining: usize,
+}
+
+impl InternalEvent for CrowdstrikeFdrFilesSkipped<'_> {
+    fn emit(self) {
+        info!(
+            message = "Resuming a re-delivered FDR batch: skipping files already delivered.",
+            message_id = %self.message_id,
+            skipped = self.skipped,
+            remaining = self.remaining,
+        );
+        counter!(CounterName::CrowdstrikeFdrFilesSkippedTotal).increment(self.skipped as u64);
     }
 }
 

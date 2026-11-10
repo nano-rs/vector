@@ -42,9 +42,29 @@ mod fetch_tests;
 #[cfg(all(test, feature = "crowdstrike-fdr-integration-tests"))]
 mod integration_tests;
 #[cfg(test)]
+mod operations_tests;
+#[cfg(test)]
 mod tests;
 
 pub use manifest::ChecksumMode;
+
+/// What `start_from` does with a batch older than its cutoff.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SkipAction {
+    /// Delete the message without downloading, on its first delivery only (a message received
+    /// before was accepted by an earlier run and is processed normally). The batch is gone
+    /// from the queue for every consumer.
+    #[default]
+    Delete,
+
+    /// Never delete: hand the message back (visible again after `retry_delay_secs`) without
+    /// downloading, on every delivery, unless this instance already delivered part of the
+    /// batch. The batch stays on the queue for other consumers, or until the queue's retention
+    /// period or dead-letter policy (after `max_tries` receives) removes it.
+    Release,
+}
 
 /// Named output that carries lookup snapshots (`fdrv2-*` objects) when `route_lookups` is on.
 pub const LOOKUPS_OUTPUT: &str = "lookups";
@@ -107,6 +127,10 @@ pub struct CrowdstrikeFdrConfig {
 
     /// Number of objects fetched at once, across all manifests.
     ///
+    /// One reader per object: at 1, throughput is bound by one download and decode at a time
+    /// (about one 30 MB FDR object a minute in the field); 16 kept a pipeline busy. Memory stays
+    /// within `max_memory_bytes` whatever this is; objects past it spool to `data_dir`.
+    ///
     /// Each object is downloaded completely and verified before any of its events is emitted,
     /// in its own task, so a backed-up pipeline never leaves a GET half-read. A downloaded
     /// object keeps its slot until its events are emitted; this also bounds how far a manifest
@@ -152,15 +176,25 @@ pub struct CrowdstrikeFdrConfig {
     /// Objects up to this many (compressed) bytes are held in memory between download and
     /// emission; larger ones are written to a temporary file in `data_dir`.
     ///
-    /// An object whose size the manifest lists is held at about this size. One of unlisted size
-    /// is buffered in a growing allocation until it passes the threshold, so it can take up to
-    /// about twice this value. Memory for objects is therefore bounded by about
-    /// `file_concurrency` times twice this value. Spooled objects take disk instead: up to
-    /// `file_concurrency` times `max_object_bytes`. If the spool directory is not writable, the
-    /// source logs an error at startup and every larger object fails (releasing its batch).
+    /// Memory for objects is also capped in total by `max_memory_bytes`; an object that does
+    /// not fit spools even below this threshold. Spooled objects take disk instead: up to
+    /// `file_concurrency` times `max_object_bytes` in the worst case (FDR objects are about
+    /// 30-35 MB, so typically `file_concurrency` times that). If the spool directory is not
+    /// writable, the source logs an error at startup and every spooled object fails (releasing
+    /// its batch).
     #[serde(default = "default_spool_threshold_bytes")]
     #[configurable(metadata(docs::type_unit = "bytes"))]
     spool_threshold_bytes: usize,
+
+    /// Total memory for objects held between download and emission, across all manifests.
+    ///
+    /// An object is held in memory only if its share fits (its listed size, or
+    /// `spool_threshold_bytes` when the manifest does not list one); otherwise it spools to
+    /// `data_dir`. Memory for objects never exceeds this value, whatever `file_concurrency` is.
+    /// `0` spools every object.
+    #[serde(default = "default_max_memory_bytes")]
+    #[configurable(metadata(docs::type_unit = "bytes"))]
+    max_memory_bytes: usize,
 
     /// After a failure, how long the message stays invisible before it re-delivers, in seconds.
     #[serde(default = "default_retry_delay_secs")]
@@ -181,15 +215,22 @@ pub struct CrowdstrikeFdrConfig {
     ///   the first run.
     /// - An RFC 3339 timestamp: only batches newer than it.
     ///
-    /// An older manifest is deleted without downloading, and counted as skipped, only on its
-    /// first delivery (`ApproximateReceiveCount` 1). A message received before was accepted by
-    /// an earlier run and is processed normally, so a restart never drops undelivered batches.
-    /// The cursor never moves past a batch that is still held or parked.
+    /// What happens to an older manifest is set by `skip_action`. With the default (`delete`),
+    /// it is **deleted** from the queue without downloading, and counted as skipped, only on
+    /// its first delivery (`ApproximateReceiveCount` 1). A message received before was accepted
+    /// by an earlier run and is processed normally, so a restart never drops undelivered
+    /// batches. Use `skip_action = release` when other consumers share the queue. The cursor
+    /// never moves past a batch that is still held or parked.
     #[serde(default = "default_start_from")]
     #[configurable(metadata(docs::examples = "beginning"))]
     #[configurable(metadata(docs::examples = "cursor"))]
     #[configurable(metadata(docs::examples = "2026-11-01T00:00:00Z"))]
     start_from: String,
+
+    /// What to do with a batch older than the `start_from` cutoff: `delete` it (on its first
+    /// delivery only) or `release` it back to the queue, never deleting it.
+    #[serde(default)]
+    skip_action: SkipAction,
 
     /// With `start_from = cursor`, how far before the stored cursor still counts as new, in
     /// seconds. Covers batches that arrive out of order or were released before a restart.
@@ -308,7 +349,7 @@ const fn default_max_hold_secs() -> u64 {
     36_000
 }
 const fn default_file_concurrency() -> usize {
-    4
+    16
 }
 const fn default_max_inflight_manifests() -> usize {
     64
@@ -321,6 +362,9 @@ const fn default_fetch_max_tries() -> u32 {
 }
 const fn default_fetch_retry_backoff_secs() -> u64 {
     1
+}
+const fn default_max_memory_bytes() -> usize {
+    512 * 1024 * 1024
 }
 const fn default_spool_threshold_bytes() -> usize {
     64 * 1024 * 1024
@@ -408,6 +452,42 @@ enum ConfigError {
 /// The directory under the data dir that holds objects past `spool_threshold_bytes`.
 const SPOOL_DIR_NAME: &str = "crowdstrike_fdr_spool";
 
+/// Filesystems whose contents do not outlive the container or host boot.
+const EPHEMERAL_FILESYSTEMS: [&str; 4] = ["overlay", "aufs", "tmpfs", "ramfs"];
+
+/// Warns loudly when `dir` sits on an ephemeral filesystem (Linux: a container's writable
+/// layer or a tmpfs), where batch progress is lost with the container.
+fn warn_if_ephemeral(dir: &std::path::Path) {
+    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return;
+    };
+    let path = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
+    if let Some(fs_type) = filesystem_of(&mountinfo, &path)
+        && EPHEMERAL_FILESYSTEMS.contains(&fs_type.as_str())
+    {
+        warn!(
+            message = "The FDR data directory is on an ephemeral filesystem: batch progress, the start_from state and spooled objects are lost when the container is re-created, and every batch held at that time is emitted again in full (duplicates). Mount a persistent volume at the data directory.",
+            data_dir = %path.display(),
+            filesystem = %fs_type,
+        );
+    }
+}
+
+/// The filesystem type of the mount holding `path`, from `/proc/self/mountinfo` text.
+fn filesystem_of(mountinfo: &str, path: &std::path::Path) -> Option<String> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (mount, rest) = line.split_once(" - ")?;
+            let mount_point = mount.split(' ').nth(4)?.replace("\\040", " ");
+            let fs_type = rest.split(' ').next()?;
+            path.starts_with(&mount_point)
+                .then(|| (mount_point.len(), fs_type.to_owned()))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, fs_type)| fs_type)
+}
+
 /// Creates the spool directory and writes (then removes) a probe file in it.
 fn check_spool_dir(dir: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
@@ -434,7 +514,7 @@ fn remove_stale_spool_files(dir: &std::path::Path) {
 fn warn_unless_acknowledged(acknowledgements: bool) {
     if !acknowledgements {
         warn!(
-            message = "End-to-end acknowledgements are off: FDR messages are deleted once their events enter the pipeline, not once sinks deliver them. Enable `acknowledgements` to hold each message until delivery."
+            message = "End-to-end acknowledgements are off: FDR messages are deleted once their events enter the pipeline, not once sinks deliver them. Set `acknowledgements.enabled = true` on the sinks this source feeds (the source-level `acknowledgements` option is deprecated) to hold each message until delivery."
         );
     }
 }
@@ -564,10 +644,19 @@ impl CrowdstrikeFdrConfig {
             .resolve_and_make_data_subdir(self.data_dir.as_ref(), cx.key.id());
         let (completions, spool_dir) = match data_dir {
             Ok(dir) => match completion::Completions::open(&dir) {
-                Ok(completions) => (completions, dir.join(SPOOL_DIR_NAME)),
+                Ok(completions) => {
+                    warn_if_ephemeral(&dir);
+                    info!(
+                        message = "FDR batch progress (which files of each held batch are delivered) is kept in the data directory; it must be on persistent storage for a restart to resume batches instead of re-emitting them.",
+                        path = %dir.join(completion::DIR_NAME).display(),
+                        batches_in_progress = completions.records_on_disk(),
+                    );
+                    (completions, dir.join(SPOOL_DIR_NAME))
+                }
                 Err(error) => {
-                    warn!(
-                        message = "Cannot keep FDR batch progress in the data directory; delivered files are remembered only until restart.",
+                    error!(
+                        message = "Cannot keep FDR batch progress in the data directory. Delivered files are remembered only until restart: after a restart or crash, every held batch is emitted again in full (duplicates). Make data_dir a writable, persistent volume.",
+                        data_dir = %dir.display(),
                         %error,
                     );
                     (
@@ -577,8 +666,8 @@ impl CrowdstrikeFdrConfig {
                 }
             },
             Err(error) => {
-                warn!(
-                    message = "No usable data directory: delivered files of a batch are remembered only until restart, and large objects spool to the system temp directory.",
+                error!(
+                    message = "No usable data directory. Delivered files of a batch are remembered only until restart: after a restart or crash, every held batch is emitted again in full (duplicates). Large objects spool to the system temp directory. Set data_dir to a writable, persistent volume.",
                     %error,
                 );
                 (
@@ -719,7 +808,9 @@ impl SourceConfig for CrowdstrikeFdrConfig {
             fetch_max_tries: self.fetch_max_tries,
             fetch_retry_backoff: Duration::from_secs(self.fetch_retry_backoff_secs),
             spool_threshold_bytes: self.spool_threshold_bytes,
+            max_memory_bytes: self.max_memory_bytes,
             spool_dir,
+            skip_action: self.skip_action,
             checksum: self.checksum,
             cutoff,
             route_lookups: self.route_lookups,

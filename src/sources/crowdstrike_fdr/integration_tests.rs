@@ -390,6 +390,8 @@ async fn aws_crowdstrike_fdr_stalled_stream_releases() {
         fetch_retry_backoff: Duration::from_secs(1),
         spool_threshold_bytes: 64 * 1024 * 1024,
         spool_dir: std::env::temp_dir().join("vector-crowdstrike-fdr-int-tests"),
+        max_memory_bytes: 512 * 1024 * 1024,
+        skip_action: super::SkipAction::Delete,
         checksum: ChecksumMode::Verify,
         cutoff: None,
         route_lookups: false,

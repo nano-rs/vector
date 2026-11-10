@@ -38,7 +38,7 @@ use crate::{
 };
 
 /// `files` objects of `lines` events each; every event carries its file and line index.
-fn objects(files: usize, lines: usize) -> Vec<(String, Bytes)> {
+pub(super) fn objects(files: usize, lines: usize) -> Vec<(String, Bytes)> {
     (0..files)
         .map(|file| {
             let lines: Vec<String> = (0..lines)
@@ -50,7 +50,7 @@ fn objects(files: usize, lines: usize) -> Vec<(String, Bytes)> {
         .collect()
 }
 
-fn body_for(objects: &[(String, Bytes)]) -> String {
+pub(super) fn body_for(objects: &[(String, Bytes)]) -> String {
     let entries: Vec<String> = objects
         .iter()
         .map(|(key, data)| file_entry(key, data))
@@ -58,7 +58,7 @@ fn body_for(objects: &[(String, Bytes)]) -> String {
     manifest_body(Utc::now().timestamp_millis(), &entries)
 }
 
-fn gets(queue: &MockQueue, key: &str) -> usize {
+pub(super) fn gets(queue: &MockQueue, key: &str) -> usize {
     queue
         .calls()
         .iter()
@@ -66,21 +66,21 @@ fn gets(queue: &MockQueue, key: &str) -> usize {
         .count()
 }
 
-fn released(queue: &MockQueue, receipt: &str) -> bool {
+pub(super) fn released(queue: &MockQueue, receipt: &str) -> bool {
     queue
         .calls()
         .contains(&Call::Visibility(receipt.to_owned(), RETRY_DELAY))
 }
 
 /// (file, line) of an event.
-fn position(event: &Event) -> (i64, i64) {
+pub(super) fn position(event: &Event) -> (i64, i64) {
     let int = |path| field(event, path).and_then(Value::as_integer).unwrap();
     (int("f"), int("l"))
 }
 
 /// Acknowledges events as they arrive (with `status`) until `want` distinct ones were seen;
 /// returns how often each was seen.
-async fn drain(
+pub(super) async fn drain(
     harness: &mut Harness,
     want: usize,
     status: EventStatus,
@@ -100,12 +100,12 @@ async fn drain(
     seen
 }
 
-fn assert_each_once(seen: &HashMap<(i64, i64), usize>) {
+pub(super) fn assert_each_once(seen: &HashMap<(i64, i64), usize>) {
     let duplicated: Vec<_> = seen.iter().filter(|(_, count)| **count > 1).collect();
     assert!(duplicated.is_empty(), "duplicated events: {duplicated:?}");
 }
 
-fn mock_store(
+pub(super) fn mock_store(
     objects: &[(String, Bytes)],
     queue: &Arc<MockQueue>,
     cut: Option<(usize, usize)>,

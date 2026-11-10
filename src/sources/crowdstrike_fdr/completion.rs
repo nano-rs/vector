@@ -108,6 +108,22 @@ impl Completions {
         }
     }
 
+    /// How many batch records the data directory holds (batches a previous run left in
+    /// progress, or this one is processing).
+    pub(super) fn records_on_disk(&self) -> usize {
+        self.dir
+            .as_ref()
+            .and_then(|dir| std::fs::read_dir(dir).ok())
+            .map_or(0, |entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry.path().extension().and_then(|ext| ext.to_str()) == Some(EXTENSION)
+                    })
+                    .count()
+            })
+    }
+
     /// Registers one more holder of the batch `key` (see [`BatchGuard`]).
     pub(super) fn begin(self: &Arc<Self>, key: &str) -> BatchGuard {
         self.active

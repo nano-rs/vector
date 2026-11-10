@@ -246,7 +246,9 @@ fn defaults_and_validation() {
     assert_eq!(start, StartFrom::Beginning);
     assert_eq!(heartbeat, 150, "half the 300 s visibility timeout");
     assert_eq!(defaults.max_hold_secs, 36_000);
-    assert_eq!(defaults.file_concurrency, 4);
+    assert_eq!(defaults.file_concurrency, 16);
+    assert_eq!(defaults.max_memory_bytes, 512 * 1024 * 1024);
+    assert_eq!(defaults.skip_action, super::SkipAction::Delete);
     assert_eq!(defaults.max_inflight_manifests, 64);
     assert_eq!(defaults.max_tries, 3);
     assert_eq!(defaults.checksum, ChecksumMode::Verify);
@@ -518,6 +520,8 @@ pub(super) fn settings() -> Settings {
         fetch_retry_backoff: Duration::from_secs(1),
         spool_threshold_bytes: 64 * 1024 * 1024,
         spool_dir: std::env::temp_dir().join("vector-crowdstrike-fdr-tests"),
+        max_memory_bytes: 512 * 1024 * 1024,
+        skip_action: super::SkipAction::Delete,
         checksum: ChecksumMode::Verify,
         cutoff: None,
         route_lookups: true,
@@ -628,6 +632,11 @@ impl Harness {
             events.extend(item.events.into_events());
         }
         events
+    }
+
+    /// Kills the source as a crash would: no shutdown, no release, no delete.
+    pub(super) fn kill(self) {
+        self.task.abort();
     }
 
     /// Starts Vector's shutdown without waiting for the source to finish.

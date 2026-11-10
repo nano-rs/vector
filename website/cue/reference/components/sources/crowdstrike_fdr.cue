@@ -49,15 +49,22 @@ components: sources: crowdstrike_fdr: {
 		warnings: [
 			"""
 				Each object is downloaded completely and verified before its events are emitted. Objects
-				up to `spool_threshold_bytes` (64 MiB) are held in memory (FDR objects are about
-				30-35 MB), so memory use grows with `file_concurrency` (up to about twice the threshold
-				per object whose size the manifest does not list); larger ones spool to `data_dir`,
-				using up to `file_concurrency` times `max_object_bytes` of disk.
+				are held in memory up to `max_memory_bytes` in total (512 MiB; FDR objects are about
+				30-35 MB, and those past `spool_threshold_bytes` always spool); the rest spool to
+				`data_dir`, using up to `file_concurrency` (16) times `max_object_bytes` of disk in the
+				worst case.
 				""",
 			"""
 				Skipping already-delivered files of a re-delivered batch needs a persistent `data_dir`
 				and works within one instance only: a batch re-delivered to another instance, or after
-				the data directory is lost, is emitted whole.
+				the data directory is lost, is emitted whole. In a container, mount a volume at the data
+				directory (`/var/lib/vector` by default); the source warns at startup when it sits on
+				the container's writable layer or a tmpfs.
+				""",
+			"""
+				`start_from` (other than `beginning`) **deletes** batches older than its cutoff on their
+				first delivery, by default. If other consumers share the queue, set
+				`skip_action: release` to hand them back instead.
 				""",
 		]
 	}
@@ -125,6 +132,7 @@ components: sources: crowdstrike_fdr: {
 		crowdstrike_fdr_manifests_total:     components.sources.internal_metrics.output.metrics.crowdstrike_fdr_manifests_total
 		crowdstrike_fdr_files_fetched_total: components.sources.internal_metrics.output.metrics.crowdstrike_fdr_files_fetched_total
 		crowdstrike_fdr_bytes_fetched_total: components.sources.internal_metrics.output.metrics.crowdstrike_fdr_bytes_fetched_total
+		crowdstrike_fdr_files_skipped_total: components.sources.internal_metrics.output.metrics.crowdstrike_fdr_files_skipped_total
 		crowdstrike_fdr_batch_lag_seconds:   components.sources.internal_metrics.output.metrics.crowdstrike_fdr_batch_lag_seconds
 		crowdstrike_fdr_inflight_manifests:  components.sources.internal_metrics.output.metrics.crowdstrike_fdr_inflight_manifests
 		crowdstrike_fdr_inflight_bytes:      components.sources.internal_metrics.output.metrics.crowdstrike_fdr_inflight_bytes
@@ -193,6 +201,22 @@ components: sources: crowdstrike_fdr: {
 				re-delivered to another instance, or after an ephemeral `data_dir` is lost, is emitted
 				whole. Acknowledgements that arrive after `max_hold_secs` are still recorded. A manifest is never deleted before all of its events are
 				acknowledged, so a restart does not lose events.
+				"""
+		}
+		observability: {
+			title: "Logs and metrics"
+			body: """
+				Every batch logs at `info`: when it is received (message ID, file count, bytes, batch
+				time, receive count), when it is delivered and its message deleted, and when it is
+				released (with the reason: an error code such as `failed_fetching_object`,
+				`delivery_failed` or `sink_rejected`, or `shutdown`). A resumed batch logs how many
+				files it skipped. Like all of Vector's internal logs, each line is rate limited per
+				component (one per 10 seconds, then a count of the suppressed ones).
+
+				The source's counters and gauges (`crowdstrike_fdr_manifests_total` for every
+				status, files and bytes fetched, files skipped, in-flight manifests and bytes) are
+				registered at zero when the source starts and never expire, whatever
+				`expire_metrics_secs` is.
 				"""
 		}
 		addressing: {
