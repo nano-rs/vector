@@ -1,0 +1,5 @@
+Added a new `crowdstrike_fdr` source that consumes CrowdStrike Falcon Data Replicator feeds. FDR's SQS messages are batch manifests (`cid`, `timestamp`, `bucket`, `files[]` with size and checksum), not S3 event notifications, so the `aws_s3` source cannot read them.
+
+The source long-polls the queue, downloads every listed object (gzipped NDJSON) with bounded concurrency, verifies its MD5 or SHA-256 checksum (`checksum: verify | warn | off`), and emits one event per line with `file`, `line`, `cid`, `bucket`, `kind` and `batch_timestamp` metadata. With acknowledgements enabled, a message is deleted only after every event of every object is acknowledged; meanwhile its visibility is extended every half visibility timeout, up to `max_hold_secs`. Failures release the message for re-delivery, messages received more than `max_tries` times are left for the queue's dead-letter policy, and `start_from` (`beginning`, `now`, `cursor`, or an RFC 3339 time) skips old batches without downloading them. Lookup snapshots (`fdrv2-*`) can go to a separate `lookups` output. Every AWS call and every object stream has a timeout (NAN-5005).
+
+authors: nano-rs

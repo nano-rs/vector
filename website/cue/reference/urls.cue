@@ -118,6 +118,7 @@ urls: {
 	contributing:                               "\(vector_repo)/blob/master/CONTRIBUTING.md#setup"
 	conventional_commits:                       "https://www.conventionalcommits.org"
 	crc:                                        "\(wikipedia)/wiki/Cyclic_redundancy_check"
+	crowdstrike_fdr:                            "https://www.crowdstrike.com/"
 	ctime:                                      "https://www.cplusplus.com/reference/ctime"
 	cue:                                        "https://cuelang.org/"
 	csv:                                        "\(wikipedia)/wiki/Comma-separated_values"

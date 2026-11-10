@@ -52,6 +52,20 @@ pub struct AwsTimeout {
 }
 
 impl AwsTimeout {
+    /// Creates a timeout configuration from explicit values, in seconds.
+    #[must_use]
+    pub const fn new(
+        connect_timeout: Option<u64>,
+        operation_timeout: Option<u64>,
+        read_timeout: Option<u64>,
+    ) -> Self {
+        Self {
+            connect_timeout,
+            operation_timeout,
+            read_timeout,
+        }
+    }
+
     /// returns the connection timeout
     #[must_use]
     pub const fn connect_timeout(&self) -> Option<u64> {

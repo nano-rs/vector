@@ -136,6 +136,58 @@ components: sources: internal_metrics: {
 			default_namespace: "vector"
 			tags:              _internal_metrics_tags
 		}
+		crowdstrike_fdr_manifests_total: {
+			description:       "FDR manifests by outcome: `received`, `acked`, `released`, `skipped` or `parked`."
+			type:              "counter"
+			default_namespace: "vector"
+			tags: _component_tags & {
+				status: {
+					description: "The outcome: `received`, `acked`, `released`, `skipped` or `parked`."
+					required:    true
+				}
+			}
+		}
+		crowdstrike_fdr_files_fetched_total: {
+			description:       "FDR objects downloaded."
+			type:              "counter"
+			default_namespace: "vector"
+			tags:              _component_tags
+		}
+		crowdstrike_fdr_bytes_fetched_total: {
+			description:       "Compressed bytes of FDR objects downloaded."
+			type:              "counter"
+			default_namespace: "vector"
+			tags:              _component_tags
+		}
+		crowdstrike_fdr_batch_lag_seconds: {
+			description:       "The age of each received manifest's batch (`now - timestamp`)."
+			type:              "histogram"
+			default_namespace: "vector"
+			tags:              _component_tags
+		}
+		crowdstrike_fdr_inflight_manifests: {
+			description:       "Manifests currently held."
+			type:              "gauge"
+			default_namespace: "vector"
+			tags:              _component_tags
+		}
+		crowdstrike_fdr_inflight_bytes: {
+			description:       "Total size of the held manifests, per the manifests."
+			type:              "gauge"
+			default_namespace: "vector"
+			tags:              _component_tags
+		}
+		crowdstrike_fdr_queue_depth: {
+			description:       "Messages on the queue (`state` = `visible` or `in_flight`), when `GetQueueAttributes` is allowed."
+			type:              "gauge"
+			default_namespace: "vector"
+			tags: _component_tags & {
+				state: {
+					description: "`visible` or `in_flight`."
+					required:    true
+				}
+			}
+		}
 		quit_total: {
 			description:       "The total number of times the Vector instance has quit."
 			type:              "counter"
