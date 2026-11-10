@@ -6,6 +6,36 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 const FILE_NAME: &str = "crowdstrike_fdr_cursor.json";
+const START_FILE_NAME: &str = "crowdstrike_fdr_start.json";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct StartFile {
+    /// When the source first started with `start_from = now`, epoch milliseconds.
+    started_at_ms: i64,
+}
+
+/// `start_from = now`: the time of the first start, persisted in `dir` so a restart does not
+/// move the cutoff forward past batches that arrived while the source was down.
+pub(super) fn pinned_start(dir: &Path, now_ms: i64) -> std::io::Result<i64> {
+    let path = dir.join(START_FILE_NAME);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            return serde_json::from_slice::<StartFile>(&bytes)
+                .map(|file| file.started_at_ms)
+                .map_err(std::io::Error::other);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let body = serde_json::to_vec(&StartFile {
+        started_at_ms: now_ms,
+    })
+    .map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(now_ms)
+}
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct CursorFile {

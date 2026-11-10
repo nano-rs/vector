@@ -1307,3 +1307,225 @@ async fn inflight_limits_hold_back_further_manifests() {
     config.max_inflight_kib = Some(1);
     assert!(!second_fetched_while_first_held(config).await);
 }
+
+// ---------------------------------------------------------------------------------------------
+// start_from must never delete an undelivered message across restarts.
+
+/// Polls the cursor (paused time) until `check` holds.
+async fn until_cursor(cursor: &Cursor, what: &str, check: impl Fn(Option<i64>) -> bool) {
+    for _ in 0..1000 {
+        if check(cursor.get().await) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("cursor never reached {what}: {:?}", cursor.get().await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cutoff_spares_redelivered_and_unknown_count_messages() {
+    let a = gzip(&[r#"{"n":1}"#]);
+    let b = gzip(&[r#"{"n":2}"#]);
+    // Both batches are older than the cutoff, but neither is a first delivery.
+    let mut redelivered = message(
+        "m-redelivered",
+        &manifest_body(1_000, &[file_entry("cid0/data/r/part-0.gz", &a)]),
+    );
+    redelivered.receive_count = 2;
+    let mut unknown = message(
+        "m-unknown",
+        &manifest_body(1_000, &[file_entry("cid0/data/k/part-0.gz", &b)]),
+    );
+    unknown.receive_count = 0;
+    let queue = MockQueue::with(vec![redelivered, unknown], false);
+    let store = MockStore::with(
+        vec![
+            ("cid0/data/r/part-0.gz", Object::Data(a)),
+            ("cid0/data/k/part-0.gz", Object::Data(b)),
+        ],
+        &queue,
+    );
+    let mut config = settings();
+    config.cutoff = Some(Utc::now());
+    let mut harness = start(Arc::clone(&queue), store, config, None);
+
+    let events = harness.take(2).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(queue.deletes(), 0, "processed and held, not skipped");
+    finalize(events, EventStatus::Delivered);
+    until("both delivered and deleted", || queue.deletes() == 2).await;
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn restart_in_now_mode_deletes_nothing_in_flight() {
+    let a = gzip(&[r#"{"n":1}"#, r#"{"n":2}"#]);
+    let batch_ms = Utc::now().timestamp_millis();
+    let body = manifest_body(batch_ms, &[file_entry("cid0/data/u/part-0.gz", &a)]);
+
+    // Run 1: started before the batch; the batch is in flight (unacknowledged) at shutdown.
+    let queue = MockQueue::with(vec![message("m-restart", &body)], false);
+    let store = MockStore::with(
+        vec![("cid0/data/u/part-0.gz", Object::Data(a.clone()))],
+        &queue,
+    );
+    let mut config = settings();
+    config.cutoff = Some(Utc::now() - chrono::Duration::hours(1));
+    let mut harness = start(Arc::clone(&queue), store, config, None);
+    let held = harness.take(2).await;
+    harness.stop().await;
+    drop(held);
+    // Fully emitted and waiting for acknowledgements when Vector stopped: never deleted; its
+    // visibility lapses and SQS re-delivers it.
+    assert_eq!(
+        queue.deletes(),
+        0,
+        "a restart never deletes an in-flight batch"
+    );
+
+    // Run 2: a later start whose cutoff (worst case: not pinned) is past the batch. SQS
+    // re-delivers the released message with receive count 2: it is processed, not skipped.
+    let mut again = message("m-restart", &body);
+    again.receipt = "m-restart#2".to_owned();
+    again.receive_count = 2;
+    let queue = MockQueue::with(vec![again], false);
+    let store = MockStore::with(vec![("cid0/data/u/part-0.gz", Object::Data(a))], &queue);
+    let mut config = settings();
+    config.cutoff = Some(Utc::now() + chrono::Duration::hours(1));
+    let mut harness = start(Arc::clone(&queue), store, config, None);
+    let events = harness.take(2).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(queue.deletes(), 0);
+    finalize(events, EventStatus::Delivered);
+    until("delete after delivery", || queue.deletes() == 1).await;
+    assert!(
+        queue
+            .calls()
+            .contains(&Call::Delete("m-restart#2".to_owned()))
+    );
+    harness.stop().await;
+}
+
+#[test]
+fn now_cutoff_is_pinned_to_the_first_start() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        super::cursor::pinned_start(dir.path(), 1_000).unwrap(),
+        1_000
+    );
+    // A restart later still uses the first start.
+    assert_eq!(
+        super::cursor::pinned_start(dir.path(), 9_000).unwrap(),
+        1_000
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cursor_never_passes_a_held_or_parked_batch() {
+    let older = gzip(&[r#"{"b":"older"}"#]);
+    let newer = gzip(&[r#"{"b":"newer"}"#]);
+    let parked_ms = 3_000_000_000_000;
+    let older_ms = 4_000_000_000_000;
+    let newer_ms = 5_000_000_000_000;
+    let mut parked = message(
+        "m-pin-parked",
+        &manifest_body(parked_ms, &[file_entry("cid0/data/p/part-0.gz", &older)]),
+    );
+    parked.receive_count = 4;
+    let queue = MockQueue::with(
+        vec![
+            parked,
+            message(
+                "m-pin-older",
+                &manifest_body(older_ms, &[file_entry("cid0/data/o/part-0.gz", &older)]),
+            ),
+            message(
+                "m-pin-newer",
+                &manifest_body(newer_ms, &[file_entry("cid0/data/n/part-0.gz", &newer)]),
+            ),
+        ],
+        false,
+    );
+    let store = MockStore::with(
+        vec![
+            ("cid0/data/o/part-0.gz", Object::Data(older)),
+            ("cid0/data/n/part-0.gz", Object::Data(newer)),
+        ],
+        &queue,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let cursor = Arc::new(Cursor::open(dir.path()).unwrap());
+    let mut harness = start(
+        Arc::clone(&queue),
+        store,
+        settings(),
+        Some(Arc::clone(&cursor)),
+    );
+
+    let events = harness.take(2).await;
+    let (newer_events, older_events): (Vec<_>, Vec<_>) = events
+        .into_iter()
+        .partition(|event| field(event, "b") == Some(&Value::from("newer")));
+    // The newer batch is delivered while the older one is still held: the cursor stops just
+    // before the oldest pinned batch (the parked one), not at the newer batch.
+    finalize(newer_events, EventStatus::Delivered);
+    until("newer deleted", || queue.deletes() == 1).await;
+    until_cursor(&cursor, "parked - 1", |ms| ms == Some(parked_ms - 1)).await;
+
+    // Delivering the older batch does not pass the parked one either.
+    finalize(older_events, EventStatus::Delivered);
+    until("older deleted", || queue.deletes() == 2).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(cursor.get().await, Some(parked_ms - 1));
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cursor_stops_before_a_held_batch_then_catches_up() {
+    let older = gzip(&[r#"{"b":"older"}"#]);
+    let newer = gzip(&[r#"{"b":"newer"}"#]);
+    let older_ms = 4_000_000_000_000;
+    let newer_ms = 5_000_000_000_000;
+    let queue = MockQueue::with(
+        vec![
+            message(
+                "m-held-older",
+                &manifest_body(older_ms, &[file_entry("cid0/data/o/part-0.gz", &older)]),
+            ),
+            message(
+                "m-held-newer",
+                &manifest_body(newer_ms, &[file_entry("cid0/data/n/part-0.gz", &newer)]),
+            ),
+        ],
+        false,
+    );
+    let store = MockStore::with(
+        vec![
+            ("cid0/data/o/part-0.gz", Object::Data(older)),
+            ("cid0/data/n/part-0.gz", Object::Data(newer)),
+        ],
+        &queue,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let cursor = Arc::new(Cursor::open(dir.path()).unwrap());
+    let mut harness = start(
+        Arc::clone(&queue),
+        store,
+        settings(),
+        Some(Arc::clone(&cursor)),
+    );
+    let events = harness.take(2).await;
+    let (newer_events, older_events): (Vec<_>, Vec<_>) = events
+        .into_iter()
+        .partition(|event| field(event, "b") == Some(&Value::from("newer")));
+    finalize(newer_events, EventStatus::Delivered);
+    until("newer deleted", || queue.deletes() == 1).await;
+    until_cursor(&cursor, "older - 1", |ms| ms == Some(older_ms - 1)).await;
+
+    finalize(older_events, EventStatus::Delivered);
+    until("older deleted", || queue.deletes() == 2).await;
+    // Nothing is pinned any more; the cursor reaches the older batch (it only moves forward,
+    // so the newer batch's time is reached by the next delivery after it).
+    until_cursor(&cursor, "older", |ms| ms == Some(older_ms)).await;
+    harness.stop().await;
+}

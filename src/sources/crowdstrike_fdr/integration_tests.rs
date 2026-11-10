@@ -471,3 +471,56 @@ async fn aws_crowdstrike_fdr_rejection_never_deletes() {
     fixture.wait_for_depth((0, 0)).await;
     task.abort();
 }
+
+/// The `start_from` cutoff must not delete a message an earlier run accepted. Run 1 (`now`) takes
+/// a batch and dies before acknowledging it; run 2 starts later with a `now` past the batch
+/// (a fresh data dir, so nothing is pinned). SQS re-delivers with `ApproximateReceiveCount` 2:
+/// run 2 delivers it instead of skipping it.
+#[tokio::test]
+async fn aws_crowdstrike_fdr_restart_does_not_skip_a_redelivered_batch() {
+    let fixture = Fixture::new().await;
+    let run1_dir = tempfile::tempdir().unwrap();
+    let run2_dir = tempfile::tempdir().unwrap();
+    let config = |dir: &tempfile::TempDir| {
+        fixture.config(&format!(
+            "start_from = \"now\"\nvisibility_timeout_secs = 2\ndata_dir = {:?}",
+            dir.path().to_str().unwrap()
+        ))
+    };
+
+    let (tx, rx) = SourceSender::new_test_sender_with_options(1000, None);
+    let mut items: Items = rx.into_stream();
+    let run1 = tokio::spawn(
+        config(&run1_dir)
+            .build(SourceContext::new_test(tx, None))
+            .await
+            .unwrap(),
+    );
+    let a = fixture
+        .put("cid0/data/u/part-00000.gz", &[r#"{"n":1}"#, r#"{"n":2}"#])
+        .await;
+    fixture.send_manifest(&[a]).await;
+    let unacknowledged = take(&mut items, 2).await;
+    run1.abort(); // crash: no release, no delete
+    drop(unacknowledged);
+    drop(items);
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (tx, rx) = SourceSender::new_test_sender_with_options(1000, None);
+    let mut items: Items = rx.into_stream();
+    let run2 = tokio::spawn(
+        config(&run2_dir)
+            .build(SourceContext::new_test(tx, None))
+            .await
+            .unwrap(),
+    );
+    let redelivered = take(&mut items, 2).await;
+    let mut lines: Vec<_> = redelivered.iter().map(line_of).collect();
+    lines.sort_unstable();
+    assert_eq!(lines, vec![0, 1]);
+    let (visible, held) = fixture.depth().await;
+    assert_eq!(visible + held, 1, "still on the queue until acknowledged");
+    finalize(redelivered, EventStatus::Delivered);
+    fixture.wait_for_depth((0, 0)).await;
+    run2.abort();
+}

@@ -140,13 +140,17 @@ pub struct CrowdstrikeFdrConfig {
     /// Which manifests to process, by batch time.
     ///
     /// - `beginning`: every manifest on the queue.
-    /// - `now`: only batches newer than the time the source started.
+    /// - `now`: only batches newer than the time the source first started (persisted in
+    ///   `data_dir`, so a restart does not move it).
     /// - `cursor`: only batches newer than the newest batch this source fully delivered before
     ///   (persisted in `data_dir`), minus `cursor_grace_secs`. Every manifest is processed on
     ///   the first run.
     /// - An RFC 3339 timestamp: only batches newer than it.
     ///
-    /// Older manifests are deleted without downloading and counted as skipped.
+    /// An older manifest is deleted without downloading, and counted as skipped, only on its
+    /// first delivery (`ApproximateReceiveCount` 1). A message received before was accepted by
+    /// an earlier run and is processed normally, so a restart never drops undelivered batches.
+    /// The cursor never moves past a batch that is still held or parked.
     #[serde(default = "default_start_from")]
     #[configurable(metadata(docs::examples = "beginning"))]
     #[configurable(metadata(docs::examples = "cursor"))]
@@ -159,7 +163,7 @@ pub struct CrowdstrikeFdrConfig {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     cursor_grace_secs: u64,
 
-    /// The directory for the `start_from = cursor` state.
+    /// The directory for the `start_from = cursor` and `start_from = now` state.
     ///
     /// Defaults to the global `data_dir` option.
     #[configurable(metadata(docs::examples = "/var/lib/vector"))]
@@ -436,6 +440,44 @@ impl CrowdstrikeFdrConfig {
         Ok((start_from, heartbeat))
     }
 
+    /// The `start_from` cutoff, and the cursor for `start_from = cursor`. `now` is pinned to
+    /// the first start (persisted in the data dir) so restarts do not move it.
+    async fn resolve_cutoff(
+        &self,
+        start_from: &StartFrom,
+        cx: &SourceContext,
+    ) -> crate::Result<(Option<DateTime<Utc>>, Option<Arc<cursor::Cursor>>)> {
+        let data_dir = || {
+            cx.globals
+                .resolve_and_make_data_subdir(self.data_dir.as_ref(), cx.key.id())
+        };
+        let (cutoff, cursor) = match start_from {
+            StartFrom::Beginning => (None, None),
+            StartFrom::Timestamp(time) => (Some(*time), None),
+            StartFrom::Now => {
+                let ms = cursor::pinned_start(&data_dir()?, Utc::now().timestamp_millis())?;
+                (DateTime::from_timestamp_millis(ms), None)
+            }
+            StartFrom::Cursor => {
+                let cursor = Arc::new(cursor::Cursor::open(&data_dir()?)?);
+                let grace =
+                    i64::try_from(self.cursor_grace_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+                let cutoff = cursor
+                    .get()
+                    .await
+                    .and_then(|ms| DateTime::from_timestamp_millis(ms.saturating_sub(grace)));
+                (cutoff, Some(cursor))
+            }
+        };
+        if let Some(cutoff) = cutoff {
+            info!(
+                message = "Skipping first deliveries of FDR batches older than the start_from cutoff.",
+                %cutoff
+            );
+        }
+        Ok((cutoff, cursor))
+    }
+
     const fn aws_timeout(&self) -> AwsTimeout {
         AwsTimeout::new(
             Some(self.connect_timeout_secs),
@@ -503,31 +545,7 @@ impl SourceConfig for CrowdstrikeFdrConfig {
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
         warn_unless_acknowledged(acknowledgements);
 
-        let cursor = match start_from {
-            StartFrom::Cursor => {
-                let dir = cx
-                    .globals
-                    .resolve_and_make_data_subdir(self.data_dir.as_ref(), cx.key.id())?;
-                Some(Arc::new(cursor::Cursor::open(&dir)?))
-            }
-            _ => None,
-        };
-        let cutoff = match &start_from {
-            StartFrom::Beginning => None,
-            StartFrom::Now => Some(Utc::now()),
-            StartFrom::Timestamp(time) => Some(*time),
-            StartFrom::Cursor => match &cursor {
-                Some(cursor) => cursor.get().await.and_then(|ms| {
-                    let grace = i64::try_from(self.cursor_grace_secs.saturating_mul(1000))
-                        .unwrap_or(i64::MAX);
-                    DateTime::from_timestamp_millis(ms.saturating_sub(grace))
-                }),
-                None => None,
-            },
-        };
-        if let Some(cutoff) = cutoff {
-            info!(message = "Skipping FDR batches older than the start_from cutoff.", %cutoff);
-        }
+        let (cutoff, cursor) = self.resolve_cutoff(&start_from, &cx).await?;
 
         let region = self.region.region();
         let endpoint = self.region.endpoint();

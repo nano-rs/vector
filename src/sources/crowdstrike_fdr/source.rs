@@ -5,10 +5,11 @@
 //! behaviour is unit-tested without AWS; `aws.rs` provides the SQS and S3 implementations.
 
 use std::{
+    collections::{BTreeMap, HashMap},
     future::Future,
     panic,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -69,7 +70,7 @@ pub(super) struct QueueMessage {
     pub(super) id: String,
     pub(super) receipt: String,
     pub(super) body: String,
-    /// `ApproximateReceiveCount`; 1 on first delivery.
+    /// `ApproximateReceiveCount`: 1 on first delivery, 0 when SQS did not report it.
     pub(super) receive_count: u32,
 }
 
@@ -155,6 +156,54 @@ struct Shared<Q, O> {
     inflight_bytes: AtomicU64,
     bytes_received: Registered<BytesReceived>,
     events_received: Registered<EventsReceived>,
+    pins: Mutex<Pins>,
+}
+
+/// Batches the cursor must not pass: held (in flight in this process) and parked ones.
+#[derive(Default)]
+struct Pins {
+    /// Batch time to number of held manifests with that time.
+    held: BTreeMap<i64, usize>,
+    /// Message id to batch time, for messages left alone after `max_tries`. Kept until restart.
+    parked: HashMap<String, i64>,
+}
+
+impl Pins {
+    fn oldest(&self) -> Option<i64> {
+        let held = self.held.keys().next().copied();
+        let parked = self.parked.values().min().copied();
+        held.into_iter().chain(parked).min()
+    }
+}
+
+/// Unpins a held batch however its task ends.
+struct HeldPin<'a> {
+    pins: &'a Mutex<Pins>,
+    timestamp_ms: i64,
+}
+
+impl<'a> HeldPin<'a> {
+    fn new(pins: &'a Mutex<Pins>, timestamp_ms: i64) -> Self {
+        *pins
+            .lock()
+            .expect("pins lock")
+            .held
+            .entry(timestamp_ms)
+            .or_default() += 1;
+        Self { pins, timestamp_ms }
+    }
+}
+
+impl Drop for HeldPin<'_> {
+    fn drop(&mut self) {
+        let mut pins = self.pins.lock().expect("pins lock");
+        if let Some(count) = pins.held.get_mut(&self.timestamp_ms) {
+            *count -= 1;
+            if *count == 0 {
+                pins.held.remove(&self.timestamp_ms);
+            }
+        }
+    }
 }
 
 impl<Q: Queue, O: ObjectStore> Engine<Q, O> {
@@ -190,6 +239,7 @@ impl<Q: Queue, O: ObjectStore> Engine<Q, O> {
             inflight_bytes: AtomicU64::new(0),
             bytes_received: register!(BytesReceived::from(Protocol::HTTPS)),
             events_received: register!(EventsReceived),
+            pins: Mutex::new(Pins::default()),
         });
         let manifest_slots = Arc::new(Semaphore::new(settings.max_inflight_manifests.max(1)));
 
@@ -464,6 +514,15 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
     });
 
     if message.receive_count > settings.max_tries {
+        // A parked batch pins the cursor (until restart): it was never delivered.
+        if let Ok(manifest) = parse_manifest(&message.body) {
+            shared
+                .pins
+                .lock()
+                .expect("pins lock")
+                .parked
+                .insert(message.id.clone(), manifest.timestamp_ms);
+        }
         emit!(CrowdstrikeFdrManifest {
             status: FdrManifestStatus::Parked,
             message_id: &message.id,
@@ -490,7 +549,10 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
         if let Ok(lag) = (Utc::now() - batch_time).to_std() {
             emit!(CrowdstrikeFdrBatchLag { lag });
         }
-        if settings.cutoff.is_some_and(|cutoff| batch_time < cutoff) {
+        // Only a first delivery may be skipped. A message received before (count >= 2, or
+        // unknown) was accepted by an earlier run, or this one, and is still undelivered:
+        // deleting it would lose it.
+        if settings.cutoff.is_some_and(|cutoff| batch_time < cutoff) && message.receive_count == 1 {
             if delete(&shared, &message).await {
                 emit!(CrowdstrikeFdrManifest {
                     status: FdrManifestStatus::Skipped,
@@ -501,6 +563,7 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
         }
     }
 
+    let pin = HeldPin::new(&shared.pins, manifest.timestamp_ms);
     let mut inflight = InflightGuard::new(&shared);
     let deadline = received_at + settings.max_hold;
     let outcome = tokio::select! {
@@ -509,6 +572,7 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
         () = sleep_until(deadline) => Outcome::HoldExpired,
     };
     drop(inflight);
+    drop(pin);
 
     match outcome {
         Outcome::Delivered => {
@@ -561,7 +625,7 @@ async fn finish<Q: Queue, O: ObjectStore>(
         message_id: &message.id,
     });
     if let Some(cursor) = &shared.cursor
-        && let Err(error) = cursor.advance(manifest.timestamp_ms).await
+        && let Err(error) = cursor.advance(cursor_target(shared, manifest)).await
     {
         emit!(CrowdstrikeFdrError {
             error_code: "failed_writing_cursor",
@@ -570,6 +634,16 @@ async fn finish<Q: Queue, O: ObjectStore>(
             message_id: &message.id,
             error: error.to_string(),
         });
+    }
+}
+
+/// How far a delivered batch may move the cursor: up to its own time, but never up to a batch
+/// that is still held or parked (it would be skipped as old after a restart).
+fn cursor_target<Q, O>(shared: &Shared<Q, O>, manifest: &Manifest) -> i64 {
+    let oldest_pinned = shared.pins.lock().expect("pins lock").oldest();
+    match oldest_pinned {
+        Some(pinned) if pinned <= manifest.timestamp_ms => pinned.saturating_sub(1),
+        _ => manifest.timestamp_ms,
     }
 }
 

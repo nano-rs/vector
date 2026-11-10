@@ -63,7 +63,7 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 	}
 	data_dir: {
 		description: """
-			The directory for the `start_from = cursor` state.
+			The directory for the `start_from = cursor` and `start_from = now` state.
 
 			Defaults to the global `data_dir` option.
 			"""
@@ -275,13 +275,17 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 			Which manifests to process, by batch time.
 
 			- `beginning`: every manifest on the queue.
-			- `now`: only batches newer than the time the source started.
+			- `now`: only batches newer than the time the source first started (persisted in
+			  `data_dir`, so a restart does not move it).
 			- `cursor`: only batches newer than the newest batch this source fully delivered before
 			  (persisted in `data_dir`), minus `cursor_grace_secs`. Every manifest is processed on
 			  the first run.
 			- An RFC 3339 timestamp: only batches newer than it.
 
-			Older manifests are deleted without downloading and counted as skipped.
+			An older manifest is deleted without downloading, and counted as skipped, only on its
+			first delivery (`ApproximateReceiveCount` 1). A message received before was accepted by
+			an earlier run and is processed normally, so a restart never drops undelivered batches.
+			The cursor never moves past a batch that is still held or parked.
 			"""
 		required: false
 		type: string: {

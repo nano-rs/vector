@@ -195,10 +195,15 @@ components: sources: crowdstrike_fdr: {
 			title: "Backlog cutoff"
 			body: """
 				`start_from` drops old batches without downloading them: `now` skips batches older
-				than the start of the source, an RFC 3339 time skips batches older than it, and
-				`cursor` skips batches older than the newest batch this source fully delivered before
-				(stored in `data_dir`), minus `cursor_grace_secs`. Skipped messages are deleted and
-				counted as `skipped`.
+				than the first start of the source (stored in `data_dir`), an RFC 3339 time skips
+				batches older than it, and `cursor` skips batches older than the newest batch this
+				source fully delivered before (stored in `data_dir`), minus `cursor_grace_secs`.
+				Skipped messages are deleted and counted as `skipped`.
+
+				Only a first delivery (`ApproximateReceiveCount` 1) is ever skipped. A message
+				received before was accepted by an earlier run, or released by this one, and is
+				processed normally, so a restart never deletes an undelivered batch. The cursor never
+				moves past a batch that is still held or parked, and `now` does not move on restart.
 				"""
 		}
 		lookups: {

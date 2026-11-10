@@ -11,7 +11,7 @@ max_hold_secs = 36000
 file_concurrency = 4
 max_inflight_manifests = 64
 checksum = "verify"
-start_from = "now"
+start_from = "beginning"
 decoding.codec = "json"
 acknowledgements = true
 

@@ -46,7 +46,9 @@ impl Queue for SqsQueue {
                     attributes.get(&MessageSystemAttributeName::ApproximateReceiveCount)
                 })
                 .and_then(|count| count.parse().ok())
-                .unwrap_or(1);
+                // Unknown: never treated as a first delivery (so never skipped by the
+                // start_from cutoff) and never parked.
+                .unwrap_or(0);
             messages.push(QueueMessage {
                 id,
                 receipt,
