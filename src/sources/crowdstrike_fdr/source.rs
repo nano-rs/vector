@@ -43,7 +43,7 @@ use vector_lib::{
 
 use super::{
     CrowdstrikeFdrConfig, LOOKUPS_OUTPUT,
-    completion::{Completions, batch_key},
+    completion::{BatchGuard, Completions, batch_key},
     cursor::Cursor,
     lines::{Line, LineCodec},
     manifest::{
@@ -604,6 +604,9 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
     }
 
     let key = batch_key(&manifest);
+    // Held until this copy of the batch is deleted or released, so a `forget` by another copy
+    // of the same batch does not remove the record under it.
+    let _batch = shared.completions.begin(&key);
     let pin = HeldPin::new(&shared.pins, manifest.timestamp_ms);
     let mut inflight = InflightGuard::new(&shared);
     let deadline = received_at + settings.max_hold;
@@ -664,7 +667,7 @@ async fn finish<Q: Queue, O: ObjectStore>(
         // Kept: the re-delivery skips every file and deletes.
         return;
     }
-    shared.completions.forget(key).await;
+    shared.completions.forget(key);
     emit!(CrowdstrikeFdrManifest {
         status: FdrManifestStatus::Acked,
         message_id: &message.id,
@@ -832,12 +835,46 @@ async fn process<Q: Queue, O: ObjectStore>(
     };
     // Emission and acknowledgement tracking run side by side; a file is recorded as delivered
     // as soon as its own events are acknowledged. When emission fails, the tracker still waits
-    // for the files already emitted, so a re-delivery repeats at most the failed file.
-    let (emitted, status) = tokio::join!(
-        emit_files(shared, manifest, key, &todo, acks_tx, out, shutdown),
-        track_acks(shared, manifest, key, acks_rx),
-    );
+    // for the files already emitted, so a re-delivery repeats at most the failed file. The
+    // tracker is its own task: when the hold expires (this future is dropped) it keeps
+    // recording late acknowledgements until every emitted file has resolved.
+    let tracker = acks_rx.map(|acks| {
+        tokio::spawn(
+            track_acks(
+                Arc::clone(shared),
+                manifest.files.clone(),
+                key.to_owned(),
+                acks,
+                shared.completions.begin(key),
+            )
+            .in_current_span(),
+        )
+    });
+    let emitted = emit_files(shared, manifest, key, &todo, acks_tx, out, shutdown).await;
+    let status = match tracker {
+        None => BatchStatus::Delivered,
+        Some(tracker) => match tracker.await {
+            Ok(status) => status,
+            Err(error) => {
+                if error.is_panic() {
+                    panic::resume_unwind(error.into_panic());
+                }
+                // Cancelled with the runtime: nothing is known to be delivered.
+                BatchStatus::Errored
+            }
+        },
+    };
 
+    outcome_of(emitted, status, message_id, manifest)
+}
+
+/// The manifest's outcome from its emission result and combined acknowledgement status.
+fn outcome_of(
+    emitted: Result<(), FileError>,
+    status: BatchStatus,
+    message_id: &str,
+    manifest: &Manifest,
+) -> Outcome {
     if let Err(error) = emitted {
         if matches!(error, FileError::ShuttingDown) {
             return Outcome::Shutdown;
@@ -935,7 +972,12 @@ async fn emit_files<Q: Queue, O: ObjectStore>(
         let Some((index, mut task)) = fetching.pop_front() else {
             return Ok(());
         };
-        let fetched = match (&mut task.0).await {
+        // A download may be waiting to retry; shutdown must not wait for its tries.
+        let joined = tokio::select! {
+            joined = &mut task.0 => joined,
+            _ = shutdown.clone() => return Err(FileError::ShuttingDown),
+        };
+        let fetched = match joined {
             Ok(result) => result?,
             Err(error) => {
                 if error.is_panic() {
@@ -964,17 +1006,16 @@ async fn emit_files<Q: Queue, O: ObjectStore>(
 }
 
 /// Waits for each emitted file's acknowledgements, records delivered files, and returns the
-/// combined status. Returns once `acks` is closed and every received file has resolved.
+/// combined status. Returns once `acks` is closed and every received file has resolved; `_batch`
+/// keeps the batch's record until then.
 async fn track_acks<Q: Queue, O: ObjectStore>(
-    shared: &Shared<Q, O>,
-    manifest: &Manifest,
-    key: &str,
-    acks: Option<mpsc::UnboundedReceiver<FileAck>>,
+    shared: Arc<Shared<Q, O>>,
+    files: Vec<ManifestFile>,
+    key: String,
+    mut acks: mpsc::UnboundedReceiver<FileAck>,
+    _batch: BatchGuard,
 ) -> BatchStatus {
     let mut status = BatchStatus::Delivered;
-    let Some(mut acks) = acks else {
-        return status;
-    };
     let mut waiting = FuturesUnordered::new();
     let mut open = true;
     loop {
@@ -985,7 +1026,7 @@ async fn track_acks<Q: Queue, O: ObjectStore>(
             },
             Some((index, file_status)) = waiting.next(), if !waiting.is_empty() => {
                 if file_status == BatchStatus::Delivered {
-                    mark_done(shared, key, &manifest.files[index]).await;
+                    mark_done(&shared, &key, &files[index]).await;
                 }
                 status = worst(status, file_status);
             }
@@ -1234,7 +1275,7 @@ async fn download<Q: Queue, O: ObjectStore>(
     let spool_error = |error: std::io::Error| FileError::Spool {
         bucket: bucket.to_owned(),
         key: key.to_owned(),
-        error: error.to_string(),
+        error: format!("{error} (in {})", settings.spool_dir.display()),
     };
     let threshold = settings.spool_threshold_bytes;
     let mut sink = match file.size {
@@ -1369,7 +1410,7 @@ async fn emit_object<Q: Queue, O: ObjectStore>(
                     .map_err(|error| FileError::Spool {
                         bucket: context.manifest.bucket.clone(),
                         key: context.file.path.clone(),
-                        error: error.to_string(),
+                        error: format!("{error} (reading {})", spool.path.display()),
                     })?;
             let buffered = tokio::io::BufReader::with_capacity(SPOOL_BUFFER, file);
             let reader: Box<dyn tokio::io::AsyncRead + Send + Unpin> = if gzipped {

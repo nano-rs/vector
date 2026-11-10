@@ -423,7 +423,13 @@ async fn progress_persists_and_is_forgotten() {
     assert!(done.contains("a/part-0.gz") && done.contains("a/part-1.gz"));
     assert!(reopened.load("other").await.is_empty());
 
-    reopened.forget("batch").await;
+    // The next append after a torn line starts a fresh line, so it is not lost with it.
+    reopened.mark("batch", "a/part-3.gz").await.unwrap();
+    let done = Completions::open(dir.path()).unwrap().load("batch").await;
+    assert_eq!(done.len(), 3, "{done:?}");
+    assert!(done.contains("a/part-3.gz"));
+
+    reopened.forget("batch");
     assert!(reopened.load("batch").await.is_empty());
     assert!(!path.exists());
 
@@ -683,4 +689,193 @@ async fn s3_cut_past_max_tries_redelivers_only_the_undelivered_files() {
         assert_eq!(count, if index == 16 { 4 } else { 1 }, "GETs of {key}");
     }
     harness.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review follow-ups (L1-L5).
+
+/// L1: acknowledgements that arrive after `max_hold_secs` are still recorded, so the
+/// re-delivery skips those files.
+#[tokio::test(start_paused = true)]
+async fn late_acks_after_the_hold_expired_are_still_recorded() {
+    let objects = objects(2, 1);
+    let body = body_for(&objects);
+    let key = batch_key(&parse_manifest(&body).unwrap());
+    let queue = MockQueue::with(vec![message("m-late", &body)], false);
+    let store = mock_store(&objects, &queue, None);
+    let completions = Arc::new(Completions::in_memory());
+    let mut config = settings();
+    config.max_hold = Duration::from_secs(700);
+    let mut harness = start_with(
+        Arc::clone(&queue),
+        store,
+        config,
+        None,
+        Arc::clone(&completions),
+        10_000,
+    );
+
+    let mut held = harness.take(2).await;
+    held.sort_by_key(position);
+    tokio::time::sleep(Duration::from_secs(1000)).await; // the hold expired
+    assert_eq!(queue.deletes(), 0);
+    let file1 = held.pop().unwrap();
+    finalize(held, EventStatus::Delivered); // file 0, late
+    for _ in 0..100 {
+        if !completions.load(&key).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let done = completions.load(&key).await;
+    assert!(done.contains(&objects[0].0), "late ack recorded: {done:?}");
+    // File 1's sink fails, late too: not recorded. (A dropped event counts as delivered.)
+    finalize(vec![file1], EventStatus::Errored);
+
+    // SQS re-delivers after the visibility timeout: only file 1 is emitted.
+    let mut again = message("m-late", &body);
+    again.receipt = "m-late#2".to_owned();
+    again.receive_count = 2;
+    queue.inbox.lock().unwrap().push_back(again);
+    let second = harness.take(1).await;
+    assert_eq!(
+        second.iter().map(position).collect::<Vec<_>>(),
+        vec![(1, 0)]
+    );
+    finalize(second, EventStatus::Delivered);
+    until("delete", || queue.deletes() == 1).await;
+    assert_eq!(gets(&queue, &objects[0].0), 1);
+    harness.stop().await;
+}
+
+/// L2: `forget` while another holder of the same batch is active waits for it.
+#[tokio::test]
+async fn forget_waits_for_every_holder_of_the_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let completions = Arc::new(Completions::open(dir.path()).unwrap());
+    let path = dir
+        .path()
+        .join(super::completion::DIR_NAME)
+        .join("batch.done");
+
+    let first = completions.begin("batch");
+    let second = completions.begin("batch");
+    completions.mark("batch", "p/0").await.unwrap();
+    completions.forget("batch"); // the first copy finished
+    drop(first);
+    assert!(completions.load("batch").await.contains("p/0"));
+    completions.mark("batch", "p/1").await.unwrap(); // the other copy goes on
+    assert_eq!(completions.load("batch").await.len(), 2);
+    assert!(path.exists());
+    drop(second);
+    assert!(!completions.is_active("batch"));
+    assert!(completions.load("batch").await.is_empty());
+    assert!(!path.exists(), "no orphan record");
+
+    // Without holders, forget is immediate.
+    completions.mark("solo", "p/0").await.unwrap();
+    completions.forget("solo");
+    assert!(completions.load("solo").await.is_empty());
+}
+
+/// L2 through the engine: the same batch arrives as two messages processed at once. The first
+/// to finish must not remove the record under the second, and nothing is left behind once
+/// both are deleted.
+#[tokio::test]
+async fn two_copies_of_a_batch_leave_no_orphan_record() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let objects = objects(1, 1);
+    let body = body_for(&objects);
+    let key = batch_key(&parse_manifest(&body).unwrap());
+    let queue = MockQueue::with(
+        vec![message("m-copy-a", &body), message("m-copy-b", &body)],
+        false,
+    );
+    let store = mock_store(&objects, &queue, None);
+    let completions = Arc::new(Completions::open(data_dir.path()).unwrap());
+    let mut harness = start_with(
+        Arc::clone(&queue),
+        store,
+        settings(),
+        None,
+        Arc::clone(&completions),
+        10_000,
+    );
+
+    let mut both = harness.take(2).await;
+    let second = both.pop().unwrap();
+    finalize(both, EventStatus::Delivered);
+    until("first copy deleted", || queue.deletes() == 1).await;
+    assert!(completions.is_active(&key), "the other copy still holds it");
+    assert!(completions.load(&key).await.contains(&objects[0].0));
+
+    finalize(vec![second], EventStatus::Delivered);
+    until("second copy deleted", || queue.deletes() == 2).await;
+    let records = data_dir.path().join(super::completion::DIR_NAME);
+    until("record removed", || {
+        !completions.is_active(&key) && std::fs::read_dir(&records).unwrap().next().is_none()
+    })
+    .await;
+    assert!(completions.load(&key).await.is_empty());
+    harness.stop().await;
+}
+
+/// L4: a shutdown while an object waits to be tried again releases the batch at once instead
+/// of after every try.
+#[tokio::test(start_paused = true)]
+async fn shutdown_during_a_retry_wait_releases_promptly() {
+    let started = tokio::time::Instant::now();
+    let objects = objects(1, 1);
+    let queue = MockQueue::with(vec![message("m-retry-stop", &body_for(&objects))], false);
+    let store = mock_store(&objects, &queue, Some((0, 100)));
+    let mut config = settings();
+    config.fetch_max_tries = 10;
+    config.fetch_retry_backoff = Duration::from_secs(30);
+    let mut harness = start_with(
+        Arc::clone(&queue),
+        store,
+        config,
+        None,
+        Arc::new(Completions::in_memory()),
+        10_000,
+    );
+
+    until("first try", || gets(&queue, &objects[0].0) >= 1).await;
+    let shutdown_at = started.elapsed();
+    harness.begin_shutdown();
+    until("release", || {
+        queue
+            .calls()
+            .contains(&Call::Visibility("m-retry-stop#1".to_owned(), 0))
+    })
+    .await;
+    let released_at = queue
+        .timed_calls()
+        .into_iter()
+        .find(|(_, call)| *call == Call::Visibility("m-retry-stop#1".to_owned(), 0))
+        .unwrap()
+        .0;
+    assert!(
+        released_at < shutdown_at + Duration::from_secs(2),
+        "released {released_at:?}, shutdown at {shutdown_at:?}"
+    );
+    assert!(gets(&queue, &objects[0].0) < 3, "no further tries");
+    harness.stop().await;
+}
+
+/// L5: an unwritable spool directory is detected at startup.
+#[cfg(unix)]
+#[test]
+fn unwritable_spool_dir_is_detected() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    super::check_spool_dir(&dir.path().join("spool")).unwrap();
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let error = super::check_spool_dir(&locked.join("spool")).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(super::check_spool_dir(&locked).is_err());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 }

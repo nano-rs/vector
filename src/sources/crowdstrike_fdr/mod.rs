@@ -152,7 +152,12 @@ pub struct CrowdstrikeFdrConfig {
     /// Objects up to this many (compressed) bytes are held in memory between download and
     /// emission; larger ones are written to a temporary file in `data_dir`.
     ///
-    /// Memory for objects is bounded by about `file_concurrency` times this value.
+    /// An object whose size the manifest lists is held at about this size. One of unlisted size
+    /// is buffered in a growing allocation until it passes the threshold, so it can take up to
+    /// about twice this value. Memory for objects is therefore bounded by about
+    /// `file_concurrency` times twice this value. Spooled objects take disk instead: up to
+    /// `file_concurrency` times `max_object_bytes`. If the spool directory is not writable, the
+    /// source logs an error at startup and every larger object fails (releasing its batch).
     #[serde(default = "default_spool_threshold_bytes")]
     #[configurable(metadata(docs::type_unit = "bytes"))]
     spool_threshold_bytes: usize,
@@ -197,6 +202,10 @@ pub struct CrowdstrikeFdrConfig {
     ///
     /// Defaults to the global `data_dir` option. Without a usable data directory, delivered
     /// files are remembered only until restart and objects spool to the system temp directory.
+    ///
+    /// Skipping already-delivered files on re-delivery works within one instance with a
+    /// persistent data directory. A batch re-delivered to another instance, or to this one after
+    /// its data directory was lost (for example an ephemeral volume), is emitted whole.
     #[configurable(metadata(docs::examples = "/var/lib/vector"))]
     data_dir: Option<PathBuf>,
 
@@ -399,6 +408,14 @@ enum ConfigError {
 /// The directory under the data dir that holds objects past `spool_threshold_bytes`.
 const SPOOL_DIR_NAME: &str = "crowdstrike_fdr_spool";
 
+/// Creates the spool directory and writes (then removes) a probe file in it.
+fn check_spool_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(format!(".probe-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&probe, b"")?;
+    std::fs::remove_file(&probe)
+}
+
 /// Removes spool files left by a crash (the directory belongs to this component alone).
 fn remove_stale_spool_files(dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -573,6 +590,14 @@ impl CrowdstrikeFdrConfig {
             }
         };
         remove_stale_spool_files(&spool_dir);
+        if let Err(error) = check_spool_dir(&spool_dir) {
+            error!(
+                message = "The FDR spool directory is not writable: every object larger than spool_threshold_bytes (or of unlisted size that grows past it) will fail and its batch be released, until it is. Set data_dir to a writable, persistent volume.",
+                spool_dir = %spool_dir.display(),
+                spool_threshold_bytes = self.spool_threshold_bytes,
+                %error,
+            );
+        }
         (Arc::new(completions), spool_dir)
     }
 

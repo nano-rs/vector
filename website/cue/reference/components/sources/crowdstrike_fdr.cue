@@ -50,7 +50,14 @@ components: sources: crowdstrike_fdr: {
 			"""
 				Each object is downloaded completely and verified before its events are emitted. Objects
 				up to `spool_threshold_bytes` (64 MiB) are held in memory (FDR objects are about
-				30-35 MB), so memory use grows with `file_concurrency`; larger ones spool to `data_dir`.
+				30-35 MB), so memory use grows with `file_concurrency` (up to about twice the threshold
+				per object whose size the manifest does not list); larger ones spool to `data_dir`,
+				using up to `file_concurrency` times `max_object_bytes` of disk.
+				""",
+			"""
+				Skipping already-delivered files of a re-delivered batch needs a persistent `data_dir`
+				and works within one instance only: a batch re-delivered to another instance, or after
+				the data directory is lost, is emitted whole.
 				""",
 		]
 	}
@@ -182,8 +189,9 @@ components: sources: crowdstrike_fdr: {
 				re-delivered manifest skips the files recorded as delivered (the record survives a
 				restart when `data_dir` is usable), so at most the files that were in flight are
 				emitted again, with the same `fdr.file` and `fdr.line`, so a sink keyed on those two
-				drops them. The record is per instance: a manifest re-delivered to another instance
-				is emitted whole. A manifest is never deleted before all of its events are
+				drops them. The record is per instance and lives in `data_dir`: a manifest
+				re-delivered to another instance, or after an ephemeral `data_dir` is lost, is emitted
+				whole. Acknowledgements that arrive after `max_hold_secs` are still recorded. A manifest is never deleted before all of its events are
 				acknowledged, so a restart does not lose events.
 				"""
 		}

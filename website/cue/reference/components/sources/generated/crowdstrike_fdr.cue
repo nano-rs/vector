@@ -68,6 +68,10 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 
 			Defaults to the global `data_dir` option. Without a usable data directory, delivered
 			files are remembered only until restart and objects spool to the system temp directory.
+
+			Skipping already-delivered files on re-delivery works within one instance with a
+			persistent data directory. A batch re-delivered to another instance, or to this one after
+			its data directory was lost (for example an ephemeral volume), is emitted whole.
 			"""
 		required: false
 		type: string: examples: ["/var/lib/vector"]
@@ -303,7 +307,12 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 			Objects up to this many (compressed) bytes are held in memory between download and
 			emission; larger ones are written to a temporary file in `data_dir`.
 
-			Memory for objects is bounded by about `file_concurrency` times this value.
+			An object whose size the manifest lists is held at about this size. One of unlisted size
+			is buffered in a growing allocation until it passes the threshold, so it can take up to
+			about twice this value. Memory for objects is therefore bounded by about
+			`file_concurrency` times twice this value. Spooled objects take disk instead: up to
+			`file_concurrency` times `max_object_bytes`. If the spool directory is not writable, the
+			source logs an error at startup and every larger object fails (releasing its batch).
 			"""
 		required: false
 		type: uint: {

@@ -306,7 +306,7 @@ pub(super) enum Call {
 
 #[derive(Default)]
 pub(super) struct MockQueue {
-    inbox: Mutex<VecDeque<QueueMessage>>,
+    pub(super) inbox: Mutex<VecDeque<QueueMessage>>,
     calls: Mutex<Vec<(Duration, Call)>>,
     /// Re-queue a message (new receipt, receive count + 1) when it is released.
     redeliver_on_release: bool,
@@ -338,7 +338,7 @@ impl MockQueue {
             .collect()
     }
 
-    fn timed_calls(&self) -> Vec<(Duration, Call)> {
+    pub(super) fn timed_calls(&self) -> Vec<(Duration, Call)> {
         self.calls.lock().unwrap().clone()
     }
 
@@ -628,6 +628,11 @@ impl Harness {
             events.extend(item.events.into_events());
         }
         events
+    }
+
+    /// Starts Vector's shutdown without waiting for the source to finish.
+    pub(super) fn begin_shutdown(&mut self) {
+        drop(self.trigger.take());
     }
 
     pub(super) async fn stop(mut self) {
