@@ -438,3 +438,36 @@ async fn aws_crowdstrike_fdr_stalled_stream_releases() {
     assert!(started.elapsed() < Duration::from_secs(20));
     task.abort();
 }
+
+/// NAN-5004 class against real SQS semantics: a rejected batch is released, re-delivered and
+/// never deleted, until a delivery is acknowledged.
+#[tokio::test]
+async fn aws_crowdstrike_fdr_rejection_never_deletes() {
+    let fixture = Fixture::new().await;
+    let a = fixture
+        .put("cid0/data/u/part-00000.gz", &[r#"{"n":1}"#, r#"{"n":2}"#])
+        .await;
+    fixture.send_manifest(&[a]).await;
+
+    let (tx, rx) = SourceSender::new_test_sender_with_options(1000, None);
+    let mut items: Items = rx.into_stream();
+    let source = fixture
+        .config("max_tries = 10")
+        .build(SourceContext::new_test(tx, None))
+        .await
+        .unwrap();
+    let task = tokio::spawn(source);
+
+    for _ in 0..2 {
+        let events = take(&mut items, 2).await;
+        finalize(events, EventStatus::Rejected);
+    }
+    // Still on the queue (visible or held), never deleted.
+    let (visible, held) = fixture.depth().await;
+    assert_eq!(visible + held, 1, "a rejected batch must stay on the queue");
+
+    let third = take(&mut items, 2).await;
+    finalize(third, EventStatus::Delivered);
+    fixture.wait_for_depth((0, 0)).await;
+    task.abort();
+}
