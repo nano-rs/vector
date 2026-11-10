@@ -256,6 +256,7 @@ pub enum TryWriteOutcome<T> {
 
 /// RAII guard that resolves finalizers as [`EventStatus::Errored`] on drop unless explicitly
 /// disarmed.
+#[derive(Debug)]
 ///
 /// Used in `try_write_record_inner` so that every `?` exit automatically notifies acking sources
 /// to nack / withhold checkpoints for any record that did not reach durable storage.
@@ -402,7 +403,13 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
     /// If a write to the underlying writer occurs, and that write encounters an error, an error variant
     /// will be returned describing the error.
     async fn flush(&mut self) -> io::Result<Option<FlushResult>> {
+        // NAN-5208: always flush the inner writer as well. `tokio::fs::File` is write-behind:
+        // `write_all` returns once the bytes are handed to a blocking-pool task, before `write(2)`
+        // runs, and a record at or above the buffer capacity is written straight through,
+        // bypassing `buf`. Only `flush` waits for that write to complete, and only then are the
+        // bytes in the data file, where they survive a kill of this process.
         if self.buf.is_empty() {
+            self.inner.flush().await?;
             return Ok(None);
         }
 
@@ -412,13 +419,13 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
         let result = self.inner.write_all(&self.buf[..]).await;
         self.unflushed_events = 0;
         self.buf.clear();
+        result?;
+        self.inner.flush().await?;
 
-        result.map(|()| {
-            Some(FlushResult {
-                events_flushed,
-                bytes_flushed,
-            })
-        })
+        Ok(Some(FlushResult {
+            events_flushed,
+            bytes_flushed,
+        }))
     }
 
     /// Gets a reference to the underlying writer.
@@ -885,6 +892,10 @@ where
     data_file_full: bool,
     skip_to_next: bool,
     ready_to_write: bool,
+    /// NAN-5208: finalizers of records accepted into the write buffer but not yet written to the
+    /// data file. They resolve (as `Delivered`) only after the next successful flush, and as
+    /// `Errored` if that flush fails or the writer is dropped first.
+    pending_finalizers: Vec<FinalizerGuard>,
     _t: PhantomData<T>,
 }
 
@@ -909,6 +920,7 @@ where
             ready_to_write: false,
             next_record_id,
             unflushed_events: 0,
+            pending_finalizers: Vec::new(),
             _t: PhantomData,
         }
     }
@@ -1823,8 +1835,12 @@ where
             // error like `DataFileFull`, as that gets checked during archiving. The guard fires
             // Errored automatically on `?` exit.
             let result = writer.flush_record(token).await?;
-            // Record is durable on disk; disarm so finalizers resolve as Delivered.
-            record_finalizers.disarm();
+            // NAN-5208: the record is only in the in-process write buffer here, not in the data
+            // file. A `Delivered` status is what acking sources report to the sender as durable
+            // (a HEC indexer ack of true, an HTTP 2xx), so resolving now acknowledged records
+            // that a kill of this process before the next flush (SIGKILL, OOM, node loss)
+            // silently discarded. Hold the finalizers until `flush` has written the bytes.
+            self.pending_finalizers.push(record_finalizers);
             result
         } else {
             // The record would not fit given the current size of the buffer, so we need to recover it from the
@@ -1932,7 +1948,14 @@ where
         // TODO: Windows has a page cache as well, and macOS _should_, but we should verify this
         // behavior works on those platforms as well.
         let flush_result = if let Some(writer) = self.writer.as_mut() {
-            writer.flush().await?
+            match writer.flush().await {
+                Ok(flush_result) => flush_result,
+                Err(error) => {
+                    // Dropping the armed guards resolves the unwritten records as Errored.
+                    self.pending_finalizers.clear();
+                    return Err(error);
+                }
+            }
         } else {
             None
         };
@@ -1940,6 +1963,11 @@ where
         if let Some(flush_result) = flush_result {
             // Publish the readable bytes before waking the reader.
             self.publish_flushed_progress(flush_result.events_flushed, flush_result.bytes_flushed);
+        }
+
+        // NAN-5208: every buffered record is now in the data file; acknowledge them.
+        for finalizers in self.pending_finalizers.drain(..) {
+            finalizers.disarm();
         }
 
         if self.ledger.should_flush() || force_full_flush {
