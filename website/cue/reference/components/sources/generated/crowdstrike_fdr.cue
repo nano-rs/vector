@@ -63,9 +63,11 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 	}
 	data_dir: {
 		description: """
-			The directory for the `start_from = cursor` and `start_from = now` state.
+			The directory for the `start_from = cursor` and `start_from = now` state, the record of
+			which files of each held batch are delivered, and objects spooled to disk.
 
-			Defaults to the global `data_dir` option.
+			Defaults to the global `data_dir` option. Without a usable data directory, delivered
+			files are remembered only until restart and objects spool to the system temp directory.
 			"""
 		required: false
 		type: string: examples: ["/var/lib/vector"]
@@ -101,11 +103,37 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 		required:    false
 		type: string: examples: ["http://127.0.0.0:5000/path/to/service"]
 	}
+	fetch_max_tries: {
+		description: """
+			How many times to try fetching one object (GET, body read and checksum) before giving
+			up on its batch.
+
+			Tries are spaced by `fetch_retry_backoff_secs`, doubling, while the message is still
+			held. Only when one object has used every try is the batch released (and that object
+			logged). A re-delivered batch skips the files already delivered.
+			"""
+		required: false
+		type: uint: default: 4
+	}
+	fetch_retry_backoff_secs: {
+		description: """
+			The wait after the first failed try of an object, in seconds. Doubles with every
+			further try, up to 30 seconds.
+			"""
+		required: false
+		type: uint: {
+			default: 1
+			unit:    "seconds"
+		}
+	}
 	file_concurrency: {
 		description: """
-			Number of objects downloaded at once, across all manifests.
+			Number of objects fetched at once, across all manifests.
 
-			Each download is buffered in memory while it is verified (FDR objects are about 30-35 MB).
+			Each object is downloaded completely and verified before any of its events is emitted,
+			in its own task, so a backed-up pipeline never leaves a GET half-read. A downloaded
+			object keeps its slot until its events are emitted; this also bounds how far a manifest
+			prefetches ahead of the file it is emitting. Objects are emitted in manifest order.
 			"""
 		required: false
 		type: uint: default: 4
@@ -173,8 +201,8 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 		description: """
 			An object larger than this many (compressed) bytes fails instead of being buffered.
 
-			Objects are held in memory while they are verified, so this bounds memory use to about
-			`file_concurrency` times this value.
+			Objects are buffered (in memory, or on disk past `spool_threshold_bytes`) while they are
+			verified.
 			"""
 		required: false
 		type: uint: {
@@ -269,6 +297,19 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 			"""
 		required: false
 		type: bool: default: true
+	}
+	spool_threshold_bytes: {
+		description: """
+			Objects up to this many (compressed) bytes are held in memory between download and
+			emission; larger ones are written to a temporary file in `data_dir`.
+
+			Memory for objects is bounded by about `file_concurrency` times this value.
+			"""
+		required: false
+		type: uint: {
+			default: 67108864
+			unit:    "bytes"
+		}
 	}
 	start_from: {
 		description: """
