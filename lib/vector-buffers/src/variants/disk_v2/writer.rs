@@ -332,6 +332,11 @@ struct TrackingBufWriter<W> {
     inner: W,
     buf: Vec<u8>,
     unflushed_events: usize,
+    /// NAN-5208: set by the first failed write or flush. Bytes buffered at that point may be gone
+    /// (`buf` is cleared, and `tokio::fs::File` reports a background write error only once), so
+    /// a later "successful" flush would prove nothing about them. Every later write or flush
+    /// fails until the writer is recreated.
+    poisoned: bool,
 }
 
 impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
@@ -341,7 +346,25 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
             inner,
             buf: Vec::with_capacity(cap),
             unflushed_events: 0,
+            poisoned: false,
         }
+    }
+
+    fn check_poisoned(&self) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "disk buffer writer is poisoned by an earlier write error; records buffered at \
+                 that point may not have reached the data file",
+            ));
+        }
+        Ok(())
+    }
+
+    fn poison_on_error<V>(&mut self, result: io::Result<V>) -> io::Result<V> {
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
 
     /// Writes the given buffer.
@@ -366,12 +389,22 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
     /// If a write to the inner writer occurs, and that write encounters an error, an error variant
     /// will be returned describing the error.
     async fn write(&mut self, event_count: usize, buf: &[u8]) -> io::Result<Option<FlushResult>> {
+        self.check_poisoned()?;
+        let result = self.write_unpoisoned(event_count, buf).await;
+        self.poison_on_error(result)
+    }
+
+    async fn write_unpoisoned(
+        &mut self,
+        event_count: usize,
+        buf: &[u8],
+    ) -> io::Result<Option<FlushResult>> {
         let mut flush_result = None;
 
         // If this write would cause us to exceed our internal buffer capacity, flush whatever we
         // have buffered already.
         if self.buf.len() + buf.len() > self.buf.capacity() {
-            flush_result = self.flush().await?;
+            flush_result = self.flush_unpoisoned().await?;
         }
 
         // If the given buffer is too large to be buffered at all, then bypass the internal buffer.
@@ -403,6 +436,12 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
     /// If a write to the underlying writer occurs, and that write encounters an error, an error variant
     /// will be returned describing the error.
     async fn flush(&mut self) -> io::Result<Option<FlushResult>> {
+        self.check_poisoned()?;
+        let result = self.flush_unpoisoned().await;
+        self.poison_on_error(result)
+    }
+
+    async fn flush_unpoisoned(&mut self) -> io::Result<Option<FlushResult>> {
         // NAN-5208: always flush the inner writer as well. `tokio::fs::File` is write-behind:
         // `write_all` returns once the bytes are handed to a blocking-pool task, before `write(2)`
         // runs, and a record at or above the buffer capacity is written straight through,
@@ -449,6 +488,7 @@ impl<W: fmt::Debug> fmt::Debug for TrackingBufWriter<W> {
                 &format_args!("{}/{}", self.buf.len(), self.buf.capacity()),
             )
             .field("unflushed_events", &self.unflushed_events)
+            .field("poisoned", &self.poisoned)
             .finish()
     }
 }
@@ -1834,7 +1874,17 @@ where
             // We always return errors here because flushing the record won't return a recoverable
             // error like `DataFileFull`, as that gets checked during archiving. The guard fires
             // Errored automatically on `?` exit.
-            let result = writer.flush_record(token).await?;
+            let result = match writer.flush_record(token).await {
+                Ok(result) => result,
+                Err(error) => {
+                    // NAN-5208: a failed write (including an implicit flush of the write buffer)
+                    // may have discarded earlier buffered records too. Resolve them all as
+                    // Errored now; the poisoned writer fails every later flush, so none of them
+                    // can be acknowledged afterwards.
+                    self.pending_finalizers.clear();
+                    return Err(error);
+                }
+            };
             // NAN-5208: the record is only in the in-process write buffer here, not in the data
             // file. A `Delivered` status is what acking sources report to the sender as durable
             // (a HEC indexer ack of true, an HTTP 2xx), so resolving now acknowledged records
