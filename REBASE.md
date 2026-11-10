@@ -268,6 +268,8 @@ Built on purpose although no product config renders them yet:
   operator enables one by renaming it). The scanner counts `*.toml.disabled` as shipped;
   `parity/opt-in-templates/` enables them.
 - `azure_event_hubs` source: this fork's own source (`parity/classic-azure_event_hubs.toml`).
+- `crowdstrike_fdr` source: this fork's own source for CrowdStrike FDR feeds (NAN-5005,
+  `parity/crowdstrike_fdr.toml`); nanosiem does not render it yet.
 
 Deliberately left out, though something still mentions them:
 

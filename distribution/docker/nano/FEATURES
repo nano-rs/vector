@@ -40,6 +40,8 @@ sources-vector
 sources-aws_s3
 sources-aws_sqs
 sources-azure_event_hubs
+# CrowdStrike Falcon Data Replicator (SQS batch manifests -> S3), this fork's source (NAN-5005).
+sources-crowdstrike_fdr
 sources-gcp_pubsub
 sources-kafka
 rdkafka?/cmake_build

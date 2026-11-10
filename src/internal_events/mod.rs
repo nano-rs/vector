@@ -32,6 +32,8 @@ mod azure_event_hubs;
 mod batch;
 mod common;
 mod conditions;
+#[cfg(feature = "sources-crowdstrike_fdr")]
+mod crowdstrike_fdr;
 #[cfg(feature = "sources-datadog_agent")]
 mod datadog_agent;
 #[cfg(feature = "sinks-datadog_logs")]
@@ -191,6 +193,8 @@ pub(crate) use self::aws_kinesis_firehose::*;
 pub(crate) use self::aws_sqs::*;
 #[cfg(feature = "sources-azure_event_hubs")]
 pub(crate) use self::azure_event_hubs::*;
+#[cfg(feature = "sources-crowdstrike_fdr")]
+pub(crate) use self::crowdstrike_fdr::*;
 #[cfg(feature = "sources-datadog_agent")]
 pub(crate) use self::datadog_agent::*;
 #[cfg(feature = "sinks-datadog_logs")]
