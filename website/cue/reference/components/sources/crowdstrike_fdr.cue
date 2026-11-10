@@ -48,8 +48,9 @@ components: sources: crowdstrike_fdr: {
 		]
 		warnings: [
 			"""
-				Each object is held in memory while it is downloaded and verified (FDR objects are
-				about 30-35 MB), so memory use grows with `file_concurrency`.
+				Each object is downloaded completely and verified before its events are emitted. Objects
+				up to `spool_threshold_bytes` (64 MiB) are held in memory (FDR objects are about
+				30-35 MB), so memory use grows with `file_concurrency`; larger ones spool to `data_dir`.
 				""",
 		]
 	}
@@ -130,9 +131,11 @@ components: sources: crowdstrike_fdr: {
 				FDR announces each batch with one SQS message whose body is a manifest:
 				`cid`, `timestamp` (epoch milliseconds, possibly as a string), `bucket`, `pathPrefix`
 				and `files`, each with a `path`, `size` and `checksum`. The source downloads every
-				listed object (at most `file_concurrency` at a time across all manifests),
-				decompresses it if it is gzip, and emits one event per line. Lines longer than
-				`max_line_bytes` are dropped and counted as errors.
+				listed object completely (at most `file_concurrency` at a time across all manifests,
+				each in its own task so a backed-up pipeline never leaves a download half-read),
+				verifies its checksum, and only then decompresses it if it is gzip and emits one event
+				per line, file by file in manifest order. Lines longer than `max_line_bytes` are
+				dropped and counted as errors.
 				"""
 		}
 		holding: {
@@ -144,11 +147,20 @@ components: sources: crowdstrike_fdr: {
 				default). After `max_hold_secs` the source stops extending it and stops waiting, so
 				the message re-delivers.
 
-				A failed or timed-out GET, a stalled body (no data for `stream_idle_timeout_secs`), a
-				checksum failure, an unparseable manifest or a sink error releases the message: it
-				becomes visible again after `retry_delay_secs`. Re-delivered manifests emit the same
-				events again, with the same `fdr.file` and `fdr.line`. A message received more than
-				`max_tries` times is left alone, for the queue's dead-letter policy.
+				A failed or timed-out GET, a body cut short or stalled (no data for
+				`stream_idle_timeout_secs`), or a checksum mismatch is tried again, up to
+				`fetch_max_tries` times with a doubling `fetch_retry_backoff_secs`, while the message
+				stays held. Nothing of an object is emitted before it is complete and verified. When
+				one object has used every try, or on an unparseable manifest or a sink error, the
+				message is released: it becomes visible again after `retry_delay_secs`. A message
+				received more than `max_tries` times is left alone, for the queue's dead-letter
+				policy.
+
+				Each file of a manifest is recorded as delivered (in `data_dir`, keyed by the
+				manifest) once all of its own events are acknowledged, and a re-delivered manifest
+				skips those files; the record is removed once the message is deleted. A release waits
+				for the acknowledgements of files already emitted, so a re-delivery repeats only what
+				was not delivered.
 
 				`max_inflight_manifests` and `max_inflight_bytes` bound how many manifests are held at
 				once; the source stops polling while the limit is reached.
@@ -166,10 +178,12 @@ components: sources: crowdstrike_fdr: {
 			body: """
 				Delivery is at least once. On shutdown the source stops receiving, hands every
 				unfinished manifest back to the queue at once, and keeps waiting for the
-				acknowledgements of manifests already fully emitted until Vector's shutdown deadline.
-				Any manifest that was not deleted re-delivers whole: events that already reached a
-				sink are emitted again, with the same `fdr.file` and `fdr.line`, so a sink keyed on
-				those two drops them. A manifest is never deleted before all of its events are
+				acknowledgements of files already emitted until Vector's shutdown deadline. A
+				re-delivered manifest skips the files recorded as delivered (the record survives a
+				restart when `data_dir` is usable), so at most the files that were in flight are
+				emitted again, with the same `fdr.file` and `fdr.line`, so a sink keyed on those two
+				drops them. The record is per instance: a manifest re-delivered to another instance
+				is emitted whole. A manifest is never deleted before all of its events are
 				acknowledged, so a restart does not lose events.
 				"""
 		}

@@ -26,6 +26,7 @@ use vrl::value::Value;
 use super::{
     CrowdstrikeFdrConfig, LOOKUPS_OUTPUT,
     aws::{S3Store, SqsQueue},
+    completion::Completions,
     manifest::{ChecksumMode, md5_hex},
     source::{Engine, Settings},
 };
@@ -385,6 +386,10 @@ async fn aws_crowdstrike_fdr_stalled_stream_releases() {
         max_inflight_kib: None,
         max_tries: 3,
         retry_delay_secs: 1,
+        fetch_max_tries: 1,
+        fetch_retry_backoff: Duration::from_secs(1),
+        spool_threshold_bytes: 64 * 1024 * 1024,
+        spool_dir: std::env::temp_dir().join("vector-crowdstrike-fdr-int-tests"),
         checksum: ChecksumMode::Verify,
         cutoff: None,
         route_lookups: false,
@@ -418,6 +423,7 @@ async fn aws_crowdstrike_fdr_stalled_stream_releases() {
         settings,
         decoder,
         None,
+        Arc::new(Completions::in_memory()),
     );
     let (tx, _rx) = SourceSender::new_test_sender_with_options(1000, None);
     let started = std::time::Instant::now();
@@ -523,4 +529,97 @@ async fn aws_crowdstrike_fdr_restart_does_not_skip_a_redelivered_batch() {
     finalize(redelivered, EventStatus::Delivered);
     fixture.wait_for_depth((0, 0)).await;
     run2.abort();
+}
+
+/// The field failure (NAN-5005 follow-up) against real SQS semantics: file 16 of 20 is cut
+/// mid-body on every try of the first delivery, so the batch is released; SQS re-delivers it
+/// and only the files not yet delivered are fetched again. No event is emitted twice.
+#[tokio::test]
+async fn aws_crowdstrike_fdr_cut_download_redelivers_without_duplicates() {
+    use std::collections::HashMap;
+
+    let fixture = Fixture::new().await;
+    let objects: Vec<(String, bytes::Bytes)> = (0..20)
+        .map(|file| {
+            let lines: Vec<String> = (0..3)
+                .map(|line| format!(r#"{{"f":{file},"l":{line}}}"#))
+                .collect();
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            (
+                format!("cid0/data/u/part-{file:05}.gz"),
+                super::tests::gzip(&refs),
+            )
+        })
+        .collect();
+    let entries: Vec<String> = objects
+        .iter()
+        .map(|(key, data)| super::tests::file_entry(key, data))
+        .collect();
+    fixture.send_manifest(&entries).await;
+    let s3 = super::fetch_tests::cutting_s3(
+        objects.iter().cloned().collect(),
+        HashMap::from([(objects[16].0.clone(), 3)]),
+    )
+    .await;
+
+    let mut settings = super::tests::settings();
+    settings.visibility_timeout_secs = 30;
+    settings.heartbeat_interval = Duration::from_secs(15);
+    settings.retry_delay_secs = 1;
+    settings.route_lookups = false;
+    settings.file_concurrency = 1;
+    settings.fetch_max_tries = 3;
+    settings.fetch_retry_backoff = Duration::from_millis(100);
+    settings.call_timeout = Duration::from_secs(30);
+    settings.stream_idle_timeout = Duration::from_secs(5);
+    let decoder = DecodingConfig::new(
+        FramingConfig::Bytes,
+        DeserializerConfig::Json(JsonDeserializerConfig::default()),
+        LogNamespace::Legacy,
+    )
+    .build()
+    .unwrap();
+    let engine = Engine::new(
+        Arc::new(SqsQueue {
+            client: sqs_client().await,
+            queue_url: fixture.queue_url.clone(),
+            wait_time_secs: 1,
+        }),
+        Arc::new(super::fetch_tests::s3_store(s3.endpoint.clone()).await),
+        settings,
+        decoder,
+        None,
+        Arc::new(Completions::in_memory()),
+    );
+    let (tx, rx) = SourceSender::new_test_sender_with_options(1000, None);
+    let mut items: Items = rx.into_stream();
+    let task = tokio::spawn(engine.run(tx, ShutdownSignal::noop()));
+
+    let mut seen: HashMap<(i64, i64), usize> = HashMap::new();
+    while seen.len() < 60 {
+        let events = take(&mut items, 1).await;
+        for event in &events {
+            let int = |path| {
+                event
+                    .as_log()
+                    .parse_path_and_get_value(path)
+                    .unwrap()
+                    .and_then(Value::as_integer)
+                    .unwrap()
+            };
+            *seen.entry((int("f"), int("l"))).or_default() += 1;
+        }
+        finalize(events, EventStatus::Delivered);
+    }
+    fixture.wait_for_depth((0, 0)).await;
+    assert!(
+        seen.values().all(|count| *count == 1),
+        "duplicated: {seen:?}"
+    );
+    let gets = s3.gets.lock().unwrap().clone();
+    for (index, (key, _)) in objects.iter().enumerate() {
+        let count = gets.iter().filter(|got| *got == key).count();
+        assert_eq!(count, if index == 16 { 4 } else { 1 }, "GETs of {key}");
+    }
+    task.abort();
 }
