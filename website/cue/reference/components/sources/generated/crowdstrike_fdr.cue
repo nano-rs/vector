@@ -68,6 +68,10 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 
 			Defaults to the global `data_dir` option. Without a usable data directory, delivered
 			files are remembered only until restart and objects spool to the system temp directory.
+
+			Skipping already-delivered files on re-delivery works within one instance with a
+			persistent data directory. A batch re-delivered to another instance, or to this one after
+			its data directory was lost (for example an ephemeral volume), is emitted whole.
 			"""
 		required: false
 		type: string: examples: ["/var/lib/vector"]
@@ -130,13 +134,17 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 		description: """
 			Number of objects fetched at once, across all manifests.
 
+			One reader per object: at 1, throughput is bound by one download and decode at a time
+			(about one 30 MB FDR object a minute in the field); 16 kept a pipeline busy. Memory stays
+			within `max_memory_bytes` whatever this is; objects past it spool to `data_dir`.
+
 			Each object is downloaded completely and verified before any of its events is emitted,
 			in its own task, so a backed-up pipeline never leaves a GET half-read. A downloaded
 			object keeps its slot until its events are emitted; this also bounds how far a manifest
 			prefetches ahead of the file it is emitting. Objects are emitted in manifest order.
 			"""
 		required: false
-		type: uint: default: 4
+		type: uint: default: 16
 	}
 	force_path_style: {
 		description: """
@@ -203,6 +211,21 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 
 			Objects are buffered (in memory, or on disk past `spool_threshold_bytes`) while they are
 			verified.
+			"""
+		required: false
+		type: uint: {
+			default: 536870912
+			unit:    "bytes"
+		}
+	}
+	max_memory_bytes: {
+		description: """
+			Total memory for objects held between download and emission, across all manifests.
+
+			An object is held in memory only if its share fits (its listed size, or
+			`spool_threshold_bytes` when the manifest does not list one); otherwise it spools to
+			`data_dir`. Memory for objects never exceeds this value, whatever `file_concurrency` is.
+			`0` spools every object.
 			"""
 		required: false
 		type: uint: {
@@ -298,12 +321,40 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 		required: false
 		type: bool: default: true
 	}
+	skip_action: {
+		description: """
+			What to do with a batch older than the `start_from` cutoff: `delete` it (on its first
+			delivery only) or `release` it back to the queue, never deleting it.
+			"""
+		required: false
+		type: string: {
+			default: "delete"
+			enum: {
+				delete: """
+					Delete the message without downloading, on its first delivery only (a message received
+					before was accepted by an earlier run and is processed normally). The batch is gone
+					from the queue for every consumer.
+					"""
+				release: """
+					Never delete: hand the message back (visible again after `retry_delay_secs`) without
+					downloading, on every delivery, unless this instance already delivered part of the
+					batch. The batch stays on the queue for other consumers, or until the queue's retention
+					period or dead-letter policy (after `max_tries` receives) removes it.
+					"""
+			}
+		}
+	}
 	spool_threshold_bytes: {
 		description: """
 			Objects up to this many (compressed) bytes are held in memory between download and
 			emission; larger ones are written to a temporary file in `data_dir`.
 
-			Memory for objects is bounded by about `file_concurrency` times this value.
+			Memory for objects is also capped in total by `max_memory_bytes`; an object that does
+			not fit spools even below this threshold. Spooled objects take disk instead: up to
+			`file_concurrency` times `max_object_bytes` in the worst case (FDR objects are about
+			30-35 MB, so typically `file_concurrency` times that). If the spool directory is not
+			writable, the source logs an error at startup and every spooled object fails (releasing
+			its batch).
 			"""
 		required: false
 		type: uint: {
@@ -323,10 +374,12 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 			  the first run.
 			- An RFC 3339 timestamp: only batches newer than it.
 
-			An older manifest is deleted without downloading, and counted as skipped, only on its
-			first delivery (`ApproximateReceiveCount` 1). A message received before was accepted by
-			an earlier run and is processed normally, so a restart never drops undelivered batches.
-			The cursor never moves past a batch that is still held or parked.
+			What happens to an older manifest is set by `skip_action`. With the default (`delete`),
+			it is **deleted** from the queue without downloading, and counted as skipped, only on
+			its first delivery (`ApproximateReceiveCount` 1). A message received before was accepted
+			by an earlier run and is processed normally, so a restart never drops undelivered
+			batches. Use `skip_action = release` when other consumers share the queue. The cursor
+			never moves past a batch that is still held or parked.
 			"""
 		required: false
 		type: string: {
