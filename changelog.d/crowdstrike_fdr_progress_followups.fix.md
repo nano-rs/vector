@@ -1,0 +1,3 @@
+The `crowdstrike_fdr` source's per-batch progress is more robust: acknowledgements that arrive after `max_hold_secs` are still recorded, a batch's record is kept while another copy of the same batch is still processed, an append after a torn record line starts a fresh line (and a new record's directory entry is synced), and a shutdown no longer waits for an object's remaining retries. An unwritable spool directory is reported at startup. The documentation now states the memory and disk bounds and that skipping delivered files works within one instance with a persistent `data_dir` (NAN-5005).
+
+authors: nano-rs

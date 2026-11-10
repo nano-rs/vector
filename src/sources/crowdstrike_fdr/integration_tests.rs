@@ -390,6 +390,8 @@ async fn aws_crowdstrike_fdr_stalled_stream_releases() {
         fetch_retry_backoff: Duration::from_secs(1),
         spool_threshold_bytes: 64 * 1024 * 1024,
         spool_dir: std::env::temp_dir().join("vector-crowdstrike-fdr-int-tests"),
+        max_memory_bytes: 512 * 1024 * 1024,
+        skip_action: super::SkipAction::Delete,
         checksum: ChecksumMode::Verify,
         cutoff: None,
         route_lookups: false,
@@ -621,5 +623,78 @@ async fn aws_crowdstrike_fdr_cut_download_redelivers_without_duplicates() {
         let count = gets.iter().filter(|got| *got == key).count();
         assert_eq!(count, if index == 16 { 4 } else { 1 }, "GETs of {key}");
     }
+    task.abort();
+}
+
+/// Review follow-up L1 against real SQS: the hold expires before the sinks acknowledge; a late
+/// acknowledgement is still recorded, so when SQS re-delivers (visibility lapsed) only the
+/// file that was not delivered is emitted again.
+#[tokio::test]
+async fn aws_crowdstrike_fdr_late_ack_after_hold_expiry_is_skipped_on_redelivery() {
+    let fixture = Fixture::new().await;
+    let a = fixture
+        .put("cid0/data/u/part-00000.gz", &[r#"{"f":0}"#])
+        .await;
+    let b = fixture
+        .put("cid0/data/u/part-00001.gz", &[r#"{"f":1}"#])
+        .await;
+    fixture.send_manifest(&[a, b]).await;
+
+    let mut settings = super::tests::settings();
+    settings.visibility_timeout_secs = 4;
+    settings.heartbeat_interval = Duration::from_secs(2);
+    settings.max_hold = Duration::from_secs(3);
+    settings.retry_delay_secs = 1;
+    settings.route_lookups = false;
+    settings.call_timeout = Duration::from_secs(30);
+    let decoder = DecodingConfig::new(
+        FramingConfig::Bytes,
+        DeserializerConfig::Json(JsonDeserializerConfig::default()),
+        LogNamespace::Legacy,
+    )
+    .build()
+    .unwrap();
+    let completions = Arc::new(Completions::in_memory());
+    let engine = Engine::new(
+        Arc::new(SqsQueue {
+            client: sqs_client().await,
+            queue_url: fixture.queue_url.clone(),
+            wait_time_secs: 1,
+        }),
+        Arc::new(S3Store {
+            client: s3_client(address()).await,
+        }),
+        settings,
+        decoder,
+        None,
+        Arc::clone(&completions),
+    );
+    let (tx, rx) = SourceSender::new_test_sender_with_options(1000, None);
+    let mut items: Items = rx.into_stream();
+    let task = tokio::spawn(engine.run(tx, ShutdownSignal::noop()));
+
+    let field = |event: &Event| {
+        event
+            .as_log()
+            .parse_path_and_get_value("f")
+            .unwrap()
+            .and_then(Value::as_integer)
+            .unwrap()
+    };
+    let mut first = take(&mut items, 2).await;
+    first.sort_by_key(field);
+    // Past max_hold (3 s): the source stops holding; acknowledgements arrive late.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let file1 = first.pop().unwrap();
+    finalize(first, EventStatus::Delivered);
+    finalize(vec![file1], EventStatus::Errored);
+
+    // Re-delivered once the visibility timeout lapses: only file 1 again.
+    let second = take(&mut items, 1).await;
+    assert_eq!(second.iter().map(field).collect::<Vec<_>>(), vec![1]);
+    finalize(second, EventStatus::Delivered);
+    fixture.wait_for_depth((0, 0)).await;
+    let extra = tokio::time::timeout(Duration::from_secs(2), items.next()).await;
+    assert!(extra.is_err(), "nothing else emitted");
     task.abort();
 }

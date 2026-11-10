@@ -153,6 +153,12 @@ components: sources: internal_metrics: {
 			default_namespace: "vector"
 			tags:              _component_tags
 		}
+		crowdstrike_fdr_files_skipped_total: {
+			description:       "Files of re-delivered FDR batches skipped because an earlier delivery already landed them."
+			type:              "counter"
+			default_namespace: "vector"
+			tags:              _component_tags
+		}
 		crowdstrike_fdr_bytes_fetched_total: {
 			description:       "Compressed bytes of FDR objects downloaded."
 			type:              "counter"
