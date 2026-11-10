@@ -22,6 +22,7 @@ use vrl::value::Value;
 
 use super::{
     CrowdstrikeFdrConfig, LOOKUPS_OUTPUT, StartFrom,
+    completion::Completions,
     cursor::Cursor,
     lines::{Line, LineCodec},
     manifest::{
@@ -252,6 +253,10 @@ fn defaults_and_validation() {
     assert_eq!(defaults.operation_timeout_secs, 90);
     assert_eq!(defaults.read_timeout_secs, 60);
     assert_eq!(defaults.stream_idle_timeout_secs, 120);
+    assert_eq!(defaults.fetch_max_tries, 4);
+    assert_eq!(defaults.fetch_retry_backoff_secs, 1);
+    assert_eq!(defaults.spool_threshold_bytes, 64 * 1024 * 1024);
+    assert!(config("fetch_max_tries = 0").validate().is_err());
 
     assert!(config("heartbeat_interval_secs = 151").validate().is_err());
     assert!(config("heartbeat_interval_secs = 0").validate().is_err());
@@ -293,14 +298,14 @@ async fn cursor_only_moves_forward_and_persists() {
 // Engine, with mock SQS and S3
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Call {
+pub(super) enum Call {
     Delete(String),
     Visibility(String, i32),
     Get(String),
 }
 
 #[derive(Default)]
-struct MockQueue {
+pub(super) struct MockQueue {
     inbox: Mutex<VecDeque<QueueMessage>>,
     calls: Mutex<Vec<(Duration, Call)>>,
     /// Re-queue a message (new receipt, receive count + 1) when it is released.
@@ -310,7 +315,7 @@ struct MockQueue {
 }
 
 impl MockQueue {
-    fn with(messages: Vec<QueueMessage>, redeliver_on_release: bool) -> Arc<Self> {
+    pub(super) fn with(messages: Vec<QueueMessage>, redeliver_on_release: bool) -> Arc<Self> {
         Arc::new(Self {
             inbox: Mutex::new(messages.into()),
             redeliver_on_release,
@@ -324,7 +329,7 @@ impl MockQueue {
         self.calls.lock().unwrap().push((start.elapsed(), call));
     }
 
-    fn calls(&self) -> Vec<Call> {
+    pub(super) fn calls(&self) -> Vec<Call> {
         self.calls
             .lock()
             .unwrap()
@@ -337,7 +342,7 @@ impl MockQueue {
         self.calls.lock().unwrap().clone()
     }
 
-    fn deletes(&self) -> usize {
+    pub(super) fn deletes(&self) -> usize {
         self.calls()
             .iter()
             .filter(|call| matches!(call, Call::Delete(_)))
@@ -403,7 +408,7 @@ impl MockQueue {
 static BODY_REGISTRY: std::sync::LazyLock<Mutex<HashMap<String, String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn message(id: &str, body: &str) -> QueueMessage {
+pub(super) fn message(id: &str, body: &str) -> QueueMessage {
     BODY_REGISTRY
         .lock()
         .unwrap()
@@ -418,21 +423,28 @@ fn message(id: &str, body: &str) -> QueueMessage {
 
 /// How a mock object behaves.
 #[derive(Clone)]
-enum Object {
+pub(super) enum Object {
     Data(Bytes),
+    /// While `cuts` is above zero, each GET sends the first `at` bytes, then fails as a
+    /// connection S3 closed mid-body (and decrements `cuts`); afterwards it serves `data`.
+    Cut {
+        data: Bytes,
+        at: usize,
+        cuts: Arc<std::sync::atomic::AtomicUsize>,
+    },
     /// Sends the first bytes, then never sends again.
     Stall(Bytes),
     Missing,
 }
 
 #[derive(Default)]
-struct MockStore {
-    objects: Mutex<HashMap<String, Object>>,
+pub(super) struct MockStore {
+    pub(super) objects: Mutex<HashMap<String, Object>>,
     queue: Mutex<Option<Arc<MockQueue>>>,
 }
 
 impl MockStore {
-    fn with(objects: Vec<(&str, Object)>, queue: &Arc<MockQueue>) -> Arc<Self> {
+    pub(super) fn with(objects: Vec<(&str, Object)>, queue: &Arc<MockQueue>) -> Arc<Self> {
         Arc::new(Self {
             objects: Mutex::new(
                 objects
@@ -461,6 +473,24 @@ impl ObjectStore for MockStore {
                     .collect();
                 Ok(stream::iter(chunks).boxed())
             }
+            Some(Object::Cut { data, at, cuts }) => {
+                let cut = cuts
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |left| left.checked_sub(1),
+                    )
+                    .is_ok();
+                let sent = if cut { data.slice(..at) } else { data };
+                let mut chunks: Vec<Result<Bytes, BoxError>> = sent
+                    .chunks(7)
+                    .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                    .collect();
+                if cut {
+                    chunks.push(Err("connection closed before message completed".into()));
+                }
+                Ok(stream::iter(chunks).boxed())
+            }
             Some(Object::Stall(first)) => Ok(stream::once(async move { Ok(first) })
                 .chain(stream::pending())
                 .boxed()),
@@ -469,9 +499,9 @@ impl ObjectStore for MockStore {
     }
 }
 
-const RETRY_DELAY: i32 = 30;
+pub(super) const RETRY_DELAY: i32 = 30;
 
-fn settings() -> Settings {
+pub(super) fn settings() -> Settings {
     Settings {
         max_number_of_messages: 10,
         visibility_timeout_secs: 300,
@@ -482,6 +512,12 @@ fn settings() -> Settings {
         max_inflight_kib: None,
         max_tries: 3,
         retry_delay_secs: RETRY_DELAY,
+        // One try, so the release timing of the older cases is unchanged; the retry cases
+        // set more.
+        fetch_max_tries: 1,
+        fetch_retry_backoff: Duration::from_secs(1),
+        spool_threshold_bytes: 64 * 1024 * 1024,
+        spool_dir: std::env::temp_dir().join("vector-crowdstrike-fdr-tests"),
         checksum: ChecksumMode::Verify,
         cutoff: None,
         route_lookups: true,
@@ -497,7 +533,7 @@ fn settings() -> Settings {
     }
 }
 
-fn gzip(lines: &[&str]) -> Bytes {
+pub(super) fn gzip(lines: &[&str]) -> Bytes {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     for line in lines {
         encoder.write_all(line.as_bytes()).unwrap();
@@ -506,7 +542,7 @@ fn gzip(lines: &[&str]) -> Bytes {
     Bytes::from(encoder.finish().unwrap())
 }
 
-fn file_entry(path: &str, data: &Bytes) -> String {
+pub(super) fn file_entry(path: &str, data: &Bytes) -> String {
     format!(
         r#"{{"path":"{path}","size":{},"checksum":"{}"}}"#,
         data.len(),
@@ -514,7 +550,7 @@ fn file_entry(path: &str, data: &Bytes) -> String {
     )
 }
 
-fn manifest_body(timestamp_ms: i64, files: &[String]) -> String {
+pub(super) fn manifest_body(timestamp_ms: i64, files: &[String]) -> String {
     format!(
         r#"{{"cid":"cid0","timestamp":{timestamp_ms},"bucket":"fdr-alias","pathPrefix":"cid0/data/u","fileCount":{},"files":[{}]}}"#,
         files.len(),
@@ -532,9 +568,9 @@ fn json_decoder() -> crate::codecs::Decoder {
     .unwrap()
 }
 
-struct Harness {
+pub(super) struct Harness {
     trigger: Option<stream_cancel::Trigger>,
-    events: std::pin::Pin<Box<dyn Stream<Item = SourceSenderItem> + Send>>,
+    pub(super) events: std::pin::Pin<Box<dyn Stream<Item = SourceSenderItem> + Send>>,
     lookups: Option<std::pin::Pin<Box<dyn Stream<Item = SourceSenderItem> + Send + Unpin>>>,
     task: tokio::task::JoinHandle<Result<(), ()>>,
 }
@@ -545,13 +581,32 @@ fn start(
     settings: Settings,
     cursor: Option<Arc<Cursor>>,
 ) -> Harness {
-    let (mut out, rx) = SourceSender::new_test_sender_with_options(10_000, None);
+    start_with(
+        queue,
+        store,
+        settings,
+        cursor,
+        Arc::new(Completions::in_memory()),
+        10_000,
+    )
+}
+
+/// As [`start`], with the progress record and the pipeline's buffer size chosen.
+pub(super) fn start_with<O: ObjectStore>(
+    queue: Arc<MockQueue>,
+    store: Arc<O>,
+    settings: Settings,
+    cursor: Option<Arc<Cursor>>,
+    completions: Arc<Completions>,
+    capacity: usize,
+) -> Harness {
+    let (mut out, rx) = SourceSender::new_test_sender_with_options(capacity, None);
     let lookups = settings.route_lookups.then(|| {
         Box::pin(out.add_outputs(EventStatus::Delivered, LOOKUPS_OUTPUT.to_owned()))
             as std::pin::Pin<Box<dyn Stream<Item = SourceSenderItem> + Send + Unpin>>
     });
     let (trigger, shutdown, _done) = ShutdownSignal::new_wired();
-    let engine = Engine::new(queue, store, settings, json_decoder(), cursor);
+    let engine = Engine::new(queue, store, settings, json_decoder(), cursor, completions);
     let task = tokio::spawn(engine.run(out, shutdown));
     Harness {
         trigger: Some(trigger),
@@ -563,7 +618,7 @@ fn start(
 
 impl Harness {
     /// Takes `n` events from the default output without finalizing them.
-    async fn take(&mut self, n: usize) -> Vec<Event> {
+    pub(super) async fn take(&mut self, n: usize) -> Vec<Event> {
         let mut events = Vec::new();
         while events.len() < n {
             let item = tokio::time::timeout(Duration::from_hours(1), self.events.next())
@@ -575,20 +630,20 @@ impl Harness {
         events
     }
 
-    async fn stop(mut self) {
+    pub(super) async fn stop(mut self) {
         drop(self.trigger.take());
         drop(tokio::time::timeout(Duration::from_mins(1), self.task).await);
     }
 }
 
-fn finalize(events: Vec<Event>, status: EventStatus) {
+pub(super) fn finalize(events: Vec<Event>, status: EventStatus) {
     for mut event in events {
         event.take_finalizers().update_status(status);
     }
 }
 
 /// Advances (paused) time until `check` holds.
-async fn until(what: &str, check: impl Fn() -> bool) {
+pub(super) async fn until(what: &str, check: impl Fn() -> bool) {
     for _ in 0..100_000 {
         if check() {
             return;
@@ -598,7 +653,7 @@ async fn until(what: &str, check: impl Fn() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-fn field<'a>(event: &'a Event, path: &str) -> Option<&'a Value> {
+pub(super) fn field<'a>(event: &'a Event, path: &str) -> Option<&'a Value> {
     event.as_log().parse_path_and_get_value(path).ok().flatten()
 }
 
@@ -1145,7 +1200,7 @@ async fn closed_pipeline_releases_and_never_deletes() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn poisoned_file_retries_the_whole_batch_without_loss() {
+async fn poisoned_file_retries_the_batch_without_loss_or_duplicates() {
     let good = gzip(&[r#"{"f":"a","n":1}"#, r#"{"f":"a","n":2}"#]);
     let fixed = gzip(&[r#"{"f":"b","n":1}"#]);
     // A gzip member cut short: the checksum (none here) passes, decompression fails.
@@ -1186,32 +1241,33 @@ async fn poisoned_file_retries_the_whole_batch_without_loss() {
         "a batch with a failed file must not delete"
     );
 
-    // The object is readable on the next delivery: every event of the batch is re-emitted
-    // (part-a again, at the same file/line, so a sink can dedupe), then the message deletes.
+    // The object is readable on the next delivery. part-a was acknowledged, so only part-b is
+    // emitted (no duplicates), then the message deletes.
     store
         .objects
         .lock()
         .unwrap()
         .insert("cid0/data/u/part-b.gz".to_owned(), Object::Data(fixed));
-    let second = harness.take(3).await;
-    let mut keys: Vec<_> = second
-        .iter()
-        .map(|event| {
-            (
-                field(event, "fdr.file").unwrap().to_string(),
-                field(event, "fdr.line").unwrap().as_integer().unwrap(),
-            )
-        })
-        .collect();
-    keys.sort();
-    assert_eq!(keys.len(), 3);
-    assert_eq!(keys[2].1, 0);
+    let second = harness.take(1).await;
+    assert_eq!(
+        field(&second[0], "fdr.file").unwrap(),
+        &Value::from("cid0/data/u/part-b.gz")
+    );
     finalize(second, EventStatus::Delivered);
     until("delete", || queue.deletes() == 1).await;
     assert!(
         queue
             .calls()
             .contains(&Call::Delete("m-poison#2".to_owned()))
+    );
+    assert_eq!(
+        queue
+            .calls()
+            .iter()
+            .filter(|call| **call == Call::Get("cid0/data/u/part-a.gz".to_owned()))
+            .count(),
+        1,
+        "part-a is not even downloaded again"
     );
     harness.stop().await;
 }

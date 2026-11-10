@@ -5,9 +5,10 @@
 //! behaviour is unit-tested without AWS; `aws.rs` provides the SQS and S3 implementations.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     future::Future,
     panic,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -18,10 +19,11 @@ use std::{
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use futures::{FutureExt, StreamExt, stream::BoxStream};
+use futures::{FutureExt, StreamExt, stream::BoxStream, stream::FuturesUnordered};
 use snafu::Snafu;
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
+    io::AsyncWriteExt as _,
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinSet,
     time::{Instant, sleep, sleep_until, timeout},
 };
@@ -41,17 +43,22 @@ use vector_lib::{
 
 use super::{
     CrowdstrikeFdrConfig, LOOKUPS_OUTPUT,
+    completion::{Completions, batch_key},
     cursor::Cursor,
     lines::{Line, LineCodec},
     manifest::{
-        ChecksumMode, Hasher, Manifest, ManifestFile, ObjectKind, parse_checksum, parse_manifest,
+        ChecksumMode, Expected, Hasher, Manifest, ManifestFile, ObjectKind, parse_checksum,
+        parse_manifest,
     },
 };
 use crate::{
     SourceSender,
     codecs::Decoder,
     common::backoff::ExponentialBackoff,
-    event::{BatchNotifier, BatchStatus, EstimatedJsonEncodedSizeOf, Event, LogEvent},
+    event::{
+        BatchNotifier, BatchStatus, BatchStatusReceiver, EstimatedJsonEncodedSizeOf, Event,
+        LogEvent,
+    },
     internal_events::{
         CrowdstrikeFdrBatchLag, CrowdstrikeFdrChecksumWarning, CrowdstrikeFdrError,
         CrowdstrikeFdrFileFetched, CrowdstrikeFdrHoldExpired, CrowdstrikeFdrInflight,
@@ -119,6 +126,13 @@ pub(super) struct Settings {
     pub(super) max_inflight_kib: Option<u32>,
     pub(super) max_tries: u32,
     pub(super) retry_delay_secs: i32,
+    /// Tries per object (GET, read, checksum) before the batch is released.
+    pub(super) fetch_max_tries: u32,
+    /// Wait after the first failed try of an object; doubles per try, at most 30 s.
+    pub(super) fetch_retry_backoff: Duration,
+    /// Objects up to this size are held in memory; larger ones are spooled to `spool_dir`.
+    pub(super) spool_threshold_bytes: usize,
+    pub(super) spool_dir: PathBuf,
     pub(super) checksum: ChecksumMode,
     pub(super) cutoff: Option<DateTime<Utc>>,
     pub(super) route_lookups: bool,
@@ -141,6 +155,7 @@ pub(super) struct Engine<Q, O> {
     settings: Arc<Settings>,
     decoder: Decoder,
     cursor: Option<Arc<Cursor>>,
+    completions: Arc<Completions>,
 }
 
 /// Shared by every manifest task.
@@ -150,6 +165,8 @@ struct Shared<Q, O> {
     settings: Arc<Settings>,
     decoder: Decoder,
     cursor: Option<Arc<Cursor>>,
+    completions: Arc<Completions>,
+    /// Objects being downloaded or waiting to be emitted, across all manifests.
     file_slots: Arc<Semaphore>,
     byte_budget: Option<Arc<Semaphore>>,
     inflight_manifests: AtomicUsize,
@@ -213,6 +230,7 @@ impl<Q: Queue, O: ObjectStore> Engine<Q, O> {
         settings: Settings,
         decoder: Decoder,
         cursor: Option<Arc<Cursor>>,
+        completions: Arc<Completions>,
     ) -> Self {
         Self {
             queue,
@@ -220,6 +238,7 @@ impl<Q: Queue, O: ObjectStore> Engine<Q, O> {
             settings: Arc::new(settings),
             decoder,
             cursor,
+            completions,
         }
     }
 
@@ -231,6 +250,7 @@ impl<Q: Queue, O: ObjectStore> Engine<Q, O> {
             settings: Arc::clone(&settings),
             decoder: self.decoder,
             cursor: self.cursor,
+            completions: self.completions,
             file_slots: Arc::new(Semaphore::new(settings.file_concurrency.max(1))),
             byte_budget: settings
                 .max_inflight_kib
@@ -427,6 +447,12 @@ enum FileError {
         key: String,
         detail: String,
     },
+    #[snafu(display("buffering s3://{bucket}/{key} on disk failed: {error}"))]
+    Spool {
+        bucket: String,
+        key: String,
+        error: String,
+    },
     #[snafu(display("decompressing s3://{bucket}/{key} failed: {error}"))]
     Decode {
         bucket: String,
@@ -450,10 +476,24 @@ impl FileError {
             Self::Stalled { .. } => ("object_stream_stalled", error_type::TIMED_OUT),
             Self::TooLarge { .. } => ("object_too_large", error_type::CONDITION_FAILED),
             Self::Checksum { .. } => ("checksum_mismatch", error_type::CONDITION_FAILED),
+            Self::Spool { .. } => ("failed_buffering_object", error_type::WRITER_FAILED),
             Self::Decode { .. } => ("failed_decompressing_object", error_type::PARSER_FAILED),
             Self::SendTimeout => ("send_timed_out", error_type::TIMED_OUT),
             Self::Closed | Self::ShuttingDown => ("pipeline_closed", error_type::WRITER_FAILED),
         }
+    }
+
+    /// Whether another try of the same object may succeed (a cut or stalled download, a
+    /// corrupted transfer). An object too large, or a full disk, fails the same way again.
+    const fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::Get { .. }
+                | Self::GetTimeout { .. }
+                | Self::Read { .. }
+                | Self::Stalled { .. }
+                | Self::Checksum { .. }
+        )
     }
 }
 
@@ -563,11 +603,12 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
         }
     }
 
+    let key = batch_key(&manifest);
     let pin = HeldPin::new(&shared.pins, manifest.timestamp_ms);
     let mut inflight = InflightGuard::new(&shared);
     let deadline = received_at + settings.max_hold;
     let outcome = tokio::select! {
-        outcome = process(&shared, &message.id, &manifest, &mut inflight, out, shutdown) => outcome,
+        outcome = process(&shared, &message.id, &manifest, &key, &mut inflight, out, shutdown) => outcome,
         () = heartbeat(&shared, &message) => unreachable!("heartbeat never returns"),
         () = sleep_until(deadline) => Outcome::HoldExpired,
     };
@@ -576,14 +617,14 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
 
     match outcome {
         Outcome::Delivered => {
-            finish(&shared, &message, &manifest).await;
+            finish(&shared, &message, &manifest, &key).await;
         }
         Outcome::Rejected if settings.delete_failed_message => {
             warn!(
                 message = "Sinks rejected events of an FDR manifest; deleting it (delete_failed_message = true).",
                 message_id = %message.id,
             );
-            finish(&shared, &message, &manifest).await;
+            finish(&shared, &message, &manifest, &key).await;
         }
         Outcome::Rejected | Outcome::Failed => {
             release(&shared, &message, settings.retry_delay_secs).await;
@@ -606,11 +647,13 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
     }
 }
 
-/// Deletes the message (when configured) and advances the cursor.
+/// Deletes the message (when configured), forgets its per-file progress and advances the
+/// cursor.
 async fn finish<Q: Queue, O: ObjectStore>(
     shared: &Shared<Q, O>,
     message: &QueueMessage,
     manifest: &Manifest,
+    key: &str,
 ) {
     let deleted = if shared.settings.delete_message {
         delete(shared, message).await
@@ -618,8 +661,10 @@ async fn finish<Q: Queue, O: ObjectStore>(
         true
     };
     if !deleted {
+        // Kept: the re-delivery skips every file and deletes.
         return;
     }
+    shared.completions.forget(key).await;
     emit!(CrowdstrikeFdrManifest {
         status: FdrManifestStatus::Acked,
         message_id: &message.id,
@@ -732,9 +777,10 @@ async fn bounded<T>(
 }
 
 async fn process<Q: Queue, O: ObjectStore>(
-    shared: &Shared<Q, O>,
+    shared: &Arc<Shared<Q, O>>,
     message_id: &str,
     manifest: &Manifest,
+    key: &str,
     inflight: &mut InflightGuard<'_, Q, O>,
     out: SourceSender,
     shutdown: ShutdownSignal,
@@ -759,34 +805,40 @@ async fn process<Q: Queue, O: ObjectStore>(
     };
     inflight.add_bytes(manifest.total_size);
 
-    let (batch, receiver) = BatchNotifier::maybe_new_with_receiver(settings.acknowledgements);
-    let fetches: Vec<_> = manifest
+    // A re-delivered batch skips the files an earlier delivery already landed.
+    let done = shared.completions.load(key).await;
+    let todo: Vec<usize> = manifest
         .files
         .iter()
-        .map(|file| {
-            fetch_file(
-                shared,
-                manifest,
-                file,
-                batch.clone(),
-                out.clone(),
-                shutdown.clone(),
-            )
-        })
+        .enumerate()
+        .filter(|(_, file)| !done.contains(&file.path))
+        .map(|(index, _)| index)
         .collect();
-    let mut fetches =
-        futures::stream::iter(fetches).buffer_unordered(settings.file_concurrency.max(1));
-    let mut failure = None;
-    while let Some(result) = fetches.next().await {
-        if let Err(error) = result {
-            failure = Some(error);
-            break;
-        }
+    let skipped = manifest.files.len() - todo.len();
+    if skipped > 0 {
+        info!(
+            message = "Skipping files of a re-delivered FDR batch that were already delivered.",
+            message_id,
+            skipped,
+            remaining = todo.len(),
+        );
     }
-    drop(fetches);
-    drop(batch);
 
-    if let Some(error) = failure {
+    let (acks_tx, acks_rx) = if settings.acknowledgements {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    // Emission and acknowledgement tracking run side by side; a file is recorded as delivered
+    // as soon as its own events are acknowledged. When emission fails, the tracker still waits
+    // for the files already emitted, so a re-delivery repeats at most the failed file.
+    let (emitted, status) = tokio::join!(
+        emit_files(shared, manifest, key, &todo, acks_tx, out, shutdown),
+        track_acks(shared, manifest, key, acks_rx),
+    );
+
+    if let Err(error) = emitted {
         if matches!(error, FileError::ShuttingDown) {
             return Outcome::Shutdown;
         }
@@ -805,55 +857,294 @@ async fn process<Q: Queue, O: ObjectStore>(
         return Outcome::Failed;
     }
 
-    match receiver {
-        None => Outcome::Delivered,
-        Some(receiver) => match receiver.await {
-            BatchStatus::Delivered => Outcome::Delivered,
-            BatchStatus::Errored => {
-                emit!(CrowdstrikeFdrError {
-                    error_code: "delivery_failed",
-                    error_type: error_type::ACKNOWLEDGMENT_FAILED,
-                    stage: error_stage::SENDING,
-                    message_id,
-                    error: format!(
-                        "sinks reported an error for batch {} ({} files)",
-                        manifest.timestamp_ms,
-                        manifest.files.len()
-                    ),
-                });
-                Outcome::Failed
-            }
-            BatchStatus::Rejected => Outcome::Rejected,
-        },
+    match status {
+        BatchStatus::Delivered => Outcome::Delivered,
+        BatchStatus::Errored => {
+            emit!(CrowdstrikeFdrError {
+                error_code: "delivery_failed",
+                error_type: error_type::ACKNOWLEDGMENT_FAILED,
+                stage: error_stage::SENDING,
+                message_id,
+                error: format!(
+                    "sinks reported an error for batch {} ({} files)",
+                    manifest.timestamp_ms,
+                    manifest.files.len()
+                ),
+            });
+            Outcome::Failed
+        }
+        BatchStatus::Rejected => Outcome::Rejected,
     }
 }
 
-/// Per-file values copied into every event.
-struct FileContext<'a> {
-    manifest: &'a Manifest,
-    file: &'a ManifestFile,
-    batch_time: Option<DateTime<Utc>>,
-}
+/// A file's acknowledgement receiver, by its index in the manifest.
+type FileAck = (usize, BatchStatusReceiver);
 
-async fn fetch_file<Q: Queue, O: ObjectStore>(
-    shared: &Shared<Q, O>,
+/// Fetches the `todo` files (up to `file_concurrency` ahead, each in its own task) and emits
+/// them one at a time, in manifest order. Each file gets its own batch notifier; its receiver
+/// goes to `acks`, or, without acknowledgements, the file is recorded as delivered once emitted.
+async fn emit_files<Q: Queue, O: ObjectStore>(
+    shared: &Arc<Shared<Q, O>>,
     manifest: &Manifest,
-    file: &ManifestFile,
-    batch: Option<BatchNotifier>,
+    key: &str,
+    todo: &[usize],
+    acks: Option<mpsc::UnboundedSender<FileAck>>,
     mut out: SourceSender,
     shutdown: ShutdownSignal,
 ) -> Result<(), FileError> {
-    let settings = &shared.settings;
-    let _slot = shared
-        .file_slots
-        .acquire()
-        .await
-        .expect("semaphore is never closed");
-    if shutdown.clone().now_or_never().is_some() {
-        return Err(FileError::ShuttingDown);
+    let window = shared.settings.file_concurrency.max(1);
+    let mut next = todo.iter().copied().peekable();
+    let mut fetching: VecDeque<(usize, FetchTask)> = VecDeque::with_capacity(window);
+    let batch_time = manifest.batch_time();
+    loop {
+        // Start downloads. A slot is waited for only when nothing of this manifest is in
+        // flight: a fetched file holds its slot until it is emitted, so waiting while one is
+        // queued could deadlock against our own queue.
+        while fetching.len() < window
+            && let Some(&index) = next.peek()
+        {
+            let slot = if fetching.is_empty() {
+                tokio::select! {
+                    permit = Arc::clone(&shared.file_slots).acquire_owned() => {
+                        permit.expect("semaphore is never closed")
+                    }
+                    _ = shutdown.clone() => return Err(FileError::ShuttingDown),
+                }
+            } else {
+                match Arc::clone(&shared.file_slots).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                }
+            };
+            if shutdown.clone().now_or_never().is_some() {
+                return Err(FileError::ShuttingDown);
+            }
+            next.next();
+            let task = tokio::spawn(
+                fetch_object(
+                    Arc::clone(shared),
+                    manifest.bucket.clone(),
+                    manifest.files[index].clone(),
+                    slot,
+                )
+                .in_current_span(),
+            );
+            fetching.push_back((index, FetchTask(task)));
+        }
+
+        let Some((index, mut task)) = fetching.pop_front() else {
+            return Ok(());
+        };
+        let fetched = match (&mut task.0).await {
+            Ok(result) => result?,
+            Err(error) => {
+                if error.is_panic() {
+                    panic::resume_unwind(error.into_panic());
+                }
+                return Err(FileError::ShuttingDown);
+            }
+        };
+        let file = &manifest.files[index];
+        let context = FileContext {
+            manifest,
+            file,
+            batch_time,
+        };
+        let (batch, receiver) = BatchNotifier::maybe_new_with_receiver(acks.is_some());
+        emit_object(shared, &context, fetched, batch.as_ref(), &mut out).await?;
+        drop(batch);
+        match (receiver, &acks) {
+            (Some(receiver), Some(acks)) => {
+                // The tracker outlives this function; a send cannot fail while it runs.
+                drop(acks.send((index, receiver)));
+            }
+            _ => mark_done(shared, key, file).await,
+        }
+    }
+}
+
+/// Waits for each emitted file's acknowledgements, records delivered files, and returns the
+/// combined status. Returns once `acks` is closed and every received file has resolved.
+async fn track_acks<Q: Queue, O: ObjectStore>(
+    shared: &Shared<Q, O>,
+    manifest: &Manifest,
+    key: &str,
+    acks: Option<mpsc::UnboundedReceiver<FileAck>>,
+) -> BatchStatus {
+    let mut status = BatchStatus::Delivered;
+    let Some(mut acks) = acks else {
+        return status;
+    };
+    let mut waiting = FuturesUnordered::new();
+    let mut open = true;
+    loop {
+        tokio::select! {
+            next_ack = acks.recv(), if open => match next_ack {
+                Some((index, receiver)) => waiting.push(async move { (index, receiver.await) }),
+                None => open = false,
+            },
+            Some((index, file_status)) = waiting.next(), if !waiting.is_empty() => {
+                if file_status == BatchStatus::Delivered {
+                    mark_done(shared, key, &manifest.files[index]).await;
+                }
+                status = worst(status, file_status);
+            }
+            else => break,
+        }
+    }
+    status
+}
+
+/// `Rejected` outranks `Errored`, which outranks `Delivered` (as for a single batch).
+const fn worst(a: BatchStatus, b: BatchStatus) -> BatchStatus {
+    match (a, b) {
+        (BatchStatus::Rejected, _) | (_, BatchStatus::Rejected) => BatchStatus::Rejected,
+        (BatchStatus::Errored, _) | (_, BatchStatus::Errored) => BatchStatus::Errored,
+        _ => BatchStatus::Delivered,
+    }
+}
+
+async fn mark_done<Q: Queue, O: ObjectStore>(
+    shared: &Shared<Q, O>,
+    key: &str,
+    file: &ManifestFile,
+) {
+    if let Err(error) = shared.completions.mark(key, &file.path).await {
+        // Still recorded in memory; only a restart would repeat this file.
+        emit!(CrowdstrikeFdrError {
+            error_code: "failed_writing_progress",
+            error_type: error_type::WRITER_FAILED,
+            stage: error_stage::PROCESSING,
+            message_id: "",
+            error: format!("recording {} as delivered failed: {error}", file.path),
+        });
+    }
+}
+
+/// A download in its own task, so a busy emitter never leaves a GET unread. Aborted (and its
+/// spool file removed) when dropped.
+struct FetchTask(tokio::task::JoinHandle<Result<Fetched, FileError>>);
+
+impl Drop for FetchTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A complete, verified object waiting to be emitted. Keeps its download slot (and so its
+/// share of memory or disk) until it is emitted.
+struct Fetched {
+    object: Downloaded,
+    slot: OwnedSemaphorePermit,
+}
+
+struct Downloaded {
+    body: Body,
+    gzipped: bool,
+}
+
+enum Body {
+    Memory(Bytes),
+    Spool(SpoolFile),
+}
+
+/// A spooled object on disk, removed when dropped.
+struct SpoolFile {
+    path: PathBuf,
+}
+
+impl Drop for SpoolFile {
+    fn drop(&mut self) {
+        drop(std::fs::remove_file(&self.path));
+    }
+}
+
+/// Extension of spool files, removed at startup if a crash left any.
+pub(super) const SPOOL_EXTENSION: &str = "part";
+
+struct SpoolWriter {
+    out: tokio::io::BufWriter<tokio::fs::File>,
+    file: SpoolFile,
+}
+
+impl SpoolWriter {
+    async fn create(dir: &std::path::Path) -> std::io::Result<Self> {
+        tokio::fs::create_dir_all(dir).await?;
+        let path = dir.join(format!("{}.{SPOOL_EXTENSION}", uuid::Uuid::new_v4()));
+        let out = tokio::fs::File::create(&path).await?;
+        Ok(Self {
+            out: tokio::io::BufWriter::with_capacity(SPOOL_BUFFER, out),
+            file: SpoolFile { path },
+        })
     }
 
-    let bucket = &manifest.bucket;
+    async fn write(&mut self, chunk: &[u8]) -> std::io::Result<()> {
+        self.out.write_all(chunk).await
+    }
+
+    async fn finish(mut self) -> std::io::Result<SpoolFile> {
+        self.out.flush().await?;
+        Ok(self.file)
+    }
+}
+
+const SPOOL_BUFFER: usize = 256 * 1024;
+
+/// Where a download goes: memory up to `spool_threshold_bytes`, then a spool file.
+enum Sink {
+    Memory(BytesMut),
+    Spool(SpoolWriter),
+}
+
+impl Sink {
+    async fn write(
+        &mut self,
+        chunk: &[u8],
+        threshold: usize,
+        dir: &std::path::Path,
+    ) -> std::io::Result<()> {
+        if let Self::Memory(buffer) = self {
+            if buffer.len() + chunk.len() <= threshold {
+                buffer.extend_from_slice(chunk);
+                return Ok(());
+            }
+            let mut writer = SpoolWriter::create(dir).await?;
+            writer.write(buffer).await?;
+            *self = Self::Spool(writer);
+        }
+        match self {
+            Self::Spool(writer) => writer.write(chunk).await,
+            Self::Memory(_) => unreachable!("spilled above"),
+        }
+    }
+
+    async fn finish(self) -> std::io::Result<Body> {
+        match self {
+            Self::Memory(buffer) => Ok(Body::Memory(buffer.freeze())),
+            Self::Spool(writer) => writer.finish().await.map(Body::Spool),
+        }
+    }
+}
+
+/// Longest wait between two tries of one object.
+const MAX_FETCH_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// `initial`, doubling with every failed try, at most [`MAX_FETCH_RETRY_DELAY`].
+fn fetch_retry_delay(initial: Duration, failed_tries: u32) -> Duration {
+    initial
+        .saturating_mul(1u32 << failed_tries.saturating_sub(1).min(16))
+        .min(MAX_FETCH_RETRY_DELAY)
+}
+
+/// Fetches one object completely and verifies it, retrying transient failures up to
+/// `fetch_max_tries` times. Nothing of the object is emitted here.
+async fn fetch_object<Q: Queue, O: ObjectStore>(
+    shared: Arc<Shared<Q, O>>,
+    bucket: String,
+    file: ManifestFile,
+    slot: OwnedSemaphorePermit,
+) -> Result<Fetched, FileError> {
+    let settings = &shared.settings;
     let key = &file.path;
 
     // Fail closed before downloading when the checksum cannot be verified at all.
@@ -863,7 +1154,7 @@ async fn fetch_file<Q: Queue, O: ObjectStore>(
             Ok(expected) => Some(expected),
             Err(detail) if mode == ChecksumMode::Verify => {
                 return Err(FileError::Checksum {
-                    bucket: bucket.clone(),
+                    bucket,
                     key: key.clone(),
                     detail,
                 });
@@ -875,58 +1166,53 @@ async fn fetch_file<Q: Queue, O: ObjectStore>(
         },
     };
 
-    let mut hasher = expected.as_ref().map(Hasher::for_expected);
-    let data = download(shared, bucket, key, file.size, hasher.as_mut()).await?;
-    emit!(CrowdstrikeFdrFileFetched {
-        key,
-        bytes: data.len() as u64,
-    });
-
-    if let (Some(hasher), Some(expected)) = (hasher, expected.as_ref()) {
-        let verdict = hasher.verify(expected).and_then(|()| match file.size {
-            Some(size) if size != data.len() as u64 => Err(format!(
-                "size mismatch: manifest {size} bytes, object {} bytes",
-                data.len()
-            )),
-            _ => Ok(()),
-        });
-        if let Err(detail) = verdict {
-            if settings.checksum == ChecksumMode::Verify {
-                return Err(FileError::Checksum {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    detail,
-                });
+    let max_tries = settings.fetch_max_tries.max(1);
+    let mut tries = 1;
+    loop {
+        match download(&shared, &bucket, &file, expected.as_ref()).await {
+            Ok((object, bytes)) => {
+                emit!(CrowdstrikeFdrFileFetched { key, bytes });
+                return Ok(Fetched { object, slot });
             }
-            emit!(CrowdstrikeFdrError {
-                error_code: "checksum_mismatch",
-                error_type: error_type::CONDITION_FAILED,
-                stage: error_stage::RECEIVING,
-                message_id: "",
-                error: detail.clone(),
-            });
-            emit!(CrowdstrikeFdrChecksumWarning { key, detail });
+            Err(error) if error.is_transient() && tries < max_tries => {
+                let delay = fetch_retry_delay(settings.fetch_retry_backoff, tries);
+                warn!(
+                    message = "Fetching an FDR object failed; retrying.",
+                    key = %key,
+                    tries,
+                    max_tries,
+                    retry_in_secs = delay.as_secs_f64(),
+                    error = %error,
+                );
+                sleep(delay).await;
+                tries += 1;
+            }
+            Err(error) => {
+                if error.is_transient() {
+                    warn!(
+                        message = "Giving up on an FDR object; its batch will be released.",
+                        key = %key,
+                        tries,
+                        error = %error,
+                    );
+                }
+                return Err(error);
+            }
         }
     }
-
-    let context = FileContext {
-        manifest,
-        file,
-        batch_time: manifest.batch_time(),
-    };
-    emit_lines(shared, &context, data.freeze(), batch.as_ref(), &mut out).await
 }
 
-/// GETs one object into memory, hashing as it arrives. Every wait is bounded: the GET by
-/// `call_timeout`, each body chunk by `stream_idle_timeout`.
+/// One GET of a whole object, into memory or (past `spool_threshold_bytes`) a spool file,
+/// hashing as it arrives, then checks the digest and size of the complete object. Every wait
+/// is bounded: the GET by `call_timeout`, each body chunk by `stream_idle_timeout`.
 async fn download<Q: Queue, O: ObjectStore>(
     shared: &Shared<Q, O>,
     bucket: &str,
-    key: &str,
-    size: Option<u64>,
-    mut hasher: Option<&mut Hasher>,
-) -> Result<BytesMut, FileError> {
+    file: &ManifestFile,
+    expected: Option<&Expected>,
+) -> Result<(Downloaded, u64), FileError> {
     let settings = &shared.settings;
+    let key = file.path.as_str();
     let mut body = match timeout(settings.call_timeout, shared.store.get(bucket, key)).await {
         Ok(Ok(body)) => body,
         Ok(Err(error)) => {
@@ -945,11 +1231,27 @@ async fn download<Q: Queue, O: ObjectStore>(
         }
     };
 
-    let capacity = size
-        .and_then(|size| usize::try_from(size).ok())
-        .unwrap_or(0)
-        .min(64 * 1024 * 1024);
-    let mut data = BytesMut::with_capacity(capacity);
+    let spool_error = |error: std::io::Error| FileError::Spool {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        error: error.to_string(),
+    };
+    let threshold = settings.spool_threshold_bytes;
+    let mut sink = match file.size {
+        Some(size) if size > threshold as u64 => Sink::Spool(
+            SpoolWriter::create(&settings.spool_dir)
+                .await
+                .map_err(spool_error)?,
+        ),
+        size => Sink::Memory(BytesMut::with_capacity(
+            size.and_then(|size| usize::try_from(size).ok())
+                .unwrap_or(0)
+                .min(threshold),
+        )),
+    };
+    let mut hasher = expected.map(Hasher::for_expected);
+    let mut len = 0usize;
+    let mut head: Vec<u8> = Vec::with_capacity(2);
     loop {
         match timeout(settings.stream_idle_timeout, body.next()).await {
             Err(_) => {
@@ -968,39 +1270,115 @@ async fn download<Q: Queue, O: ObjectStore>(
                 });
             }
             Ok(Some(Ok(chunk))) => {
-                if let Some(hasher) = hasher.as_deref_mut() {
-                    hasher.update(&chunk);
-                }
-                if data.len() + chunk.len() > settings.max_object_bytes {
+                if len + chunk.len() > settings.max_object_bytes {
                     return Err(FileError::TooLarge {
                         bucket: bucket.to_owned(),
                         key: key.to_owned(),
                         max: settings.max_object_bytes,
                     });
                 }
-                data.extend_from_slice(&chunk);
+                if let Some(hasher) = hasher.as_mut() {
+                    hasher.update(&chunk);
+                }
+                if head.len() < 2 {
+                    head.extend_from_slice(&chunk[..chunk.len().min(2 - head.len())]);
+                }
+                len += chunk.len();
+                sink.write(&chunk, threshold, &settings.spool_dir)
+                    .await
+                    .map_err(spool_error)?;
             }
         }
     }
     drop(body);
-    Ok(data)
+
+    verify_object(settings, bucket, file, hasher, expected, len)?;
+
+    let body = sink.finish().await.map_err(spool_error)?;
+    Ok((
+        Downloaded {
+            body,
+            gzipped: head == [0x1f, 0x8b],
+        },
+        len as u64,
+    ))
+}
+
+/// Checks the digest and size of a complete object. With `checksum = warn`, a mismatch is only
+/// reported.
+fn verify_object(
+    settings: &Settings,
+    bucket: &str,
+    file: &ManifestFile,
+    hasher: Option<Hasher>,
+    expected: Option<&Expected>,
+    len: usize,
+) -> Result<(), FileError> {
+    let key = file.path.as_str();
+    if let (Some(hasher), Some(expected)) = (hasher, expected) {
+        let verdict = hasher.verify(expected).and_then(|()| match file.size {
+            Some(size) if size != len as u64 => Err(format!(
+                "size mismatch: manifest {size} bytes, object {len} bytes"
+            )),
+            _ => Ok(()),
+        });
+        if let Err(detail) = verdict {
+            if settings.checksum == ChecksumMode::Verify {
+                return Err(FileError::Checksum {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    detail,
+                });
+            }
+            emit!(CrowdstrikeFdrError {
+                error_code: "checksum_mismatch",
+                error_type: error_type::CONDITION_FAILED,
+                stage: error_stage::RECEIVING,
+                message_id: "",
+                error: detail.clone(),
+            });
+            emit!(CrowdstrikeFdrChecksumWarning { key, detail });
+        }
+    }
+    Ok(())
 }
 
 const SEND_CHUNK: usize = 1000;
 
-async fn emit_lines<Q: Queue, O: ObjectStore>(
+/// Decodes a fetched object and sends its events, then releases its download slot.
+async fn emit_object<Q: Queue, O: ObjectStore>(
     shared: &Shared<Q, O>,
     context: &FileContext<'_>,
-    data: Bytes,
+    fetched: Fetched,
     batch: Option<&BatchNotifier>,
     out: &mut SourceSender,
 ) -> Result<(), FileError> {
     let settings = &shared.settings;
-    let gzipped = data.starts_with(&[0x1f, 0x8b]);
-    let reader: Box<dyn tokio::io::AsyncRead + Send + Unpin> = if gzipped {
-        Box::new(gzip_multiple_decoder(std::io::Cursor::new(data)))
-    } else {
-        Box::new(std::io::Cursor::new(data))
+    let Fetched { object, slot } = fetched;
+    let gzipped = object.gzipped;
+    let (reader, spool): (Box<dyn tokio::io::AsyncRead + Send + Unpin>, _) = match object.body {
+        Body::Memory(data) if gzipped => (
+            Box::new(gzip_multiple_decoder(std::io::Cursor::new(data))),
+            None,
+        ),
+        Body::Memory(data) => (Box::new(std::io::Cursor::new(data)), None),
+        Body::Spool(spool) => {
+            let file =
+                tokio::fs::File::open(&spool.path)
+                    .await
+                    .map_err(|error| FileError::Spool {
+                        bucket: context.manifest.bucket.clone(),
+                        key: context.file.path.clone(),
+                        error: error.to_string(),
+                    })?;
+            let buffered = tokio::io::BufReader::with_capacity(SPOOL_BUFFER, file);
+            let reader: Box<dyn tokio::io::AsyncRead + Send + Unpin> = if gzipped {
+                Box::new(gzip_multiple_decoder(buffered))
+            } else {
+                Box::new(buffered)
+            };
+            (reader, Some(spool))
+        }
     };
     let mut lines = FramedRead::new(reader, LineCodec::new(settings.max_line_bytes));
     let port = (settings.route_lookups && context.file.kind == ObjectKind::Lookup)
@@ -1047,12 +1425,24 @@ async fn emit_lines<Q: Queue, O: ObjectStore>(
         }
         if pending.len() >= SEND_CHUNK {
             send(out, port, &mut pending).await?;
+            // Decoding an in-memory object never waits; let the heartbeat (same task) run.
+            tokio::task::yield_now().await;
         }
     }
     if !pending.is_empty() {
         send(out, port, &mut pending).await?;
     }
+    drop(lines);
+    drop(spool);
+    drop(slot);
     Ok(())
+}
+
+/// Per-file values copied into every event.
+struct FileContext<'a> {
+    manifest: &'a Manifest,
+    file: &'a ManifestFile,
+    batch_time: Option<DateTime<Utc>>,
 }
 
 async fn send(

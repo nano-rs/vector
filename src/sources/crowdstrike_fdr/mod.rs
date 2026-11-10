@@ -31,11 +31,14 @@ use crate::{
 };
 
 mod aws;
+mod completion;
 mod cursor;
 mod lines;
 mod manifest;
 mod source;
 
+#[cfg(test)]
+mod fetch_tests;
 #[cfg(all(test, feature = "crowdstrike-fdr-integration-tests"))]
 mod integration_tests;
 #[cfg(test)]
@@ -102,9 +105,12 @@ pub struct CrowdstrikeFdrConfig {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     max_hold_secs: u64,
 
-    /// Number of objects downloaded at once, across all manifests.
+    /// Number of objects fetched at once, across all manifests.
     ///
-    /// Each download is buffered in memory while it is verified (FDR objects are about 30-35 MB).
+    /// Each object is downloaded completely and verified before any of its events is emitted,
+    /// in its own task, so a backed-up pipeline never leaves a GET half-read. A downloaded
+    /// object keeps its slot until its events are emitted; this also bounds how far a manifest
+    /// prefetches ahead of the file it is emitting. Objects are emitted in manifest order.
     #[serde(default = "default_file_concurrency")]
     file_concurrency: usize,
 
@@ -127,6 +133,29 @@ pub struct CrowdstrikeFdrConfig {
     /// queue to move it aside.
     #[serde(default = "default_max_tries")]
     max_tries: u32,
+
+    /// How many times to try fetching one object (GET, body read and checksum) before giving
+    /// up on its batch.
+    ///
+    /// Tries are spaced by `fetch_retry_backoff_secs`, doubling, while the message is still
+    /// held. Only when one object has used every try is the batch released (and that object
+    /// logged). A re-delivered batch skips the files already delivered.
+    #[serde(default = "default_fetch_max_tries")]
+    fetch_max_tries: u32,
+
+    /// The wait after the first failed try of an object, in seconds. Doubles with every
+    /// further try, up to 30 seconds.
+    #[serde(default = "default_fetch_retry_backoff_secs")]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    fetch_retry_backoff_secs: u64,
+
+    /// Objects up to this many (compressed) bytes are held in memory between download and
+    /// emission; larger ones are written to a temporary file in `data_dir`.
+    ///
+    /// Memory for objects is bounded by about `file_concurrency` times this value.
+    #[serde(default = "default_spool_threshold_bytes")]
+    #[configurable(metadata(docs::type_unit = "bytes"))]
+    spool_threshold_bytes: usize,
 
     /// After a failure, how long the message stays invisible before it re-delivers, in seconds.
     #[serde(default = "default_retry_delay_secs")]
@@ -163,9 +192,11 @@ pub struct CrowdstrikeFdrConfig {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     cursor_grace_secs: u64,
 
-    /// The directory for the `start_from = cursor` and `start_from = now` state.
+    /// The directory for the `start_from = cursor` and `start_from = now` state, the record of
+    /// which files of each held batch are delivered, and objects spooled to disk.
     ///
-    /// Defaults to the global `data_dir` option.
+    /// Defaults to the global `data_dir` option. Without a usable data directory, delivered
+    /// files are remembered only until restart and objects spool to the system temp directory.
     #[configurable(metadata(docs::examples = "/var/lib/vector"))]
     data_dir: Option<PathBuf>,
 
@@ -181,8 +212,8 @@ pub struct CrowdstrikeFdrConfig {
 
     /// An object larger than this many (compressed) bytes fails instead of being buffered.
     ///
-    /// Objects are held in memory while they are verified, so this bounds memory use to about
-    /// `file_concurrency` times this value.
+    /// Objects are buffered (in memory, or on disk past `spool_threshold_bytes`) while they are
+    /// verified.
     #[serde(default = "default_max_object_bytes")]
     #[configurable(metadata(docs::type_unit = "bytes"))]
     max_object_bytes: usize,
@@ -276,6 +307,15 @@ const fn default_max_inflight_manifests() -> usize {
 const fn default_max_tries() -> u32 {
     3
 }
+const fn default_fetch_max_tries() -> u32 {
+    4
+}
+const fn default_fetch_retry_backoff_secs() -> u64 {
+    1
+}
+const fn default_spool_threshold_bytes() -> usize {
+    64 * 1024 * 1024
+}
 const fn default_retry_delay_secs() -> u32 {
     30
 }
@@ -354,6 +394,22 @@ enum ConfigError {
         "`max_hold_secs` must not exceed 43200 (SQS caps a message's total visibility at 12 hours), not {value}"
     ))]
     MaxHold { value: u64 },
+}
+
+/// The directory under the data dir that holds objects past `spool_threshold_bytes`.
+const SPOOL_DIR_NAME: &str = "crowdstrike_fdr_spool";
+
+/// Removes spool files left by a crash (the directory belongs to this component alone).
+fn remove_stale_spool_files(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some(source::SPOOL_EXTENSION) {
+            drop(std::fs::remove_file(&path));
+        }
+    }
 }
 
 /// Without end-to-end acknowledgements a message is deleted once its events enter the pipeline,
@@ -437,6 +493,11 @@ impl CrowdstrikeFdrConfig {
                 field: "stream_idle_timeout_secs",
             });
         }
+        if self.fetch_max_tries == 0 {
+            return Err(ConfigError::Zero {
+                field: "fetch_max_tries",
+            });
+        }
         Ok((start_from, heartbeat))
     }
 
@@ -476,6 +537,43 @@ impl CrowdstrikeFdrConfig {
             );
         }
         Ok((cutoff, cursor))
+    }
+
+    /// The per-file progress record and the spool directory, in the data dir when there is a
+    /// usable one. Removes spool files a crash left behind.
+    fn progress_and_spool(&self, cx: &SourceContext) -> (Arc<completion::Completions>, PathBuf) {
+        let data_dir = cx
+            .globals
+            .resolve_and_make_data_subdir(self.data_dir.as_ref(), cx.key.id());
+        let (completions, spool_dir) = match data_dir {
+            Ok(dir) => match completion::Completions::open(&dir) {
+                Ok(completions) => (completions, dir.join(SPOOL_DIR_NAME)),
+                Err(error) => {
+                    warn!(
+                        message = "Cannot keep FDR batch progress in the data directory; delivered files are remembered only until restart.",
+                        %error,
+                    );
+                    (
+                        completion::Completions::in_memory(),
+                        dir.join(SPOOL_DIR_NAME),
+                    )
+                }
+            },
+            Err(error) => {
+                warn!(
+                    message = "No usable data directory: delivered files of a batch are remembered only until restart, and large objects spool to the system temp directory.",
+                    %error,
+                );
+                (
+                    completion::Completions::in_memory(),
+                    std::env::temp_dir()
+                        .join(format!("vector-crowdstrike-fdr-{}", cx.key.id()))
+                        .join(SPOOL_DIR_NAME),
+                )
+            }
+        };
+        remove_stale_spool_files(&spool_dir);
+        (Arc::new(completions), spool_dir)
     }
 
     const fn aws_timeout(&self) -> AwsTimeout {
@@ -546,6 +644,7 @@ impl SourceConfig for CrowdstrikeFdrConfig {
         warn_unless_acknowledged(acknowledgements);
 
         let (cutoff, cursor) = self.resolve_cutoff(&start_from, &cx).await?;
+        let (completions, spool_dir) = self.progress_and_spool(&cx);
 
         let region = self.region.region();
         let endpoint = self.region.endpoint();
@@ -592,6 +691,10 @@ impl SourceConfig for CrowdstrikeFdrConfig {
             }),
             max_tries: self.max_tries,
             retry_delay_secs: i32::try_from(self.retry_delay_secs.min(43_200)).unwrap_or(30),
+            fetch_max_tries: self.fetch_max_tries,
+            fetch_retry_backoff: Duration::from_secs(self.fetch_retry_backoff_secs),
+            spool_threshold_bytes: self.spool_threshold_bytes,
+            spool_dir,
             checksum: self.checksum,
             cutoff,
             route_lookups: self.route_lookups,
@@ -617,6 +720,7 @@ impl SourceConfig for CrowdstrikeFdrConfig {
             settings,
             decoder,
             cursor,
+            completions,
         );
         Ok(crate::sources::opaque_source(
             engine.run(cx.out, cx.shutdown),
