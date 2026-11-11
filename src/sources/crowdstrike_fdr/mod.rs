@@ -180,8 +180,10 @@ pub struct CrowdstrikeFdrConfig {
     /// not fit spools even below this threshold. Spooled objects take disk instead: up to
     /// `file_concurrency` times `max_object_bytes` in the worst case (FDR objects are about
     /// 30-35 MB, so typically `file_concurrency` times that). If the spool directory is not
-    /// writable, the source logs an error at startup and every spooled object fails (releasing
-    /// its batch).
+    /// writable, the source logs an error at startup and holds objects in memory only: a
+    /// manifest then waits for memory instead of spooling, and only an object that can never
+    /// fit in `max_memory_bytes` (or one of unlisted size that grows past this threshold)
+    /// fails, releasing its batch.
     #[serde(default = "default_spool_threshold_bytes")]
     #[configurable(metadata(docs::type_unit = "bytes"))]
     spool_threshold_bytes: usize,
@@ -638,7 +640,10 @@ impl CrowdstrikeFdrConfig {
 
     /// The per-file progress record and the spool directory, in the data dir when there is a
     /// usable one. Removes spool files a crash left behind.
-    fn progress_and_spool(&self, cx: &SourceContext) -> (Arc<completion::Completions>, PathBuf) {
+    fn progress_and_spool(
+        &self,
+        cx: &SourceContext,
+    ) -> (Arc<completion::Completions>, PathBuf, bool) {
         let data_dir = cx
             .globals
             .resolve_and_make_data_subdir(self.data_dir.as_ref(), cx.key.id());
@@ -679,15 +684,20 @@ impl CrowdstrikeFdrConfig {
             }
         };
         remove_stale_spool_files(&spool_dir);
-        if let Err(error) = check_spool_dir(&spool_dir) {
-            error!(
-                message = "The FDR spool directory is not writable: every object larger than spool_threshold_bytes (or of unlisted size that grows past it) will fail and its batch be released, until it is. Set data_dir to a writable, persistent volume.",
-                spool_dir = %spool_dir.display(),
-                spool_threshold_bytes = self.spool_threshold_bytes,
-                %error,
-            );
-        }
-        (Arc::new(completions), spool_dir)
+        let spool_usable = match check_spool_dir(&spool_dir) {
+            Ok(()) => true,
+            Err(error) => {
+                error!(
+                    message = "The FDR spool directory is not writable: objects are held in memory only, and a manifest waits for memory (max_memory_bytes) instead of spooling, which lowers throughput. An object that can never fit in max_memory_bytes, or one of unlisted size that grows past spool_threshold_bytes, fails and its batch is released. Set data_dir to a writable, persistent volume.",
+                    spool_dir = %spool_dir.display(),
+                    max_memory_bytes = self.max_memory_bytes,
+                    spool_threshold_bytes = self.spool_threshold_bytes,
+                    %error,
+                );
+                false
+            }
+        };
+        (Arc::new(completions), spool_dir, spool_usable)
     }
 
     const fn aws_timeout(&self) -> AwsTimeout {
@@ -758,7 +768,7 @@ impl SourceConfig for CrowdstrikeFdrConfig {
         warn_unless_acknowledged(acknowledgements);
 
         let (cutoff, cursor) = self.resolve_cutoff(&start_from, &cx).await?;
-        let (completions, spool_dir) = self.progress_and_spool(&cx);
+        let (completions, spool_dir, spool_usable) = self.progress_and_spool(&cx);
 
         let region = self.region.region();
         let endpoint = self.region.endpoint();
@@ -810,6 +820,7 @@ impl SourceConfig for CrowdstrikeFdrConfig {
             spool_threshold_bytes: self.spool_threshold_bytes,
             max_memory_bytes: self.max_memory_bytes,
             spool_dir,
+            spool_usable,
             skip_action: self.skip_action,
             checksum: self.checksum,
             cutoff,

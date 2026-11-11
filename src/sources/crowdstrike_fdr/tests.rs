@@ -522,6 +522,7 @@ pub(super) fn settings() -> Settings {
         spool_dir: std::env::temp_dir().join("vector-crowdstrike-fdr-tests"),
         max_memory_bytes: 512 * 1024 * 1024,
         skip_action: super::SkipAction::Delete,
+        spool_usable: true,
         checksum: ChecksumMode::Verify,
         cutoff: None,
         route_lookups: true,

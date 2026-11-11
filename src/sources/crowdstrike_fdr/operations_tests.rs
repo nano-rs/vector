@@ -506,7 +506,7 @@ async fn start_from_release_never_deletes_skipped_batches() {
     let (old, new, data) = old_and_new();
     let queue = MockQueue::with(
         vec![message("m-old-rel", &old), message("m-new-rel", &new)],
-        true,
+        false,
     );
     let store = MockStore::with(
         vec![
@@ -537,8 +537,19 @@ async fn start_from_release_never_deletes_skipped_batches() {
             .contains(&Call::Delete("m-new-rel#1".to_owned()))
     })
     .await;
-    // Re-delivered (count 2, 3) and still released, never processed or deleted.
-    until("released three times", || released(&queue, "m-old-rel#3")).await;
+    // Re-delivered (count 2, and 5: past max_tries) and still released, never processed,
+    // deleted or parked (a parked message gets no call at all).
+    until("first release", || released(&queue, "m-old-rel#1")).await;
+    for count in [2, 5] {
+        let mut again = message("m-old-rel", &old);
+        again.receipt = format!("m-old-rel#{count}");
+        again.receive_count = count;
+        queue.inbox.lock().unwrap().push_back(again);
+        until("released again", || {
+            released(&queue, &format!("m-old-rel#{count}"))
+        })
+        .await;
+    }
     tokio::time::sleep(Duration::from_mins(5)).await;
     assert_eq!(queue.deletes(), 1, "only the new batch is deleted");
     assert_eq!(gets(&queue, "cid0/data/o/part-0.gz"), 0, "never downloaded");
@@ -602,4 +613,120 @@ fn acknowledgement_warning_points_at_the_sinks() {
         "{text}"
     );
     assert!(text.contains("source-level `acknowledgements` option is deprecated"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// nano.9 review M1: no usable spool directory
+
+/// Objects of `lines` padded events for manifest `batch` (files `0..files`).
+fn padded_objects(batch: i64, files: usize, lines: usize) -> Vec<(String, Bytes)> {
+    (0..files)
+        .map(|file| {
+            let lines: Vec<String> = (0..lines)
+                .map(|line| {
+                    format!(
+                        r#"{{"f":{},"l":{line},"pad":"{line:0>24}"}}"#,
+                        batch * 100 + i64::try_from(file).unwrap()
+                    )
+                })
+                .collect();
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            (format!("cid0/data/{batch}/part-{file:05}.gz"), gzip(&refs))
+        })
+        .collect()
+}
+
+/// Without a writable spool directory, objects are held in memory only: when the budget is
+/// taken, a manifest waits for memory instead of spooling (which would fail and release the
+/// batch). Two manifests compete for room for one object at a time, with `file_concurrency`
+/// 16, an object of unlisted size among them, and a stalling pipeline: everything is delivered
+/// once, nothing is released, and nothing deadlocks.
+#[tokio::test]
+async fn without_a_usable_spool_manifests_wait_for_memory() {
+    let locked = tempfile::tempdir().unwrap();
+    let first = padded_objects(1, 4, 300);
+    let second = padded_objects(2, 4, 300);
+    let largest = first
+        .iter()
+        .chain(&second)
+        .map(|(_, data)| data.len())
+        .max()
+        .unwrap();
+    let budget = largest.div_ceil(1024) * 1024 + 1024;
+    let mut second_entries: Vec<String> = second
+        .iter()
+        .map(|(key, data)| file_entry(key, data))
+        .collect();
+    // The manifest does not list this object's size: it reserves spool_threshold_bytes.
+    second_entries[1] = format!(r#"{{"path":"{}"}}"#, second[1].0);
+    let queue = MockQueue::with(
+        vec![
+            message("m-nospool-1", &body_for(&first)),
+            message(
+                "m-nospool-2",
+                &manifest_body(Utc::now().timestamp_millis(), &second_entries),
+            ),
+        ],
+        false,
+    );
+    let all: Vec<(String, Bytes)> = first.iter().chain(&second).cloned().collect();
+    let store = mock_store(&all, &queue, None);
+    let mut config = settings();
+    config.file_concurrency = 16;
+    config.max_memory_bytes = budget;
+    config.spool_threshold_bytes = budget;
+    config.checksum = super::ChecksumMode::Warn;
+    config.spool_usable = false;
+    config.spool_dir = locked.path().join("missing").join("spool");
+    std::fs::write(locked.path().join("missing"), b"not a directory").unwrap();
+    let mut harness = start_with(
+        Arc::clone(&queue),
+        store,
+        config,
+        None,
+        Arc::new(Completions::in_memory()),
+        10,
+    );
+
+    let seen = tokio::time::timeout(
+        Duration::from_mins(1),
+        drain(&mut harness, 2400, EventStatus::Delivered),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("not every event arrived; calls: {:?}", queue.calls()));
+    assert_each_once(&seen);
+    until("both deleted", || queue.deletes() == 2).await;
+    assert!(
+        !queue
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Visibility(_, RETRY_DELAY))),
+        "nothing released"
+    );
+    harness.stop().await;
+}
+
+/// Without a usable spool, an object that can never fit in `max_memory_bytes` fails at once
+/// (its batch is released) instead of waiting forever.
+#[tokio::test(start_paused = true)]
+async fn without_a_usable_spool_an_object_too_large_for_memory_fails() {
+    let objects = padded_objects(3, 1, 300);
+    let queue = MockQueue::with(vec![message("m-nospool-big", &body_for(&objects))], false);
+    let store = mock_store(&objects, &queue, None);
+    let mut config = settings();
+    config.max_memory_bytes = 1024;
+    config.spool_threshold_bytes = 1024;
+    config.spool_usable = false;
+    config.spool_dir = std::path::PathBuf::from("/nonexistent/vector-fdr-spool");
+    let harness = start_with(
+        Arc::clone(&queue),
+        store,
+        config,
+        None,
+        Arc::new(Completions::in_memory()),
+        10_000,
+    );
+    until("release", || released(&queue, "m-nospool-big#1")).await;
+    assert_eq!(queue.deletes(), 0);
+    harness.stop().await;
 }

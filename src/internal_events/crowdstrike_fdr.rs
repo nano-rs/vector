@@ -81,6 +81,7 @@ impl InternalEvent for CrowdstrikeFdrManifest<'_> {
 pub struct CrowdstrikeFdrMetrics {
     _counters: Vec<metrics::Counter>,
     _gauges: Vec<metrics::Gauge>,
+    _histograms: Vec<metrics::Histogram>,
 }
 
 impl CrowdstrikeFdrMetrics {
@@ -113,9 +114,13 @@ impl CrowdstrikeFdrMetrics {
             gauge.increment(0.0);
             gauges.push(gauge);
         }
+        // Registered without a sample (a zero would skew the distribution); the handle keeps
+        // it from expiring once the first batch records one.
+        let histograms = vec![histogram!(HistogramName::CrowdstrikeFdrBatchLagSeconds)];
         Self {
             _counters: counters,
             _gauges: gauges,
+            _histograms: histograms,
         }
     }
 }
