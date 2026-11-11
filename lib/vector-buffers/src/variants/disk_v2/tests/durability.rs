@@ -7,9 +7,9 @@
 //! point and the next flush lost a record the sender had already been told was durable.
 //!
 //! The guarantee these tests pin is process-death durability: an acknowledged record has been
-//! written into the data file (the kernel page cache). It is not a host-crash guarantee: the
-//! data file is still `fsync`ed only every `flush_interval` (500 ms by default), so a power loss
-//! or kernel crash can lose up to that window of acknowledged records.
+//! written into the data file (the kernel page cache). Host-crash durability (the data file and
+//! ledger are `fsync`ed before a record a source waits on is acknowledged) is NAN-5285, pinned in
+//! `host_crash.rs`.
 
 use std::{
     io,

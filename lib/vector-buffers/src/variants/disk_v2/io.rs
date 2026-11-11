@@ -115,6 +115,22 @@ pub trait Filesystem: Send + Sync {
         path: &'a Path,
     ) -> impl Future<Output = io::Result<Vec<PathBuf>>> + Send + 'a;
 
+    /// Synchronizes a directory, so that files created in it survive a host crash (NAN-5285).
+    ///
+    /// The default does nothing, for filesystems without directory entries to persist.
+    ///
+    /// # Errors
+    ///
+    /// If an I/O error occurred when attempting to synchronize the directory, an error variant
+    /// will be returned describing the underlying error.
+    fn sync_directory<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> impl Future<Output = io::Result<()>> + Send + 'a {
+        let _ = path;
+        std::future::ready(Ok(()))
+    }
+
     /// Returns whether the buffer should spawn its periodic stale data file cleanup task.
     fn supports_background_cleanup(&self) -> bool {
         true
@@ -219,6 +235,25 @@ impl Filesystem for ProductionFilesystem {
         path: &'a Path,
     ) -> impl Future<Output = io::Result<()>> + Send + 'a {
         tokio::fs::remove_file(path)
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn sync_directory<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> impl Future<Output = io::Result<()>> + Send + 'a {
+        async move {
+            #[cfg(unix)]
+            {
+                let dir = path.to_path_buf();
+                tokio::task::spawn_blocking(move || std::fs::File::open(&dir)?.sync_all())
+                    .await
+                    .map_err(io::Error::other)??;
+            }
+            #[cfg(not(unix))]
+            let _ = path;
+            Ok(())
+        }
     }
 
     #[allow(clippy::manual_async_fn)]

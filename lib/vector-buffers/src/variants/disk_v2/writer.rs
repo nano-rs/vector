@@ -281,6 +281,11 @@ impl FinalizerGuard {
         self.error_on_drop = false;
     }
 
+    /// Whether a source is waiting on these finalizers (see NAN-5285 in `flush_inner`).
+    fn has_finalizers(&self) -> bool {
+        self.finalizers.has_finalizers()
+    }
+
     /// Returns the finalizers for reattachment to the recovered record on buffer-full retry.
     fn into_inner(mut self) -> EventFinalizerGroups {
         self.error_on_drop = false;
@@ -1684,6 +1689,12 @@ where
 
                 // Make sure the file is flushed to disk, especially if we just created it.
                 data_file.sync_all().await?;
+                // NAN-5285: and its directory entry, so a host crash cannot lose a new data file
+                // whose (fsynced) records were already acknowledged. Once per data file.
+                self.config
+                    .filesystem
+                    .sync_directory(&self.config.data_dir)
+                    .await?;
 
                 self.writer = Some(RecordWriter::new(
                     data_file,
@@ -2015,12 +2026,41 @@ where
             self.publish_flushed_progress(flush_result.events_flushed, flush_result.bytes_flushed);
         }
 
-        // NAN-5208: every buffered record is now in the data file; acknowledge them.
+        // NAN-5285: the bytes are in the data file, but only in the kernel page cache. A host
+        // crash (power loss, kernel panic, hard reset) before the periodic `fsync` below (every
+        // `flush_interval`, 500 ms by default) loses them, and a `Delivered` status is what
+        // acking sources report to the sender as durable (an HTTP/OTLP 2xx, a HEC ackId of true).
+        // So when a source is waiting on a pending record, sync the data file and the ledger
+        // before acknowledging it. Every record buffered since the last flush shares this one
+        // sync (group commit); records no source waits on keep the periodic sync.
+        let synced_for_ack = self
+            .pending_finalizers
+            .iter()
+            .any(FinalizerGuard::has_finalizers);
+        if synced_for_ack {
+            let synced = match self.writer.as_mut() {
+                Some(writer) => writer.sync_all().await,
+                None => Ok(()),
+            }
+            .and_then(|()| self.ledger.flush());
+            if let Err(error) = synced {
+                // The bytes may or may not be durable: resolve them Errored so the sender retries
+                // (at-least-once), never Delivered.
+                self.pending_finalizers.clear();
+                return Err(error);
+            }
+        }
+
+        // NAN-5208: every buffered record is now in the data file (and, per NAN-5285 above,
+        // synced to disk when a source waits on it); acknowledge them.
         for finalizers in self.pending_finalizers.drain(..) {
             finalizers.disarm();
         }
 
-        if self.ledger.should_flush() || force_full_flush {
+        if synced_for_ack {
+            // This flush already synced the data file and the ledger.
+            Ok(())
+        } else if self.ledger.should_flush() || force_full_flush {
             if let Some(writer) = self.writer.as_mut() {
                 writer.sync_all().await?;
             }
@@ -2035,9 +2075,10 @@ where
     ///
     /// This must be called for the reader to be able to make progress.
     ///
-    /// This does not ensure that the data is fully synchronized (i.e. `fsync`) to disk, however it
-    /// may sometimes perform a full synchronization if the time since the last full synchronization
-    /// occurred has exceeded a configured limit.
+    /// When a record written since the last flush carries a finalizer (a source with
+    /// acknowledgements waits on it), the data file and the ledger are fully synchronized
+    /// (`fsync`) before it is acknowledged (NAN-5285). Otherwise this does not synchronize, except
+    /// when the time since the last full synchronization has exceeded the configured limit.
     ///
     /// # Errors
     ///
