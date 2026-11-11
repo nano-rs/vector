@@ -580,7 +580,10 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
 
     let parsed = parse_manifest(&message.body);
     if let Ok(manifest) = &parsed {
-        if let Some(batch_time) = manifest.batch_time()
+        // Not for a parked delivery: it re-arrives every visibility timeout until the queue
+        // dead-letters it, and would skew the lag of batches actually being read.
+        if message.receive_count <= settings.max_tries
+            && let Some(batch_time) = manifest.batch_time()
             && let Ok(lag) = (Utc::now() - batch_time).to_std()
         {
             emit!(CrowdstrikeFdrBatchLag { lag });
