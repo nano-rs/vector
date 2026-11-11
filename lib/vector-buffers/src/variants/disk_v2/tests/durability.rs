@@ -81,8 +81,10 @@ async fn finalizers_resolve_only_after_the_record_reaches_the_data_file() {
                 // The caller's flush (the topology fanout flushes after every send) writes the
                 // record out, and only then may it be acknowledged.
                 writer.flush().await.expect("flush should not fail");
-                let status = receiver
-                    .try_recv()
+                // NAN-5285: the record is acknowledged once the group syncer's fsync after the
+                // flush completes, off the writer's task.
+                let status = tokio::time::timeout(Duration::from_secs(5), &mut receiver)
+                    .await
                     .unwrap_or_else(|_| panic!("record {index} was flushed but never finalized"));
                 assert_eq!(status, BatchStatus::Delivered);
                 assert!(

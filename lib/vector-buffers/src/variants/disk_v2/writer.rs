@@ -43,6 +43,87 @@ use crate::{
 };
 use vector_common::finalization::{EventFinalizerGroups, EventStatus};
 
+use super::io::DataSync;
+
+/// Records waiting for a sync of the data file they were written to (NAN-5285).
+struct SyncBatch {
+    sync: DataSync,
+    finalizers: Vec<FinalizerGuard>,
+}
+
+/// The group syncer (NAN-5285): acknowledges records once a sync that started after they were
+/// written has completed. While one sync runs, the writer keeps writing and later flushes queue
+/// their records here, so the next sync covers all of them (group commit). Without it every
+/// flush that carries an acknowledged record waited for its own sync, and a source with many
+/// concurrent requests was capped at one request per sync latency.
+///
+/// A failed sync resolves its records and every later one as Errored, and makes the writer's
+/// next flush fail: after a failed `fsync` the kernel may have dropped the dirty pages, so a later
+/// successful sync proves nothing about them.
+#[derive(Clone)]
+struct GroupSyncer {
+    batches: tokio::sync::mpsc::UnboundedSender<SyncBatch>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl fmt::Debug for GroupSyncer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupSyncer").field("failed", &self.failed()).finish()
+    }
+}
+
+impl GroupSyncer {
+    fn spawn() -> Self {
+        let (batches, mut queue) = tokio::sync::mpsc::unbounded_channel::<SyncBatch>();
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_failed = Arc::clone(&failed);
+        tokio::spawn(async move {
+            while let Some(first) = queue.recv().await {
+                let mut ready = vec![first];
+                while let Ok(more) = queue.try_recv() {
+                    ready.push(more);
+                }
+                let mut syncs: Vec<DataSync> = Vec::new();
+                for batch in &ready {
+                    if !syncs.iter().any(|known| known.same_file(&batch.sync)) {
+                        syncs.push(batch.sync.clone());
+                    }
+                }
+                let synced = !task_failed.load(std::sync::atomic::Ordering::Acquire)
+                    && matches!(
+                        tokio::task::spawn_blocking(move || syncs.iter().try_for_each(DataSync::sync))
+                            .await,
+                        Ok(Ok(()))
+                    );
+                if !synced {
+                    task_failed.store(true, std::sync::atomic::Ordering::Release);
+                }
+                for batch in ready {
+                    for finalizers in batch.finalizers {
+                        // Dropping an armed guard resolves its records as Errored.
+                        if synced {
+                            finalizers.disarm();
+                        }
+                    }
+                }
+            }
+        });
+        Self { batches, failed }
+    }
+
+    fn failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn submit(&self, batch: SyncBatch) {
+        // A closed queue (runtime shutting down) hands the batch back; dropping it resolves its
+        // records as Errored.
+        if let Err(unsent) = self.batches.send(batch) {
+            drop(unsent);
+        }
+    }
+}
+
 /// Error that occurred during calls to [`BufferWriter`].
 #[derive(Debug, Snafu)]
 pub enum WriterError<T>
@@ -941,6 +1022,10 @@ where
     /// data file. They resolve (as `Delivered`) only after the next successful flush, and as
     /// `Errored` if that flush fails or the writer is dropped first.
     pending_finalizers: Vec<FinalizerGuard>,
+    /// NAN-5285: syncs the current data file from another thread, when the file supports it.
+    data_sync: Option<DataSync>,
+    /// NAN-5285: started on the first acknowledged record that can be synced off-task.
+    group_syncer: Option<GroupSyncer>,
     _t: PhantomData<T>,
 }
 
@@ -966,6 +1051,8 @@ where
             next_record_id,
             unflushed_events: 0,
             pending_finalizers: Vec::new(),
+            data_sync: None,
+            group_syncer: None,
             _t: PhantomData,
         }
     }
@@ -1696,6 +1783,8 @@ where
                     .sync_directory(&self.config.data_dir)
                     .await?;
 
+                // NAN-5285: a handle the group syncer can sync this file through.
+                self.data_sync = data_file.data_sync().await?;
                 self.writer = Some(RecordWriter::new(
                     data_file,
                     data_file_size,
@@ -1709,6 +1798,9 @@ where
                 // file ID now to signal that the writer has moved on.
                 if should_open_next {
                     self.ledger.state().increment_writer_file_id();
+                    // NAN-5285: acknowledged records are about to land in the new file, and a
+                    // recovery only finds them if the ledger names it. Once per data file.
+                    self.ledger.flush()?;
                     self.ledger.notify_writer_waiters();
 
                     // The writer just rolled to a fresh data file, the boundary the
@@ -2001,6 +2093,11 @@ where
 
     #[instrument(skip(self), level = "debug")]
     async fn flush_inner(&mut self, force_full_flush: bool) -> io::Result<()> {
+        if self.group_syncer.as_ref().is_some_and(GroupSyncer::failed) {
+            // NAN-5285: a sync failed; see `GroupSyncer`.
+            self.pending_finalizers.clear();
+            return Err(io::Error::other("disk buffer data file sync failed"));
+        }
         // We always flush the `BufWriter` when this is called, but we don't always flush to disk or
         // flush the ledger.  This is enough for readers on Linux since the file ends up in the page
         // cache, as we don't do any O_DIRECT fanciness, and the new contents can be immediately
@@ -2037,6 +2134,15 @@ where
             .pending_finalizers
             .iter()
             .any(FinalizerGuard::has_finalizers);
+        if synced_for_ack && let Some(sync) = self.data_sync.clone() {
+            // Hand the records to the group syncer and return: the writer keeps writing while
+            // the sync runs, and the source hears Delivered once it has completed.
+            let finalizers = std::mem::take(&mut self.pending_finalizers);
+            self.group_syncer
+                .get_or_insert_with(GroupSyncer::spawn)
+                .submit(SyncBatch { sync, finalizers });
+            return Ok(());
+        }
         if synced_for_ack {
             let synced = match self.writer.as_mut() {
                 Some(writer) => writer.sync_all().await,

@@ -26,7 +26,7 @@ use crate::{
     test::{SizedRecord, with_temp_dir},
     variants::disk_v2::{
         Buffer, DiskBufferConfigBuilder,
-        io::{AsyncFile, Filesystem, Metadata, ProductionFilesystem},
+        io::{AsyncFile, DataSync, Filesystem, Metadata, ProductionFilesystem},
     },
 };
 
@@ -35,9 +35,27 @@ use crate::{
 struct PageCacheFs {
     synced: Arc<Mutex<HashMap<PathBuf, u64>>>,
     syncs: Arc<Mutex<u64>>,
+    /// Offer the group syncer an off-task sync handle (the production path); `false` exercises
+    /// the inline fallback for files without one.
+    off_task_sync: bool,
+    /// Make every off-task sync fail.
+    fail_syncs: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PageCacheFs {
+    fn group_synced() -> Self {
+        Self {
+            off_task_sync: true,
+            ..Self::default()
+        }
+    }
+
+    fn record_sync(&self, path: &Path) {
+        let len = std::fs::metadata(path).map_or(0, |m| m.len());
+        self.synced.lock().unwrap().insert(path.to_path_buf(), len);
+        *self.syncs.lock().unwrap() += 1;
+    }
+
     fn sync_count(&self) -> u64 {
         *self.syncs.lock().unwrap()
     }
@@ -103,10 +121,25 @@ impl AsyncFile for PageCacheFile {
 
     async fn sync_all(&self) -> io::Result<()> {
         AsyncFile::sync_all(&self.inner).await?;
-        let len = std::fs::metadata(&self.path).map_or(0, |m| m.len());
-        self.fs.synced.lock().unwrap().insert(self.path.clone(), len);
-        *self.fs.syncs.lock().unwrap() += 1;
+        self.fs.record_sync(&self.path);
         Ok(())
+    }
+
+    /// The group syncer's off-task sync records what it made durable, like `sync_all`.
+    async fn data_sync(&self) -> io::Result<Option<DataSync>> {
+        if !self.fs.off_task_sync {
+            return Ok(None);
+        }
+        let file = self.inner.try_clone().await?.into_std().await;
+        let (fs, path) = (self.fs.clone(), self.path.clone());
+        Ok(Some(DataSync::new(move || {
+            if fs.fail_syncs.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(io::Error::other("injected sync failure"));
+            }
+            file.sync_data()?;
+            fs.record_sync(&path);
+            Ok(())
+        })))
     }
 }
 
@@ -161,13 +194,24 @@ impl Filesystem for PageCacheFs {
     }
 }
 
+async fn acknowledged_status(status: vector_common::finalization::BatchStatusReceiver) -> BatchStatus {
+    tokio::time::timeout(std::time::Duration::from_secs(5), status)
+        .await
+        .expect("the flushed record should be acknowledged")
+}
+
 #[tokio::test]
 async fn an_acknowledged_record_survives_a_host_crash() {
+    for fs in [PageCacheFs::group_synced(), PageCacheFs::default()] {
+        acknowledged_record_survives_a_host_crash(fs).await;
+    }
+}
+
+async fn acknowledged_record_survives_a_host_crash(fs: PageCacheFs) {
     with_temp_dir(|dir| {
         let data_dir = dir.to_path_buf();
 
         async move {
-            let fs = PageCacheFs::default();
             let config = DiskBufferConfigBuilder::from_path(data_dir.clone())
                 .filesystem(fs.clone())
                 .build()
@@ -177,7 +221,7 @@ async fn an_acknowledged_record_survives_a_host_crash() {
                     .await
                     .expect("should not fail to create buffer");
 
-            let (batch, mut status) = BatchNotifier::new_with_receiver();
+            let (batch, status) = BatchNotifier::new_with_receiver();
             let mut record = SizedRecord::new(64);
             record.add_batch_notifier(batch);
             writer
@@ -185,11 +229,7 @@ async fn an_acknowledged_record_survives_a_host_crash() {
                 .await
                 .expect("write should not fail");
             writer.flush().await.expect("flush should not fail");
-            assert_eq!(
-                status.try_recv(),
-                Ok(BatchStatus::Delivered),
-                "the flushed record should be acknowledged"
-            );
+            assert_eq!(acknowledged_status(status).await, BatchStatus::Delivered);
 
             // The sender now holds a 2xx. Pull the plug.
             drop(writer);
@@ -224,7 +264,7 @@ async fn records_no_source_waits_on_keep_the_periodic_sync() {
         let data_dir = dir.to_path_buf();
 
         async move {
-            let fs = PageCacheFs::default();
+            let fs = PageCacheFs::group_synced();
             let config = DiskBufferConfigBuilder::from_path(data_dir)
                 .filesystem(fs.clone())
                 .build()
@@ -256,7 +296,7 @@ async fn records_no_source_waits_on_keep_the_periodic_sync() {
             );
 
             // One acknowledged record among many costs exactly one sync: group commit.
-            let (batch, mut status) = BatchNotifier::new_with_receiver();
+            let (batch, status) = BatchNotifier::new_with_receiver();
             let mut tracked = SizedRecord::new(64);
             tracked.add_batch_notifier(batch);
             for _ in 0..4 {
@@ -270,8 +310,93 @@ async fn records_no_source_waits_on_keep_the_periodic_sync() {
                 .await
                 .expect("write should not fail");
             writer.flush().await.expect("flush should not fail");
-            assert_eq!(status.try_recv(), Ok(BatchStatus::Delivered));
+            assert_eq!(acknowledged_status(status).await, BatchStatus::Delivered);
             assert_eq!(fs.sync_count(), after_open + 1);
+        }
+    })
+    .await;
+}
+
+/// Group commit across flushes: while one sync runs, later flushes queue their records and the
+/// writer keeps going, so many flushes share few syncs instead of one sync each.
+#[tokio::test]
+async fn concurrent_flushes_share_syncs() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let fs = PageCacheFs::group_synced();
+            let config = DiskBufferConfigBuilder::from_path(data_dir)
+                .filesystem(fs.clone())
+                .build()
+                .expect("creating buffer should not fail");
+            let (mut writer, _reader, _ledger) =
+                Buffer::from_config_inner(config, BufferUsageHandle::noop())
+                    .await
+                    .expect("should not fail to create buffer");
+            let before = fs.sync_count();
+            let mut statuses = Vec::new();
+            for _ in 0..200 {
+                let (batch, status) = BatchNotifier::new_with_receiver();
+                let mut record = SizedRecord::new(64);
+                record.add_batch_notifier(batch);
+                writer
+                    .write_record(record)
+                    .await
+                    .expect("write should not fail");
+                // The flush returns without waiting for the sync.
+                writer.flush().await.expect("flush should not fail");
+                statuses.push(status);
+            }
+            for status in statuses {
+                assert_eq!(acknowledged_status(status).await, BatchStatus::Delivered);
+            }
+            let syncs = fs.sync_count() - before;
+            assert!(
+                syncs < 200,
+                "200 acknowledged flushes took {syncs} syncs: no group commit"
+            );
+        }
+    })
+    .await;
+}
+
+/// A failed sync never acknowledges, and the writer refuses to carry on as if it had succeeded.
+#[tokio::test]
+async fn a_failed_group_sync_never_acknowledges() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let fs = PageCacheFs::group_synced();
+            let config = DiskBufferConfigBuilder::from_path(data_dir)
+                .filesystem(fs.clone())
+                .build()
+                .expect("creating buffer should not fail");
+            let (mut writer, _reader, _ledger) =
+                Buffer::from_config_inner(config, BufferUsageHandle::noop())
+                    .await
+                    .expect("should not fail to create buffer");
+            writer
+                .write_record(SizedRecord::new(64))
+                .await
+                .expect("write should not fail");
+            writer.flush().await.expect("flush should not fail");
+            fs.fail_syncs.store(true, std::sync::atomic::Ordering::Release);
+
+            let (batch, status) = BatchNotifier::new_with_receiver();
+            let mut record = SizedRecord::new(64);
+            record.add_batch_notifier(batch);
+            writer
+                .write_record(record)
+                .await
+                .expect("write should not fail");
+            writer.flush().await.expect("flush should not fail");
+            assert_eq!(acknowledged_status(status).await, BatchStatus::Errored);
+            assert!(
+                writer.flush().await.is_err(),
+                "after a failed sync the writer must not report success"
+            );
         }
     })
     .await;

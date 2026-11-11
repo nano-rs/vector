@@ -2,7 +2,40 @@ use std::{
     future::Future,
     io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
+
+/// A blocking sync of one open data file, runnable off the writer's task (NAN-5285). The disk
+/// buffer's group syncer calls it from a blocking thread while the writer keeps writing, so one
+/// sync covers every record written before it started.
+#[derive(Clone)]
+pub struct DataSync(Arc<dyn Fn() -> io::Result<()> + Send + Sync>);
+
+impl DataSync {
+    pub fn new(sync: impl Fn() -> io::Result<()> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(sync))
+    }
+
+    /// Syncs the file. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// If the sync fails, an error variant is returned.
+    pub fn sync(&self) -> io::Result<()> {
+        (self.0)()
+    }
+
+    /// Whether both handles sync the same open file.
+    pub fn same_file(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for DataSync {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DataSync")
+    }
+}
 
 use tokio::{
     fs::OpenOptions,
@@ -163,6 +196,16 @@ pub trait AsyncFile: AsyncRead + AsyncWrite + Send + Sync {
     /// If an I/O error occurred when attempting to synchronize the file data and metadata to disk,
     /// an error variant will be returned describing the underlying error.
     async fn sync_all(&self) -> io::Result<()>;
+
+    /// A handle that syncs this file's data from another thread, if the file supports it
+    /// (NAN-5285). `None` makes the writer sync inline on its own task instead.
+    ///
+    /// # Errors
+    ///
+    /// If the file handle cannot be duplicated, an error variant is returned.
+    async fn data_sync(&self) -> io::Result<Option<DataSync>> {
+        Ok(None)
+    }
 }
 
 pub trait ReadableMemoryMap: AsRef<[u8]> + Send + Sync {}
@@ -345,6 +388,11 @@ impl AsyncFile for tokio::fs::File {
 
     async fn sync_all(&self) -> io::Result<()> {
         self.sync_all().await
+    }
+
+    async fn data_sync(&self) -> io::Result<Option<DataSync>> {
+        let file = self.try_clone().await?.into_std().await;
+        Ok(Some(DataSync::new(move || file.sync_data())))
     }
 }
 
