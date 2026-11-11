@@ -61,7 +61,12 @@ impl Variant {
                 id,
             } => {
                 builder.stage(
-                    DiskV2Buffer::new(id.clone(), data_dir.clone(), *max_size),
+                    DiskV2Buffer::new(
+                        id.clone(),
+                        data_dir.clone(),
+                        *max_size,
+                        crate::AcknowledgementDurability::default(),
+                    ),
                     *when_full,
                 );
             }

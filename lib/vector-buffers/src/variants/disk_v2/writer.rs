@@ -33,7 +33,7 @@ use super::{
 };
 
 use crate::{
-    Bufferable,
+    AcknowledgementDurability, Bufferable,
     encoding::{AsMetadata, Encodable},
     variants::disk_v2::{
         io::AsyncFile,
@@ -2130,20 +2130,27 @@ where
         // So when a source is waiting on a pending record, sync the data file and the ledger
         // before acknowledging it. Every record buffered since the last flush shares this one
         // sync (group commit); records no source waits on keep the periodic sync.
-        let synced_for_ack = self
-            .pending_finalizers
-            .iter()
-            .any(FinalizerGuard::has_finalizers);
+        // `acknowledgement_durability = "page_cache"` opts out: acknowledge once in the data file.
+        let synced_for_ack = self.config.acknowledgement_durability
+            == AcknowledgementDurability::Fsync
+            && self
+                .pending_finalizers
+                .iter()
+                .any(FinalizerGuard::has_finalizers);
+        let mut handed_off = false;
         if synced_for_ack && let Some(sync) = self.data_sync.clone() {
-            // Hand the records to the group syncer and return: the writer keeps writing while
-            // the sync runs, and the source hears Delivered once it has completed.
+            // Hand the records to the group syncer: the writer keeps writing while the sync runs,
+            // and the source hears Delivered once it has completed. The periodic data file and
+            // ledger sync below still runs, so a steady stream of acknowledged records cannot
+            // starve the ledger (reader progress, file IDs) of its `flush_interval` msync, nor
+            // skip a forced full flush (data file rollover).
             let finalizers = std::mem::take(&mut self.pending_finalizers);
             self.group_syncer
                 .get_or_insert_with(GroupSyncer::spawn)
                 .submit(SyncBatch { sync, finalizers });
-            return Ok(());
+            handed_off = true;
         }
-        if synced_for_ack {
+        if synced_for_ack && !handed_off {
             let synced = match self.writer.as_mut() {
                 Some(writer) => writer.sync_all().await,
                 None => Ok(()),
@@ -2163,8 +2170,8 @@ where
             finalizers.disarm();
         }
 
-        if synced_for_ack {
-            // This flush already synced the data file and the ledger.
+        if synced_for_ack && !handed_off {
+            // This flush already synced the data file and the ledger inline.
             Ok(())
         } else if self.ledger.should_flush() || force_full_flush {
             if let Some(writer) = self.writer.as_mut() {

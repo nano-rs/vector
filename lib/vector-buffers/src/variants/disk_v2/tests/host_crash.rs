@@ -22,6 +22,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use vector_common::finalization::{AddBatchNotifier, BatchNotifier, BatchStatus};
 
 use crate::{
+    AcknowledgementDurability,
     buffer_usage_data::BufferUsageHandle,
     test::{SizedRecord, with_temp_dir},
     variants::disk_v2::{
@@ -45,6 +46,8 @@ struct PageCacheFs {
     fail_syncs: Arc<std::sync::atomic::AtomicBool>,
     /// The ledger's bytes as of its last `msync` (or its open).
     mmap_synced: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
+    /// How many times the ledger was msynced.
+    ledger_flushes: Arc<Mutex<u64>>,
 }
 
 /// The ledger's writable mapping, remembering what each `flush` (msync) made durable.
@@ -76,6 +79,7 @@ impl WritableMemoryMap for PageCacheMmap {
             .lock()
             .unwrap()
             .insert(self.path.clone(), self.inner.as_ref().to_vec());
+        *self.fs.ledger_flushes.lock().unwrap() += 1;
         Ok(())
     }
 }
@@ -515,6 +519,103 @@ async fn acknowledged_records_across_data_files_survive_a_host_crash() {
                         .expect("reading should not fail");
                 assert_eq!(recovered, Some(SizedRecord::new(size)));
             }
+        }
+    })
+    .await;
+}
+
+/// `acknowledgement_durability = "page_cache"` (the operator opt-out) acknowledges once the record
+/// is in the data file, with no sync per flush: the pre-NAN-5285 behavior.
+#[tokio::test]
+async fn page_cache_durability_acknowledges_without_a_sync() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let fs = PageCacheFs::group_synced();
+            let config = DiskBufferConfigBuilder::from_path(data_dir)
+                .filesystem(fs.clone())
+                .acknowledgement_durability(AcknowledgementDurability::PageCache)
+                .build()
+                .expect("creating buffer should not fail");
+            let (mut writer, _reader, _ledger) =
+                Buffer::from_config_inner(config, BufferUsageHandle::noop())
+                    .await
+                    .expect("should not fail to create buffer");
+            writer
+                .write_record(SizedRecord::new(64))
+                .await
+                .expect("write should not fail");
+            writer.flush().await.expect("flush should not fail");
+            let after_open = fs.sync_count();
+
+            for _ in 0..16 {
+                let (batch, mut status) = BatchNotifier::new_with_receiver();
+                let mut record = SizedRecord::new(64);
+                record.add_batch_notifier(batch);
+                writer
+                    .write_record(record)
+                    .await
+                    .expect("write should not fail");
+                writer.flush().await.expect("flush should not fail");
+                // Acknowledged by the flush itself, not by a later sync.
+                assert_eq!(status.try_recv(), Ok(BatchStatus::Delivered));
+            }
+            assert_eq!(
+                fs.sync_count(),
+                after_open,
+                "page_cache durability must not sync per acknowledged flush"
+            );
+        }
+    })
+    .await;
+}
+
+/// A steady stream of acknowledged records (every flush handed to the group syncer) must not
+/// starve the ledger of its periodic `flush_interval` msync, which persists reader progress.
+#[tokio::test]
+async fn acknowledged_traffic_keeps_the_periodic_ledger_sync() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let fs = PageCacheFs::group_synced();
+            let config = DiskBufferConfigBuilder::from_path(data_dir)
+                .filesystem(fs.clone())
+                .flush_interval(std::time::Duration::ZERO)
+                .build()
+                .expect("creating buffer should not fail");
+            let (mut writer, _reader, _ledger) =
+                Buffer::from_config_inner(config, BufferUsageHandle::noop())
+                    .await
+                    .expect("should not fail to create buffer");
+            writer
+                .write_record(SizedRecord::new(64))
+                .await
+                .expect("write should not fail");
+            writer.flush().await.expect("flush should not fail");
+            let before = *fs.ledger_flushes.lock().unwrap();
+
+            let mut statuses = Vec::new();
+            for _ in 0..8 {
+                let (batch, status) = BatchNotifier::new_with_receiver();
+                let mut record = SizedRecord::new(64);
+                record.add_batch_notifier(batch);
+                writer
+                    .write_record(record)
+                    .await
+                    .expect("write should not fail");
+                writer.flush().await.expect("flush should not fail");
+                statuses.push(status);
+            }
+            for status in statuses {
+                assert_eq!(acknowledged_status(status).await, BatchStatus::Delivered);
+            }
+            let ledger_flushes = *fs.ledger_flushes.lock().unwrap() - before;
+            assert!(
+                ledger_flushes >= 8,
+                "the periodic ledger msync was skipped on acknowledged flushes ({ledger_flushes} of 8)"
+            );
         }
     })
     .await;
