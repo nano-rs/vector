@@ -82,6 +82,7 @@ fn create_disk_v2_variant(_max_events: usize, max_size: u64) -> BufferType {
     BufferType::DiskV2 {
         max_size: NonZeroU64::new(max_size).unwrap(),
         when_full: WhenFull::DropNewest,
+        acknowledgement_durability: vector_buffers::AcknowledgementDurability::default(),
     }
 }
 

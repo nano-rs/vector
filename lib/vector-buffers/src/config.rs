@@ -12,7 +12,7 @@ use vector_common::{config::ComponentKey, finalization::Finalizable};
 use vector_config::configurable_component;
 
 use crate::{
-    Bufferable, WhenFull,
+    AcknowledgementDurability, Bufferable, WhenFull,
     topology::{
         builder::{TopologyBuilder, TopologyError},
         channel::{BufferReceiver, BufferSender},
@@ -38,7 +38,13 @@ enum BufferTypeKind {
     DiskV2,
 }
 
-const ALL_FIELDS: [&str; 4] = ["type", "max_events", "max_size", "when_full"];
+const ALL_FIELDS: [&str; 5] = [
+    "type",
+    "max_events",
+    "max_size",
+    "when_full",
+    "acknowledgement_durability",
+];
 
 struct BufferTypeVisitor;
 
@@ -51,6 +57,7 @@ impl BufferTypeVisitor {
         let mut max_events: Option<NonZeroUsize> = None;
         let mut max_size: Option<NonZeroU64> = None;
         let mut when_full: Option<WhenFull> = None;
+        let mut acknowledgement_durability: Option<AcknowledgementDurability> = None;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "type" => {
@@ -77,6 +84,12 @@ impl BufferTypeVisitor {
                     }
                     when_full = Some(map.next_value()?);
                 }
+                "acknowledgement_durability" => {
+                    if acknowledgement_durability.is_some() {
+                        return Err(de::Error::duplicate_field("acknowledgement_durability"));
+                    }
+                    acknowledgement_durability = Some(map.next_value()?);
+                }
                 other => {
                     return Err(de::Error::unknown_field(other, &ALL_FIELDS));
                 }
@@ -86,6 +99,12 @@ impl BufferTypeVisitor {
         let when_full = when_full.unwrap_or_default();
         match kind {
             BufferTypeKind::Memory => {
+                if acknowledgement_durability.is_some() {
+                    return Err(de::Error::unknown_field(
+                        "acknowledgement_durability",
+                        &["type", "max_events", "max_size", "when_full"],
+                    ));
+                }
                 let size = match (max_events, max_size) {
                     (Some(_), Some(_)) => {
                         return Err(de::Error::unknown_field(
@@ -117,12 +136,13 @@ impl BufferTypeVisitor {
                 if max_events.is_some() {
                     return Err(de::Error::unknown_field(
                         "max_events",
-                        &["type", "max_size", "when_full"],
+                        &["type", "max_size", "when_full", "acknowledgement_durability"],
                     ));
                 }
                 Ok(BufferType::DiskV2 {
                     max_size: max_size.ok_or_else(|| de::Error::missing_field("max_size"))?,
                     when_full,
+                    acknowledgement_durability: acknowledgement_durability.unwrap_or_default(),
                 })
             }
         }
@@ -238,7 +258,8 @@ pub enum BufferType {
     /// This is less performant, but more durable. Data that has been synchronized to disk will not
     /// be lost if Vector is restarted forcefully or crashes.
     ///
-    /// Data is synchronized to disk every 500ms.
+    /// Data is synchronized to disk every 500ms, and before a record that a source with end-to-end
+    /// acknowledgements waits on is acknowledged (see `acknowledgement_durability`).
     #[configurable(title = "Events are buffered on disk.")]
     #[serde(rename = "disk")]
     DiskV2 {
@@ -253,6 +274,15 @@ pub enum BufferType {
 
         #[serde(default)]
         when_full: WhenFull,
+
+        /// When a record that a source with end-to-end acknowledgements waits on is acknowledged.
+        ///
+        /// `fsync` (the default) acknowledges after the data file is synced to disk, so the
+        /// acknowledgement survives a host crash. `page_cache` acknowledges once the record is in
+        /// the data file (the kernel page cache): faster, but a host crash can lose up to 500 ms
+        /// of acknowledged records.
+        #[serde(default)]
+        acknowledgement_durability: AcknowledgementDurability,
     },
 }
 
@@ -318,9 +348,13 @@ impl BufferType {
             BufferType::DiskV2 {
                 when_full,
                 max_size,
+                acknowledgement_durability,
             } => {
                 let data_dir = data_dir.ok_or(BufferBuildError::RequiresDataDir)?;
-                builder.stage(DiskV2Buffer::new(id, data_dir, max_size), when_full);
+                builder.stage(
+                    DiskV2Buffer::new(id, data_dir, max_size, acknowledgement_durability),
+                    when_full,
+                );
             }
         }
 
@@ -570,7 +604,28 @@ max_events: 42
             BufferType::DiskV2 {
                 max_size: NonZeroU64::new(1024).unwrap(),
                 when_full: WhenFull::Block,
+                acknowledgement_durability: crate::AcknowledgementDurability::default(),
             },
         );
+        check_single_stage(
+            r"
+          type: disk
+          max_size: 1024
+          acknowledgement_durability: page_cache
+          ",
+            BufferType::DiskV2 {
+                max_size: NonZeroU64::new(1024).unwrap(),
+                when_full: WhenFull::Block,
+                acknowledgement_durability: crate::AcknowledgementDurability::PageCache,
+            },
+        );
+
+        let error = serde_yaml::from_str::<BufferConfig>(
+            r"
+          type: memory
+          acknowledgement_durability: fsync
+          ",
+        );
+        assert!(error.is_err(), "acknowledgement_durability applies to disk buffers only");
     }
 }

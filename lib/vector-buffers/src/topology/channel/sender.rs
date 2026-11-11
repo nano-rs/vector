@@ -424,6 +424,7 @@ mod tests {
             BufferType::DiskV2 {
                 max_size: NonZeroU64::new(268_435_488).unwrap(),
                 when_full: WhenFull::Block,
+                acknowledgement_durability: crate::AcknowledgementDurability::default(),
             },
         ]);
         let data_dir = tempdir().unwrap();

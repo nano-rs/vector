@@ -604,6 +604,7 @@ async fn s3_disk_buffer_reload_delivers_all_events() {
     old_config.sinks[&sink_key].buffer = BufferConfig::Single(BufferType::DiskV2 {
         max_size: NonZeroU64::new(268_435_488).unwrap(),
         when_full: WhenFull::Block,
+        acknowledgement_durability: vector_lib::buffers::AcknowledgementDurability::default(),
     });
 
     // Clone config before building so we can create the reload config.
@@ -611,6 +612,7 @@ async fn s3_disk_buffer_reload_delivers_all_events() {
     new_config.sinks[&sink_key].buffer = BufferConfig::Single(BufferType::DiskV2 {
         max_size: NonZeroU64::new(536_870_912).unwrap(),
         when_full: WhenFull::Block,
+        acknowledgement_durability: vector_lib::buffers::AcknowledgementDurability::default(),
     });
 
     // 1. Start topology with initial disk buffer config.
