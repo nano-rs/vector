@@ -33,7 +33,7 @@ use super::{
 };
 
 use crate::{
-    Bufferable,
+    AcknowledgementDurability, Bufferable,
     encoding::{AsMetadata, Encodable},
     variants::disk_v2::{
         io::AsyncFile,
@@ -42,6 +42,87 @@ use crate::{
     },
 };
 use vector_common::finalization::{EventFinalizerGroups, EventStatus};
+
+use super::io::DataSync;
+
+/// Records waiting for a sync of the data file they were written to (NAN-5285).
+struct SyncBatch {
+    sync: DataSync,
+    finalizers: Vec<FinalizerGuard>,
+}
+
+/// The group syncer (NAN-5285): acknowledges records once a sync that started after they were
+/// written has completed. While one sync runs, the writer keeps writing and later flushes queue
+/// their records here, so the next sync covers all of them (group commit). Without it every
+/// flush that carries an acknowledged record waited for its own sync, and a source with many
+/// concurrent requests was capped at one request per sync latency.
+///
+/// A failed sync resolves its records and every later one as Errored, and makes the writer's
+/// next flush fail: after a failed `fsync` the kernel may have dropped the dirty pages, so a later
+/// successful sync proves nothing about them.
+#[derive(Clone)]
+struct GroupSyncer {
+    batches: tokio::sync::mpsc::UnboundedSender<SyncBatch>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl fmt::Debug for GroupSyncer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupSyncer").field("failed", &self.failed()).finish()
+    }
+}
+
+impl GroupSyncer {
+    fn spawn() -> Self {
+        let (batches, mut queue) = tokio::sync::mpsc::unbounded_channel::<SyncBatch>();
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_failed = Arc::clone(&failed);
+        tokio::spawn(async move {
+            while let Some(first) = queue.recv().await {
+                let mut ready = vec![first];
+                while let Ok(more) = queue.try_recv() {
+                    ready.push(more);
+                }
+                let mut syncs: Vec<DataSync> = Vec::new();
+                for batch in &ready {
+                    if !syncs.iter().any(|known| known.same_file(&batch.sync)) {
+                        syncs.push(batch.sync.clone());
+                    }
+                }
+                let synced = !task_failed.load(std::sync::atomic::Ordering::Acquire)
+                    && matches!(
+                        tokio::task::spawn_blocking(move || syncs.iter().try_for_each(DataSync::sync))
+                            .await,
+                        Ok(Ok(()))
+                    );
+                if !synced {
+                    task_failed.store(true, std::sync::atomic::Ordering::Release);
+                }
+                for batch in ready {
+                    for finalizers in batch.finalizers {
+                        // Dropping an armed guard resolves its records as Errored.
+                        if synced {
+                            finalizers.disarm();
+                        }
+                    }
+                }
+            }
+        });
+        Self { batches, failed }
+    }
+
+    fn failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn submit(&self, batch: SyncBatch) {
+        // A closed queue (runtime shutting down) hands the batch back; dropping it resolves its
+        // records as Errored.
+        if let Err(unsent) = self.batches.send(batch) {
+            drop(unsent);
+        }
+    }
+}
 
 /// Error that occurred during calls to [`BufferWriter`].
 #[derive(Debug, Snafu)]
@@ -279,6 +360,11 @@ impl FinalizerGuard {
     /// disk — both cases where the upstream source should ack rather than retry.
     fn disarm(mut self) {
         self.error_on_drop = false;
+    }
+
+    /// Whether a source is waiting on these finalizers (see NAN-5285 in `flush_inner`).
+    fn has_finalizers(&self) -> bool {
+        self.finalizers.has_finalizers()
     }
 
     /// Returns the finalizers for reattachment to the recovered record on buffer-full retry.
@@ -936,6 +1022,10 @@ where
     /// data file. They resolve (as `Delivered`) only after the next successful flush, and as
     /// `Errored` if that flush fails or the writer is dropped first.
     pending_finalizers: Vec<FinalizerGuard>,
+    /// NAN-5285: syncs the current data file from another thread, when the file supports it.
+    data_sync: Option<DataSync>,
+    /// NAN-5285: started on the first acknowledged record that can be synced off-task.
+    group_syncer: Option<GroupSyncer>,
     _t: PhantomData<T>,
 }
 
@@ -961,6 +1051,8 @@ where
             next_record_id,
             unflushed_events: 0,
             pending_finalizers: Vec::new(),
+            data_sync: None,
+            group_syncer: None,
             _t: PhantomData,
         }
     }
@@ -1684,7 +1776,15 @@ where
 
                 // Make sure the file is flushed to disk, especially if we just created it.
                 data_file.sync_all().await?;
+                // NAN-5285: and its directory entry, so a host crash cannot lose a new data file
+                // whose (fsynced) records were already acknowledged. Once per data file.
+                self.config
+                    .filesystem
+                    .sync_directory(&self.config.data_dir)
+                    .await?;
 
+                // NAN-5285: a handle the group syncer can sync this file through.
+                self.data_sync = data_file.data_sync().await?;
                 self.writer = Some(RecordWriter::new(
                     data_file,
                     data_file_size,
@@ -1698,6 +1798,9 @@ where
                 // file ID now to signal that the writer has moved on.
                 if should_open_next {
                     self.ledger.state().increment_writer_file_id();
+                    // NAN-5285: acknowledged records are about to land in the new file, and a
+                    // recovery only finds them if the ledger names it. Once per data file.
+                    self.ledger.flush()?;
                     self.ledger.notify_writer_waiters();
 
                     // The writer just rolled to a fresh data file, the boundary the
@@ -1990,6 +2093,11 @@ where
 
     #[instrument(skip(self), level = "debug")]
     async fn flush_inner(&mut self, force_full_flush: bool) -> io::Result<()> {
+        if self.group_syncer.as_ref().is_some_and(GroupSyncer::failed) {
+            // NAN-5285: a sync failed; see `GroupSyncer`.
+            self.pending_finalizers.clear();
+            return Err(io::Error::other("disk buffer data file sync failed"));
+        }
         // We always flush the `BufWriter` when this is called, but we don't always flush to disk or
         // flush the ledger.  This is enough for readers on Linux since the file ends up in the page
         // cache, as we don't do any O_DIRECT fanciness, and the new contents can be immediately
@@ -2015,12 +2123,57 @@ where
             self.publish_flushed_progress(flush_result.events_flushed, flush_result.bytes_flushed);
         }
 
-        // NAN-5208: every buffered record is now in the data file; acknowledge them.
+        // NAN-5285: the bytes are in the data file, but only in the kernel page cache. A host
+        // crash (power loss, kernel panic, hard reset) before the periodic `fsync` below (every
+        // `flush_interval`, 500 ms by default) loses them, and a `Delivered` status is what
+        // acking sources report to the sender as durable (an HTTP/OTLP 2xx, a HEC ackId of true).
+        // So when a source is waiting on a pending record, sync the data file and the ledger
+        // before acknowledging it. Every record buffered since the last flush shares this one
+        // sync (group commit); records no source waits on keep the periodic sync.
+        // `acknowledgement_durability = "page_cache"` opts out: acknowledge once in the data file.
+        let synced_for_ack = self.config.acknowledgement_durability
+            == AcknowledgementDurability::Fsync
+            && self
+                .pending_finalizers
+                .iter()
+                .any(FinalizerGuard::has_finalizers);
+        let mut handed_off = false;
+        if synced_for_ack && let Some(sync) = self.data_sync.clone() {
+            // Hand the records to the group syncer: the writer keeps writing while the sync runs,
+            // and the source hears Delivered once it has completed. The periodic data file and
+            // ledger sync below still runs, so a steady stream of acknowledged records cannot
+            // starve the ledger (reader progress, file IDs) of its `flush_interval` msync, nor
+            // skip a forced full flush (data file rollover).
+            let finalizers = std::mem::take(&mut self.pending_finalizers);
+            self.group_syncer
+                .get_or_insert_with(GroupSyncer::spawn)
+                .submit(SyncBatch { sync, finalizers });
+            handed_off = true;
+        }
+        if synced_for_ack && !handed_off {
+            let synced = match self.writer.as_mut() {
+                Some(writer) => writer.sync_all().await,
+                None => Ok(()),
+            }
+            .and_then(|()| self.ledger.flush());
+            if let Err(error) = synced {
+                // The bytes may or may not be durable: resolve them Errored so the sender retries
+                // (at-least-once), never Delivered.
+                self.pending_finalizers.clear();
+                return Err(error);
+            }
+        }
+
+        // NAN-5208: every buffered record is now in the data file (and, per NAN-5285 above,
+        // synced to disk when a source waits on it); acknowledge them.
         for finalizers in self.pending_finalizers.drain(..) {
             finalizers.disarm();
         }
 
-        if self.ledger.should_flush() || force_full_flush {
+        if synced_for_ack && !handed_off {
+            // This flush already synced the data file and the ledger inline.
+            Ok(())
+        } else if self.ledger.should_flush() || force_full_flush {
             if let Some(writer) = self.writer.as_mut() {
                 writer.sync_all().await?;
             }
@@ -2035,9 +2188,10 @@ where
     ///
     /// This must be called for the reader to be able to make progress.
     ///
-    /// This does not ensure that the data is fully synchronized (i.e. `fsync`) to disk, however it
-    /// may sometimes perform a full synchronization if the time since the last full synchronization
-    /// occurred has exceeded a configured limit.
+    /// When a record written since the last flush carries a finalizer (a source with
+    /// acknowledgements waits on it), the data file and the ledger are fully synchronized
+    /// (`fsync`) before it is acknowledged (NAN-5285). Otherwise this does not synchronize, except
+    /// when the time since the last full synchronization has exceeded the configured limit.
     ///
     /// # Errors
     ///

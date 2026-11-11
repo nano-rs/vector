@@ -147,6 +147,13 @@ impl EventFinalizerGroups {
         self.0.is_empty()
     }
 
+    /// Returns `true` if any group carries a finalizer, i.e. some source is waiting on the
+    /// delivery status of at least one of these events.
+    #[must_use]
+    pub fn has_finalizers(&self) -> bool {
+        self.0.iter().any(|group| !group.is_empty())
+    }
+
     /// Consumes this value and returns the ordered finalizer groups.
     #[must_use]
     pub fn into_groups(self) -> Vec<EventFinalizers> {

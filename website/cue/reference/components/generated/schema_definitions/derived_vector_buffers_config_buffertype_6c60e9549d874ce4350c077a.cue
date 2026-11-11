@@ -1,6 +1,37 @@
 package metadata
 
 _schemaDefinitions: "derived::vector_buffers::config::BufferType::6c60e9549d874ce4350c077a": object: options: {
+	acknowledgement_durability: {
+		description: """
+			When a record that a source with end-to-end acknowledgements waits on is acknowledged.
+
+			`fsync` (the default) acknowledges after the data file is synced to disk, so the
+			acknowledgement survives a host crash. `page_cache` acknowledges once the record is in
+			the data file (the kernel page cache): faster, but a host crash can lose up to 500 ms
+			of acknowledged records.
+			"""
+		relevant_when: "type = \"disk\""
+		required:      false
+		type: string: {
+			default: "fsync"
+			enum: {
+				fsync: """
+					Acknowledge once the record's data file has been `fsync`ed.
+
+					An acknowledged record survives a host crash (power loss, kernel panic, hard reset) as well
+					as a process kill. Concurrent records share one sync (group commit), but every
+					acknowledgement waits for at least one sync of the disk.
+					"""
+				page_cache: """
+					Acknowledge once the record is in the data file, in the kernel page cache.
+
+					An acknowledged record survives a process kill, but a host crash can lose up to the last
+					500 ms (the periodic sync interval) of acknowledged records. Higher throughput and lower
+					latency; choose it only if the sender's retries or a lossy window are acceptable.
+					"""
+			}
+		}
+	}
 	max_events: {
 		description:   "The maximum number of events allowed in the buffer."
 		relevant_when: "type = \"memory\""
@@ -28,7 +59,8 @@ _schemaDefinitions: "derived::vector_buffers::config::BufferType::6c60e9549d874c
 					This is less performant, but more durable. Data that has been synchronized to disk will not
 					be lost if Vector is restarted forcefully or crashes.
 
-					Data is synchronized to disk every 500ms.
+					Data is synchronized to disk every 500ms, and before a record that a source with end-to-end
+					acknowledgements waits on is acknowledged (see `acknowledgement_durability`).
 					"""
 				memory: """
 					Events are buffered in memory.

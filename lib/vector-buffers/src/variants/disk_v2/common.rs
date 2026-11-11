@@ -4,6 +4,7 @@ use std::{
 };
 
 use crc32fast::Hasher;
+use crate::AcknowledgementDurability;
 use snafu::Snafu;
 
 use super::{
@@ -179,6 +180,10 @@ pub struct DiskBufferConfig<FS> {
     /// amount of data written since the last flush would be lost.
     pub(crate) flush_interval: Duration,
 
+    /// When a record a source waits on is acknowledged: after an `fsync` of its data file
+    /// (default), or once it is in the page cache (NAN-5285).
+    pub(crate) acknowledgement_durability: AcknowledgementDurability,
+
     /// Filesystem implementation for opening data files.
     ///
     /// We allow parameterizing the filesystem implementation for ease of testing.  The "filesystem"
@@ -199,6 +204,7 @@ where
     pub(crate) max_record_size: Option<usize>,
     pub(crate) write_buffer_size: Option<usize>,
     pub(crate) flush_interval: Option<Duration>,
+    pub(crate) acknowledgement_durability: AcknowledgementDurability,
     pub(crate) filesystem: FS,
 }
 
@@ -214,6 +220,7 @@ impl DiskBufferConfigBuilder {
             max_record_size: None,
             write_buffer_size: None,
             flush_interval: None,
+            acknowledgement_durability: AcknowledgementDurability::default(),
             filesystem: ProductionFilesystem,
         }
     }
@@ -312,8 +319,17 @@ where
             max_record_size: self.max_record_size,
             write_buffer_size: self.write_buffer_size,
             flush_interval: self.flush_interval,
+            acknowledgement_durability: self.acknowledgement_durability,
             filesystem,
         }
+    }
+
+    /// Sets when a record a source waits on is acknowledged (NAN-5285).
+    ///
+    /// Defaults to [`AcknowledgementDurability::Fsync`].
+    pub fn acknowledgement_durability(mut self, durability: AcknowledgementDurability) -> Self {
+        self.acknowledgement_durability = durability;
+        self
     }
 
     /// Consumes this builder and constructs a `DiskBufferConfig`.
@@ -437,6 +453,7 @@ where
             max_record_size,
             write_buffer_size,
             flush_interval,
+            acknowledgement_durability: self.acknowledgement_durability,
             filesystem,
         })
     }
