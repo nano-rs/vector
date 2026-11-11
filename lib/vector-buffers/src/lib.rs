@@ -78,6 +78,28 @@ pub enum WhenFull {
     Overflow,
 }
 
+/// When a disk buffer acknowledges a record that a source with end-to-end acknowledgements is
+/// waiting on (an HTTP or OTLP 2xx, a HEC ackId of true) (NAN-5285).
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcknowledgementDurability {
+    /// Acknowledge once the record's data file has been `fsync`ed.
+    ///
+    /// An acknowledged record survives a host crash (power loss, kernel panic, hard reset) as well
+    /// as a process kill. Concurrent records share one sync (group commit), but every
+    /// acknowledgement waits for at least one sync of the disk.
+    #[default]
+    Fsync,
+
+    /// Acknowledge once the record is in the data file, in the kernel page cache.
+    ///
+    /// An acknowledged record survives a process kill, but a host crash can lose up to the last
+    /// 500 ms (the periodic sync interval) of acknowledged records. Higher throughput and lower
+    /// latency; choose it only if the sender's retries or a lossy window are acceptable.
+    PageCache,
+}
+
 #[cfg(test)]
 impl Arbitrary for WhenFull {
     fn arbitrary(g: &mut Gen) -> Self {
