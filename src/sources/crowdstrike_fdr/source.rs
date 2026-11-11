@@ -135,6 +135,9 @@ pub(super) struct Settings {
     /// Total memory for objects held between download and emission; past it, objects spool.
     pub(super) max_memory_bytes: usize,
     pub(super) spool_dir: PathBuf,
+    /// Whether the startup probe could write to `spool_dir`. When it could not, objects are
+    /// only ever held in memory, and a manifest waits for memory instead of spooling.
+    pub(super) spool_usable: bool,
     /// What `start_from` does with an older batch.
     pub(super) skip_action: SkipAction,
     pub(super) checksum: ChecksumMode,
@@ -575,14 +578,26 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
         message_id: &message.id,
     });
 
-    if message.receive_count > settings.max_tries {
-        // A parked batch pins the cursor (until restart): it was never delivered. One left on
-        // the queue only because it is older than `start_from` (`skip_action = release`) is
-        // not meant to be delivered, so it does not.
-        if let Ok(manifest) = parse_manifest(&message.body)
-            && !(settings.skip_action == SkipAction::Release
-                && older_than_cutoff(settings, &manifest))
+    let parsed = parse_manifest(&message.body);
+    if let Ok(manifest) = &parsed {
+        // Not for a parked delivery: it re-arrives every visibility timeout until the queue
+        // dead-letters it, and would skew the lag of batches actually being read.
+        if message.receive_count <= settings.max_tries
+            && let Some(batch_time) = manifest.batch_time()
+            && let Ok(lag) = (Utc::now() - batch_time).to_std()
         {
+            emit!(CrowdstrikeFdrBatchLag { lag });
+        }
+        // Before the `max_tries` check: a batch `start_from` skips (released, with
+        // `skip_action = release`, on every delivery) is skipped, not parked.
+        if skip_old_batch(&shared, &message, manifest, &batch_key(manifest)).await {
+            return;
+        }
+    }
+
+    if message.receive_count > settings.max_tries {
+        // A parked batch pins the cursor (until restart): it was never delivered.
+        if let Ok(manifest) = &parsed {
             shared
                 .pins
                 .lock()
@@ -597,7 +612,7 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
         return;
     }
 
-    let manifest = match parse_manifest(&message.body) {
+    let manifest = match parsed {
         Ok(manifest) => manifest,
         Err(error) => {
             emit!(CrowdstrikeFdrError {
@@ -618,15 +633,7 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
         }
     };
 
-    if let Some(batch_time) = manifest.batch_time()
-        && let Ok(lag) = (Utc::now() - batch_time).to_std()
-    {
-        emit!(CrowdstrikeFdrBatchLag { lag });
-    }
     let key = batch_key(&manifest);
-    if skip_old_batch(&shared, &message, &manifest, &key).await {
-        return;
-    }
     info!(
         message = "FDR batch received.",
         message_id = %message.id,
@@ -1088,18 +1095,45 @@ async fn emit_files<Q: Queue, O: ObjectStore>(
         while fetching.len() < window
             && let Some(&index) = next.peek()
         {
-            let slot = if fetching.is_empty() {
+            // Without a usable spool directory an object can only be held in memory, so its
+            // memory is reserved here, under the same rule as the slot.
+            let memory_kib = (!shared.settings.spool_usable)
+                .then(|| memory_only_kib(&shared.settings, manifest.files[index].size))
+                .flatten();
+            let (slot, memory) = if fetching.is_empty() {
                 tokio::select! {
-                    permit = Arc::clone(&shared.file_slots).acquire_owned() => {
-                        permit.expect("semaphore is never closed")
-                    }
+                    permits = async {
+                        let slot = Arc::clone(&shared.file_slots)
+                            .acquire_owned()
+                            .await
+                            .expect("semaphore is never closed");
+                        let memory = match memory_kib {
+                            Some(kib) => Some(
+                                Arc::clone(&shared.memory_budget)
+                                    .acquire_many_owned(kib)
+                                    .await
+                                    .expect("semaphore is never closed"),
+                            ),
+                            None => None,
+                        };
+                        (slot, memory)
+                    } => permits,
                     _ = shutdown.clone() => return Err(FileError::ShuttingDown),
                 }
             } else {
-                match Arc::clone(&shared.file_slots).try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => break,
-                }
+                let Ok(slot) = Arc::clone(&shared.file_slots).try_acquire_owned() else {
+                    break;
+                };
+                let memory = match memory_kib {
+                    Some(kib) => {
+                        match Arc::clone(&shared.memory_budget).try_acquire_many_owned(kib) {
+                            Ok(permit) => Some(permit),
+                            Err(_) => break,
+                        }
+                    }
+                    None => None,
+                };
+                (slot, memory)
             };
             if shutdown.clone().now_or_never().is_some() {
                 return Err(FileError::ShuttingDown);
@@ -1111,6 +1145,7 @@ async fn emit_files<Q: Queue, O: ObjectStore>(
                     manifest.bucket.clone(),
                     manifest.files[index].clone(),
                     slot,
+                    memory,
                 )
                 .in_current_span(),
             );
@@ -1234,13 +1269,13 @@ struct Downloaded {
 
 enum Body {
     /// In memory, holding its share of the memory budget until emitted.
-    Memory(Bytes, OwnedSemaphorePermit),
+    Memory(Bytes, Option<OwnedSemaphorePermit>),
     Spool(SpoolFile),
 }
 
 /// What an object being emitted holds until it is done.
 enum Held {
-    Memory(#[allow(dead_code, reason = "held for its drop")] OwnedSemaphorePermit),
+    Memory(#[allow(dead_code, reason = "held for its drop")] Option<OwnedSemaphorePermit>),
     Spool(#[allow(dead_code, reason = "held for its drop")] SpoolFile),
 }
 
@@ -1288,11 +1323,12 @@ const SPOOL_BUFFER: usize = 256 * 1024;
 
 /// Where a download goes: memory up to `spool_threshold_bytes`, then a spool file.
 enum Sink {
-    /// Held in memory, within `limit` bytes covered by `permit` (the memory budget).
+    /// Held in memory, within `limit` bytes covered by `permit` (the memory budget), or by a
+    /// reservation the caller holds when `permit` is `None`.
     Memory {
         buffer: Vec<u8>,
         limit: usize,
-        permit: OwnedSemaphorePermit,
+        permit: Option<OwnedSemaphorePermit>,
     },
     Spool(SpoolWriter),
 }
@@ -1328,6 +1364,20 @@ impl Sink {
             Self::Spool(writer) => writer.finish().await.map(Body::Spool),
         }
     }
+}
+
+/// The memory (KiB) to reserve for an object when nothing can spool: its listed size (even
+/// past `spool_threshold_bytes`), or the threshold when unlisted. `None` when it could never
+/// fit in `max_memory_bytes`; the download then fails with a spool error.
+fn memory_only_kib(settings: &Settings, size: Option<u64>) -> Option<u32> {
+    let wanted = match size {
+        Some(size) => usize::try_from(size).ok()?,
+        None => settings.spool_threshold_bytes,
+    };
+    let kib = wanted.div_ceil(1024).max(1);
+    (kib <= settings.max_memory_bytes / 1024)
+        .then(|| u32::try_from(kib).ok())
+        .flatten()
 }
 
 /// Reserves memory for one object, or `None` to spool it: objects larger than
@@ -1368,9 +1418,15 @@ async fn fetch_object<Q: Queue, O: ObjectStore>(
     bucket: String,
     file: ManifestFile,
     slot: OwnedSemaphorePermit,
+    memory: Option<OwnedSemaphorePermit>,
 ) -> Result<Fetched, FileError> {
     let settings = &shared.settings;
     let key = &file.path;
+    // A reservation made by the manifest (no usable spool) is kept across tries: giving it
+    // back between tries could leave this object, the head of its manifest, waiting for memory
+    // held by the objects queued behind it.
+    let preset = memory.as_ref().map(|permit| permit.num_permits() * 1024);
+    let mut memory = memory;
 
     // Fail closed before downloading when the checksum cannot be verified at all.
     let expected = match settings.checksum {
@@ -1394,8 +1450,11 @@ async fn fetch_object<Q: Queue, O: ObjectStore>(
     let max_tries = settings.fetch_max_tries.max(1);
     let mut tries = 1;
     loop {
-        match download(&shared, &bucket, &file, expected.as_ref()).await {
-            Ok((object, bytes)) => {
+        match download(&shared, &bucket, &file, expected.as_ref(), preset).await {
+            Ok((mut object, bytes)) => {
+                if let Body::Memory(_, held @ None) = &mut object.body {
+                    *held = memory.take();
+                }
                 emit!(CrowdstrikeFdrFileFetched { key, bytes });
                 return Ok(Fetched { object, slot });
             }
@@ -1435,6 +1494,7 @@ async fn download<Q: Queue, O: ObjectStore>(
     bucket: &str,
     file: &ManifestFile,
     expected: Option<&Expected>,
+    preset: Option<usize>,
 ) -> Result<(Downloaded, u64), FileError> {
     let settings = &shared.settings;
     let key = file.path.as_str();
@@ -1461,7 +1521,11 @@ async fn download<Q: Queue, O: ObjectStore>(
         key: key.to_owned(),
         error: format!("{error} (in {})", settings.spool_dir.display()),
     };
-    let mut sink = match memory_reservation(shared, file.size) {
+    let reservation = match preset {
+        Some(limit) => Some((limit, None)),
+        None => memory_reservation(shared, file.size).map(|(limit, permit)| (limit, Some(permit))),
+    };
+    let mut sink = match reservation {
         Some((limit, permit)) => Sink::Memory {
             buffer: Vec::with_capacity(
                 file.size

@@ -353,8 +353,10 @@ generated: components: sources: crowdstrike_fdr: configuration: {
 			not fit spools even below this threshold. Spooled objects take disk instead: up to
 			`file_concurrency` times `max_object_bytes` in the worst case (FDR objects are about
 			30-35 MB, so typically `file_concurrency` times that). If the spool directory is not
-			writable, the source logs an error at startup and every spooled object fails (releasing
-			its batch).
+			writable, the source logs an error at startup and holds objects in memory only: a
+			manifest then waits for memory instead of spooling, and only an object that can never
+			fit in `max_memory_bytes` (or one of unlisted size that grows past this threshold)
+			fails, releasing its batch.
 			"""
 		required: false
 		type: uint: {
