@@ -26,7 +26,10 @@ use crate::{
     test::{SizedRecord, with_temp_dir},
     variants::disk_v2::{
         Buffer, DiskBufferConfigBuilder,
-        io::{AsyncFile, DataSync, Filesystem, Metadata, ProductionFilesystem},
+        io::{
+            AsyncFile, DataSync, Filesystem, Metadata, ProductionFilesystem, ReadableMemoryMap,
+            WritableMemoryMap,
+        },
     },
 };
 
@@ -40,6 +43,41 @@ struct PageCacheFs {
     off_task_sync: bool,
     /// Make every off-task sync fail.
     fail_syncs: Arc<std::sync::atomic::AtomicBool>,
+    /// The ledger's bytes as of its last `msync` (or its open).
+    mmap_synced: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
+}
+
+/// The ledger's writable mapping, remembering what each `flush` (msync) made durable.
+struct PageCacheMmap {
+    inner: memmap2::MmapMut,
+    path: PathBuf,
+    fs: PageCacheFs,
+}
+
+impl AsRef<[u8]> for PageCacheMmap {
+    fn as_ref(&self) -> &[u8] {
+        self.inner.as_ref()
+    }
+}
+
+impl AsMut<[u8]> for PageCacheMmap {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.inner.as_mut()
+    }
+}
+
+impl ReadableMemoryMap for PageCacheMmap {}
+
+impl WritableMemoryMap for PageCacheMmap {
+    fn flush(&self) -> io::Result<()> {
+        self.inner.flush()?;
+        self.fs
+            .mmap_synced
+            .lock()
+            .unwrap()
+            .insert(self.path.clone(), self.inner.as_ref().to_vec());
+        Ok(())
+    }
 }
 
 impl PageCacheFs {
@@ -71,6 +109,10 @@ impl PageCacheFs {
             let durable = synced.get(&path).copied().unwrap_or(0);
             let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             file.set_len(durable).unwrap();
+        }
+        // The ledger loses every update since its last msync.
+        for (path, bytes) in self.mmap_synced.lock().unwrap().iter() {
+            std::fs::write(path, bytes).unwrap();
         }
     }
 }
@@ -156,7 +198,7 @@ impl PageCacheFs {
 impl Filesystem for PageCacheFs {
     type File = PageCacheFile;
     type MemoryMap = <ProductionFilesystem as Filesystem>::MemoryMap;
-    type MutableMemoryMap = <ProductionFilesystem as Filesystem>::MutableMemoryMap;
+    type MutableMemoryMap = PageCacheMmap;
 
     async fn open_file_writable(&self, path: &Path) -> io::Result<PageCacheFile> {
         let inner = ProductionFilesystem.open_file_writable(path).await?;
@@ -178,7 +220,17 @@ impl Filesystem for PageCacheFs {
     }
 
     async fn open_mmap_writable(&self, path: &Path) -> io::Result<Self::MutableMemoryMap> {
-        ProductionFilesystem.open_mmap_writable(path).await
+        let inner = ProductionFilesystem.open_mmap_writable(path).await?;
+        self.mmap_synced
+            .lock()
+            .unwrap()
+            .entry(path.to_path_buf())
+            .or_insert_with(|| inner.as_ref().to_vec());
+        Ok(PageCacheMmap {
+            inner,
+            path: path.to_path_buf(),
+            fs: self.clone(),
+        })
     }
 
     async fn truncate_file(&self, path: &Path, size: u64) -> io::Result<()> {
@@ -397,6 +449,72 @@ async fn a_failed_group_sync_never_acknowledges() {
                 writer.flush().await.is_err(),
                 "after a failed sync the writer must not report success"
             );
+        }
+    })
+    .await;
+}
+
+/// Acknowledged records that span a move to a new data file survive a crash too: the ledger
+/// (which names the writer's current file) is synced when the writer moves on.
+#[tokio::test]
+async fn acknowledged_records_across_data_files_survive_a_host_crash() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let fs = PageCacheFs::group_synced();
+            let config = DiskBufferConfigBuilder::from_path(data_dir.clone())
+                .filesystem(fs.clone())
+                .max_data_file_size(256)
+                .max_record_size(192)
+                .build()
+                .expect("creating buffer should not fail");
+            let (mut writer, reader, ledger) =
+                Buffer::from_config_inner(config, BufferUsageHandle::noop())
+                    .await
+                    .expect("should not fail to create buffer");
+            let sizes = [96u32, 97, 98, 99, 100];
+            for size in sizes {
+                let (batch, status) = BatchNotifier::new_with_receiver();
+                let mut record = SizedRecord::new(size);
+                record.add_batch_notifier(batch);
+                writer
+                    .write_record(record)
+                    .await
+                    .expect("write should not fail");
+                writer.flush().await.expect("flush should not fail");
+                assert_eq!(acknowledged_status(status).await, BatchStatus::Delivered);
+            }
+            let data_files = std::fs::read_dir(&data_dir)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref().unwrap().path().extension().and_then(|x| x.to_str()) == Some("dat")
+                })
+                .count();
+            assert!(data_files > 1, "the records should span data files ({data_files})");
+
+            drop(writer);
+            drop(reader);
+            drop(ledger);
+            fs.crash(&data_dir);
+
+            let config = DiskBufferConfigBuilder::from_path(data_dir)
+                .max_data_file_size(256)
+                .max_record_size(192)
+                .build()
+                .expect("creating buffer should not fail");
+            let (_writer, mut reader, _ledger) =
+                Buffer::<SizedRecord>::from_config_inner(config, BufferUsageHandle::noop())
+                    .await
+                    .expect("the buffer should reopen after the crash");
+            for size in sizes {
+                let recovered =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), reader.next())
+                        .await
+                        .unwrap_or_else(|_| panic!("record of size {size} lost by the crash"))
+                        .expect("reading should not fail");
+                assert_eq!(recovered, Some(SizedRecord::new(size)));
+            }
         }
     })
     .await;
