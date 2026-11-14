@@ -50,6 +50,17 @@ impl RetryLogic for ClickhouseRetryLogic {
             );
         }
 
+        // nano (NAN-5390): an authentication or access refusal is an operator error
+        // (wrong password, user dropped, grant regression, user `networks` that no
+        // longer admit this host), never a property of the batch. Upstream's default
+        // strategy treats the 401/403 ClickHouse answers with as permanent and drops
+        // the batch, after the source has already acknowledged it. Retry it instead,
+        // so the batch stays in the sink's buffer and `when_full = "block"` applies
+        // back-pressure until access is restored.
+        if let Some(reason) = access_refusal(status, response.response.body()) {
+            return RetryAction::Retry(reason.into());
+        }
+
         match status {
             StatusCode::INTERNAL_SERVER_ERROR => {
                 let body = response.response.body();
@@ -73,6 +84,39 @@ impl RetryLogic for ClickhouseRetryLogic {
             _ => RetryStrategy::Default.retry_action(status),
         }
     }
+}
+
+/// ClickHouse error codes that mean "this user may not do this right now", whatever HTTP
+/// status the server mapped them to: `UNKNOWN_USER` (192), `WRONG_PASSWORD` (193),
+/// `REQUIRED_PASSWORD` (194), `IP_ADDRESS_NOT_ALLOWED` (195), `ACCESS_DENIED` (497) and
+/// `AUTHENTICATION_FAILED` (516).
+const ACCESS_REFUSAL_CODES: [u32; 6] = [192, 193, 194, 195, 497, 516];
+
+/// Parses the leading `Code: <n>.` of a ClickHouse error body.
+fn clickhouse_error_code(body: &[u8]) -> Option<u32> {
+    let rest = body.strip_prefix(b"Code: ")?;
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()
+}
+
+/// Returns a retry reason when the response is an authentication or access refusal (nano,
+/// NAN-5390): HTTP 401 or 403, or any error whose body carries one of
+/// [`ACCESS_REFUSAL_CODES`].
+fn access_refusal(status: StatusCode, body: &[u8]) -> Option<String> {
+    if status.is_success() {
+        return None;
+    }
+    let code = clickhouse_error_code(body);
+    let refused = matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        || code.is_some_and(|code| ACCESS_REFUSAL_CODES.contains(&code));
+    if !refused {
+        return None;
+    }
+    let detail = String::from_utf8_lossy(&body[..body.len().min(512)]);
+    Some(format!(
+        "ClickHouse refused access ({status}); the batch is held and retried until access is restored: {}",
+        detail.trim_end()
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +267,87 @@ mod tests {
         url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect()
+    }
+
+    fn response(status: StatusCode, body: &'static str) -> HttpResponse {
+        HttpResponse {
+            events_byte_size: GroupedCountByteSize::new_untagged(),
+            raw_byte_size: 0,
+            response: http_1::Response::builder()
+                .status(status)
+                .body(Bytes::from_static(body.as_bytes()))
+                .unwrap(),
+        }
+    }
+
+    fn retries(status: StatusCode, body: &'static str) -> bool {
+        matches!(
+            ClickhouseRetryLogic.should_retry_response(&response(status, body)),
+            RetryAction::Retry(_)
+        )
+    }
+
+    // NAN-5390: auth and access refusals are held and retried, never dropped.
+    #[test]
+    fn access_refusals_are_retried() {
+        assert!(retries(
+            StatusCode::FORBIDDEN,
+            "Code: 516. DB::Exception: nanosiem: Authentication failed: password is incorrect, or there is no user with such name. (AUTHENTICATION_FAILED)"
+        ));
+        assert!(retries(StatusCode::UNAUTHORIZED, ""));
+        assert!(retries(
+            StatusCode::FORBIDDEN,
+            "Code: 497. DB::Exception: nanosiem: Not enough privileges. (ACCESS_DENIED)"
+        ));
+        for code in ACCESS_REFUSAL_CODES {
+            let body: &'static str = format!("Code: {code}. DB::Exception: refused").leak();
+            assert!(
+                retries(StatusCode::INTERNAL_SERVER_ERROR, body),
+                "{code} on 500"
+            );
+            assert!(retries(StatusCode::BAD_REQUEST, body), "{code} on 400");
+        }
+    }
+
+    #[test]
+    fn data_errors_still_not_retried() {
+        assert!(!retries(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Code: 117. DB::Exception: incorrect data"
+        ));
+        assert!(!retries(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Code: 53. DB::Exception: type mismatch"
+        ));
+        // Code 19 must not be read as a prefix of 192..195.
+        assert!(!retries(
+            StatusCode::BAD_REQUEST,
+            "Code: 19. DB::Exception: x"
+        ));
+        assert!(!retries(
+            StatusCode::BAD_REQUEST,
+            "Code: 27. DB::Exception: parse"
+        ));
+        assert!(retries(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Code: 241. memory"
+        ));
+        assert!(matches!(
+            ClickhouseRetryLogic.should_retry_response(&response(StatusCode::OK, "")),
+            RetryAction::Successful
+        ));
+    }
+
+    #[test]
+    fn parses_clickhouse_error_code() {
+        assert_eq!(
+            clickhouse_error_code(b"Code: 516. DB::Exception"),
+            Some(516)
+        );
+        assert_eq!(clickhouse_error_code(b"Code: 19. x"), Some(19));
+        assert_eq!(clickhouse_error_code(b"code: 516."), None);
+        assert_eq!(clickhouse_error_code(b"Code: ."), None);
+        assert_eq!(clickhouse_error_code(b""), None);
     }
 
     #[test]
