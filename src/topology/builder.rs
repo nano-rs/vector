@@ -697,7 +697,13 @@ impl<'a> Builder<'a> {
                     self.errors.push(format!("Sink \"{key}\": {error}"));
                     return;
                 }
-                Ok((tx, rx)) => (tx, Arc::new(Mutex::new(Some(rx.into_stream())))),
+                Ok((tx, rx)) => {
+                    // nano (NAN-5567): opt-in hold of `Errored` records in a disk buffer.
+                    if sink.inner.hold_errored_in_disk_buffer() {
+                        rx.hold_errored_records();
+                    }
+                    (tx, Arc::new(Mutex::new(Some(rx.into_stream()))))
+                }
             }
         };
 
@@ -711,6 +717,7 @@ impl<'a> Builder<'a> {
             app_name: crate::get_app_name().to_string(),
             app_name_slug: crate::get_slugified_app_name(),
             extra_context: self.extra_context.clone(),
+            key: Some(key.clone()),
         };
 
         let (sink, healthcheck) = match sink.build(cx).await {

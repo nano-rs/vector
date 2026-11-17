@@ -15,6 +15,9 @@ pub enum CounterName {
     ComponentTimedOutEventsTotal,
     ComponentTimedOutRequestsTotal,
     ComponentLoadShedRequestsTotal,
+    // nano (NAN-5567): events a sink wrote to its dead-letter store, and dead-letter data discarded.
+    ComponentDeadLetteredEventsTotal,
+    ComponentDeadLetterDiscardedEventsTotal,
     BufferReceivedEventsTotal,
     BufferReceivedBytesTotal,
     BufferSentEventsTotal,
@@ -212,6 +215,8 @@ impl HistogramName {
 #[strum(serialize_all = "snake_case")]
 pub enum GaugeName {
     ComponentLatencyMeanSeconds,
+    // nano (NAN-5567): bytes currently held in a sink's dead-letter store.
+    ComponentDeadLetterBytes,
     ComponentRequestActive,
     ComponentRequestConcurrencyLimit,
     CrowdstrikeFdrInflightBytes,
@@ -304,6 +309,7 @@ impl GaugeName {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ComponentLatencyMeanSeconds => "component_latency_mean_seconds",
+            Self::ComponentDeadLetterBytes => "component_dead_letter_bytes",
             Self::ComponentRequestActive => "component_request_active",
             Self::ComponentRequestConcurrencyLimit => "component_request_concurrency_limit",
             Self::CrowdstrikeFdrInflightBytes => "crowdstrike_fdr_inflight_bytes",
@@ -404,6 +410,10 @@ impl CounterName {
             Self::ComponentSentEventBytesTotal => "component_sent_event_bytes_total",
             Self::ComponentSentBytesTotal => "component_sent_bytes_total",
             Self::ComponentDiscardedEventsTotal => "component_discarded_events_total",
+            Self::ComponentDeadLetteredEventsTotal => "component_dead_lettered_events_total",
+            Self::ComponentDeadLetterDiscardedEventsTotal => {
+                "component_dead_letter_discarded_events_total"
+            }
             Self::ComponentErrorsTotal => "component_errors_total",
             Self::ComponentTimedOutEventsTotal => "component_timed_out_events_total",
             Self::ComponentTimedOutRequestsTotal => "component_timed_out_requests_total",

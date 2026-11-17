@@ -20,7 +20,7 @@ use tokio::{
     io::AsyncWriteExt,
     sync::{Mutex, MutexGuard, Notify},
 };
-use vector_common::finalizer::OrderedFinalizer;
+use vector_common::{finalization::BatchStatus, finalizer::OrderedFinalizer};
 
 use super::{
     Filesystem,
@@ -266,6 +266,13 @@ where
     writer_done: AtomicBool,
     // Number of pending record acknowledgements that have yeet to be consumed by the reader.
     pending_acks: AtomicU64,
+    // nano (NAN-5567): latched once a record read from this buffer is finalized as `Errored`.
+    // Acknowledgements are ordered, so no record at or after the errored one may advance the
+    // durable read position; the reader stops and the restart replays them.
+    ack_hold: AtomicBool,
+    // nano (NAN-5567): whether `Errored` latches `ack_hold` (opted in by the sink). Off, `Errored`
+    // is acknowledged as upstream does.
+    hold_errored: AtomicBool,
     // The file ID offset of the reader past the acknowledged reader file ID.
     unacked_reader_file_id_offset: AtomicU16,
     // Runtime-only coordination and durable-boundary state for stale data file cleanup.
@@ -606,6 +613,55 @@ where
         self.pending_acks.swap(0, Ordering::AcqRel)
     }
 
+    /// Whether a record read from this buffer was finalized as `Errored` (nano, NAN-5567).
+    ///
+    /// Once set, no further acknowledgement is applied for the lifetime of this ledger, so the
+    /// durable read position stays before the errored record and it is replayed after a restart.
+    pub fn is_ack_held(&self) -> bool {
+        self.ack_hold.load(Ordering::Acquire)
+    }
+
+    /// Opts this buffer into holding `Errored` records (nano, NAN-5567). Set by the topology for a
+    /// sink whose `Errored` status is always transient, before its first read.
+    pub fn enable_errored_hold(&self) {
+        self.hold_errored.store(true, Ordering::Release);
+    }
+
+    /// Applies the finalization status of one record (nano, NAN-5567).
+    ///
+    /// Statuses arrive in read order (the finalizer is ordered), so this decides how far the
+    /// durable read position may advance:
+    ///
+    /// - `Delivered`: acknowledge.
+    /// - `Rejected`: a permanent failure the sink has already handled (for the ClickHouse sink,
+    ///   written to its dead-letter store). Replaying it would fail the same way forever, so it is
+    ///   acknowledged too.
+    /// - `Errored`, for a sink that opted in ([`Self::enable_errored_hold`]; otherwise it is
+    ///   acknowledged as upstream does): a transient failure. Upstream acknowledged it anyway, which advanced the read
+    ///   position past undelivered records so they were never replayed. Instead, latch a hold: this
+    ///   record and every later one stay unacknowledged, and the reader stops with
+    ///   [`ReaderError::UndeliveredRecord`](super::reader::ReaderError) so Vector restarts and
+    ///   replays them (at-least-once).
+    pub(super) fn apply_finalization(&self, status: BatchStatus, amount: u64) {
+        if self.is_ack_held() {
+            return;
+        }
+        match status {
+            BatchStatus::Delivered | BatchStatus::Rejected => self.increment_pending_acks(amount),
+            BatchStatus::Errored if !self.hold_errored.load(Ordering::Acquire) => {
+                self.increment_pending_acks(amount);
+            }
+            BatchStatus::Errored => {
+                self.ack_hold.store(true, Ordering::Release);
+                error!(
+                    message = "Disk buffer record was not delivered; holding the read position so it is replayed after restart.",
+                    events = amount,
+                    data_dir = %self.config.data_dir.display(),
+                );
+            }
+        }
+    }
+
     /// Increments the unacknowledged reader file ID.
     ///
     /// As further described in `increment_acked_reader_file_id`, the underlying value here allows
@@ -837,6 +893,8 @@ where
             writer_notify: Notify::new(),
             writer_done: AtomicBool::new(false),
             pending_acks: AtomicU64::new(0),
+            ack_hold: AtomicBool::new(false),
+            hold_errored: AtomicBool::new(false),
             unacked_reader_file_id_offset: AtomicU16::new(0),
             data_file_cleanup: DataFileCleanupState::new(cleanup_reader_file_id),
             last_flush: AtomicCell::new(Instant::now()),
@@ -860,8 +918,9 @@ where
     pub(super) fn spawn_finalizer(self: Arc<Self>) -> OrderedFinalizer<u64> {
         let (finalizer, mut stream) = OrderedFinalizer::new(None);
         vector_common::spawn_in_current_span(async move {
-            while let Some((_status, amount)) = stream.next().await {
-                self.increment_pending_acks(amount);
+            while let Some((status, amount)) = stream.next().await {
+                self.apply_finalization(status, amount);
+                // Wake the reader for an acknowledgement and for a newly latched hold alike.
                 self.notify_writer_waiters();
             }
         });
@@ -907,6 +966,7 @@ where
                 &self.total_buffer_size.load(Ordering::Acquire),
             )
             .field("pending_acks", &self.pending_acks.load(Ordering::Acquire))
+            .field("ack_hold", &self.ack_hold.load(Ordering::Acquire))
             .field(
                 "unacked_reader_file_id_offset",
                 &self.unacked_reader_file_id_offset.load(Ordering::Acquire),
