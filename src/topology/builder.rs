@@ -711,6 +711,7 @@ impl<'a> Builder<'a> {
             app_name: crate::get_app_name().to_string(),
             app_name_slug: crate::get_slugified_app_name(),
             extra_context: self.extra_context.clone(),
+            key: Some(key.clone()),
         };
 
         let (sink, healthcheck) = match sink.build(cx).await {

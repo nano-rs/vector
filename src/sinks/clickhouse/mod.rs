@@ -11,6 +11,7 @@
 
 mod arrow;
 pub mod config;
+mod dead_letter;
 #[cfg(all(test, feature = "clickhouse-integration-tests"))]
 mod integration_tests;
 mod request_builder;

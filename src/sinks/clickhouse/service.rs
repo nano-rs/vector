@@ -86,6 +86,16 @@ impl RetryLogic for ClickhouseRetryLogic {
     }
 }
 
+/// Whether a final non-success response is a permanent rejection (nano, NAN-5567): the retry
+/// logic would not retry it (a 4xx, or a 500 carrying a non-retryable ClickHouse code). A response
+/// it would still retry only reaches the caller once retries are exhausted, which is transient.
+pub(super) fn is_permanent_rejection(logic: &ClickhouseRetryLogic, response: &HttpResponse) -> bool {
+    matches!(
+        logic.should_retry_response(response),
+        RetryAction::DontRetry(_)
+    )
+}
+
 /// ClickHouse error codes that mean "this user may not do this right now", whatever HTTP
 /// status the server mapped them to: `UNKNOWN_USER` (192), `WRONG_PASSWORD` (193),
 /// `REQUIRED_PASSWORD` (194), `IP_ADDRESS_NOT_ALLOWED` (195), `ACCESS_DENIED` (497) and

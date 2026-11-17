@@ -123,6 +123,17 @@ where
     /// writing logic of the buffer, or a record that does not use a symmetrical encoding scheme,
     /// which is also not supported.
     EmptyRecord,
+
+    /// A record this reader already handed to the sink was finalized as `Errored` (nano, NAN-5567).
+    ///
+    /// The sink reported a transient delivery failure for the record. The ledger holds the durable
+    /// read position before it, so the reader must stop handing out records: the sink task fails,
+    /// Vector exits non-zero, and the record is replayed from the buffer after the restart. This is
+    /// never recoverable in-process.
+    #[snafu(display(
+        "a record read from the disk buffer was finalized as errored; the buffer keeps it for replay after restart"
+    ))]
+    UndeliveredRecord,
 }
 
 impl<T> ReaderError<T>
@@ -158,6 +169,7 @@ where
             ReaderError::Incompatible { .. } => "incompatible_record_version",
             ReaderError::PartialWrite => "partial_write",
             ReaderError::EmptyRecord => "empty_record",
+            ReaderError::UndeliveredRecord => "undelivered_record",
         }
     }
 
@@ -166,7 +178,9 @@ where
         let error_code = self.as_error_code();
 
         match self {
-            ReaderError::Io { .. } | ReaderError::EmptyRecord => None,
+            ReaderError::Io { .. }
+            | ReaderError::EmptyRecord
+            | ReaderError::UndeliveredRecord => None,
             ReaderError::Deserialization { .. }
             | ReaderError::Checksum { .. }
             | ReaderError::Decode { .. }
@@ -1027,6 +1041,14 @@ where
             self.handle_pending_acknowledgements(force_check_pending_data_files)
                 .context(IoSnafu)?;
             force_check_pending_data_files = false;
+
+            // nano (NAN-5567): a record already handed to the sink came back `Errored`. Every
+            // acknowledgement before it has been applied just above; the durable read position now
+            // stays before it, so stop handing out records and let the sink task fail. The
+            // restart replays the record (and everything after it) from the buffer.
+            if self.ledger.is_ack_held() {
+                return Err(ReaderError::UndeliveredRecord);
+            }
 
             // Startup can read one valid frame beyond the durable reader checkpoint while using
             // its ID to bound a preceding corrupt frame. The underlying file cursor has already

@@ -14,6 +14,7 @@ use vector_lib::codecs::{
 use vector_lib::stream::BatcherSettings;
 
 use super::{
+    dead_letter::{DeadLetterConfig, DeadLetterService, resolve_store},
     arrow,
     request_builder::ClickhouseRequestBuilder,
     service::{ClickhouseRetryLogic, ClickhouseServiceRequestBuilder},
@@ -153,6 +154,11 @@ pub struct ClickhouseConfig {
 
     #[serde(flatten)]
     pub confinement: ConfinementConfig,
+
+    /// nano (NAN-5567): keep batches ClickHouse permanently rejects in a bounded local
+    /// dead-letter store instead of dropping them.
+    #[serde(default)]
+    pub dead_letter: DeadLetterConfig,
 }
 
 /// Query settings for the `clickhouse` sink.
@@ -316,6 +322,11 @@ impl ValidatedSink for ClickhouseConfig {
         let service = ServiceBuilder::new()
             .settings(request_limits, ClickhouseRetryLogic)
             .service(service);
+        // nano (NAN-5567): outside the retry layer, so only a batch's final outcome is judged.
+        let service = DeadLetterService::new(
+            service,
+            resolve_store(self.dead_letter, &cx, self.compression),
+        );
 
         // Resolve the encoding strategy (format + encoder) based on configuration.
         // This happens here in build because Arrow schema fetching requires network access.

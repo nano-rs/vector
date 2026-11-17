@@ -332,6 +332,10 @@ pub struct SinkContext {
     /// Extra context data provided by the running app and shared across all components. This can be
     /// used to pass shared settings or other data from outside the components.
     pub extra_context: ExtraContext,
+
+    /// nano (NAN-5567): the id of the sink being built, when built by the topology. Sinks that
+    /// keep per-sink local state (the ClickHouse dead-letter store) key it on this.
+    pub key: Option<ComponentKey>,
 }
 
 impl Default for SinkContext {
@@ -351,6 +355,7 @@ impl Default for SinkContext {
             app_name: crate::get_app_name().to_string(),
             app_name_slug: crate::get_slugified_app_name(),
             extra_context: ExtraContext::default(),
+            key: None,
         }
     }
 }
