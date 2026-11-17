@@ -389,6 +389,11 @@ impl<T: Send> HttpRequest<T> {
     pub fn take_payload(&mut self) -> Bytes {
         std::mem::take(&mut self.payload)
     }
+
+    /// The request body as built (after compression). Cloning `Bytes` is cheap.
+    pub const fn get_payload(&self) -> &Bytes {
+        &self.payload
+    }
 }
 
 impl<T: Send> Finalizable for HttpRequest<T> {

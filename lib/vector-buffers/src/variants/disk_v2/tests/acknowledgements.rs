@@ -1,12 +1,21 @@
-use std::sync::Arc;
+use std::{
+    path::Path,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use tokio_test::{assert_pending, assert_ready, task::spawn};
-use vector_common::finalization::{BatchNotifier, EventFinalizer, EventStatus};
+use vector_common::finalization::{BatchNotifier, EventFinalizer, EventStatus, Finalizable};
 
 use crate::{
     buffer_usage_data::BufferUsageHandle,
-    test::with_temp_dir,
-    variants::disk_v2::{DiskBufferConfigBuilder, ledger::Ledger},
+    test::{SizedRecord, with_temp_dir},
+    variants::disk_v2::{
+        DiskBufferConfigBuilder,
+        ledger::Ledger,
+        reader::ReaderError,
+        tests::{FilesystemUnderTest, create_default_buffer_v2},
+    },
 };
 
 pub(crate) async fn acknowledge(batch: BatchNotifier) {
@@ -79,6 +88,238 @@ async fn ack_wakes_reader() {
 
             assert!(wait_for_writer.is_woken());
             assert_ready!(wait_for_writer.poll());
+        }
+    })
+    .await;
+}
+
+/// Finalizes a record read from the buffer with the given status.
+async fn finalize(mut record: SizedRecord, status: EventStatus) {
+    record.take_finalizers().update_status(status);
+    drop(record);
+    tokio::task::yield_now().await;
+}
+
+/// Waits until every handle to a dropped buffer's ledger is gone (the background finalizer task
+/// holds one until its stream ends), so the ledger lock is free to reopen the buffer.
+async fn wait_for_ledger_release(ledger: Weak<Ledger<FilesystemUnderTest>>) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ledger.strong_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("ledger should be released after the buffer is dropped");
+}
+
+/// Writes three single-event records (sizes 64, 65, 66), reads them, and finalizes them with
+/// the given statuses. Returns the error of the next read and whether the ledger latched a hold.
+async fn write_read_and_finalize(
+    data_dir: &Path,
+    statuses: [EventStatus; 3],
+    hold_errored: bool,
+) -> (Option<ReaderError<SizedRecord>>, bool) {
+    let (mut writer, mut reader, ledger) =
+        create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+    if hold_errored {
+        ledger.enable_errored_hold();
+    }
+    for size in [64, 65, 66] {
+        writer
+            .write_record(SizedRecord::new(size))
+            .await
+            .expect("write should not fail");
+    }
+    writer.flush().await.expect("flush should not fail");
+
+    let mut records = Vec::new();
+    for _ in 0..3 {
+        records.push(
+            reader
+                .next()
+                .await
+                .expect("read should not fail")
+                .expect("record should be present"),
+        );
+    }
+    for (record, status) in records.into_iter().zip(statuses) {
+        finalize(record, status).await;
+    }
+
+    // The next read applies the pending acknowledgements. With nothing left to read and the
+    // writer still open it would wait forever, so close the writer first.
+    writer.close();
+    let next = tokio::time::timeout(Duration::from_secs(5), reader.next())
+        .await
+        .expect("read should not hang");
+    let held = ledger.is_ack_held();
+    let error = next.err();
+
+    ledger.flush().expect("ledger flush should not fail");
+    let weak = Arc::downgrade(&ledger);
+    drop(reader);
+    drop(writer);
+    drop(ledger);
+    wait_for_ledger_release(weak).await;
+
+    (error, held)
+}
+
+/// NAN-5567: a record finalized as `Errored` must not be acknowledged. The durable read
+/// position stays before it, the reader stops, and the record is the first one read after the
+/// buffer is reopened.
+#[tokio::test]
+async fn errored_record_survives_reader_restart() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (error, held) = write_read_and_finalize(
+                &data_dir,
+                [
+                    EventStatus::Delivered,
+                    EventStatus::Errored,
+                    EventStatus::Delivered,
+                ],
+                true,
+            )
+            .await;
+            assert!(held, "an errored record must latch the acknowledgement hold");
+            assert_eq!(error, Some(ReaderError::UndeliveredRecord));
+            assert!(
+                ReaderError::<SizedRecord>::UndeliveredRecord
+                    .as_recoverable_error()
+                    .is_none(),
+                "an undelivered record must stop the sink, not be skipped"
+            );
+
+            let (_writer, mut reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(&data_dir).await;
+            assert!(!ledger.is_ack_held(), "the hold is runtime-only");
+            let first = tokio::time::timeout(Duration::from_secs(5), reader.next())
+                .await
+                .expect("read should not hang")
+                .expect("read should not fail")
+                .expect("the errored record should be replayed");
+            assert_eq!(first, SizedRecord::new(65));
+            let second = tokio::time::timeout(Duration::from_secs(5), reader.next())
+                .await
+                .expect("read should not hang")
+                .expect("read should not fail")
+                .expect("records after the errored one should be replayed");
+            assert_eq!(second, SizedRecord::new(66));
+        }
+    })
+    .await;
+}
+
+/// NAN-5567: a `Rejected` record is a permanent failure the sink has already handled (written
+/// to its dead-letter store); replaying it would fail forever, so it is acknowledged.
+#[tokio::test]
+async fn rejected_record_is_acknowledged() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (error, held) = write_read_and_finalize(
+                &data_dir,
+                [
+                    EventStatus::Delivered,
+                    EventStatus::Rejected,
+                    EventStatus::Delivered,
+                ],
+                true,
+            )
+            .await;
+            assert!(!held);
+            assert_eq!(error, None);
+
+            let (mut writer, mut reader, _ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(&data_dir).await;
+            writer.close();
+            let next = tokio::time::timeout(Duration::from_secs(5), reader.next())
+                .await
+                .expect("read should not hang")
+                .expect("read should not fail");
+            assert_eq!(next, None, "every record was acknowledged");
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn errored_status_holds_later_acknowledgements() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let config = DiskBufferConfigBuilder::from_path(data_dir)
+                .build()
+                .expect("creating buffer should not fail");
+            let ledger = Ledger::load_or_create(config, BufferUsageHandle::noop())
+                .await
+                .expect("ledger should not fail to load/create");
+            let ledger = Arc::new(ledger);
+            ledger.enable_errored_hold();
+            let finalizer = ledger.spawn_finalizer();
+
+            let mut batches = Vec::new();
+            for amount in [1, 2, 4] {
+                let (batch, receiver) = BatchNotifier::new_with_receiver();
+                finalizer.add(amount, receiver);
+                batches.push(batch);
+            }
+            let statuses = [
+                EventStatus::Delivered,
+                EventStatus::Errored,
+                EventStatus::Delivered,
+            ];
+            for (batch, status) in batches.into_iter().zip(statuses) {
+                let finalizer = EventFinalizer::new(batch);
+                finalizer.update_status(status);
+                drop(finalizer);
+                tokio::task::yield_now().await;
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !ledger.is_ack_held() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the errored batch should latch the hold");
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                ledger.consume_pending_acks(),
+                1,
+                "only the record before the errored one may be acknowledged"
+            );
+        }
+    })
+    .await;
+}
+
+/// NAN-5567: without the sink's opt-in, `Errored` is acknowledged as upstream does, so a sink that
+/// reports `Errored` for deterministic failures cannot crash-loop on replay.
+#[tokio::test]
+async fn errored_record_is_acknowledged_without_opt_in() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (error, held) = write_read_and_finalize(
+                &data_dir,
+                [
+                    EventStatus::Delivered,
+                    EventStatus::Errored,
+                    EventStatus::Delivered,
+                ],
+                false,
+            )
+            .await;
+            assert!(!held);
+            assert_eq!(error, None);
         }
     })
     .await;

@@ -13,6 +13,7 @@ use vector_lib::codecs::{
 use vector_lib::stream::BatcherSettings;
 
 use super::{
+    dead_letter::{DeadLetterConfig, DeadLetterService, resolve_store},
     arrow,
     request_builder::ClickhouseRequestBuilder,
     service::{ClickhouseRetryLogic, ClickhouseServiceRequestBuilder},
@@ -152,6 +153,11 @@ pub struct ClickhouseConfig {
 
     #[serde(flatten)]
     pub confinement: ConfinementConfig,
+
+    /// nano (NAN-5567): keep batches ClickHouse permanently rejects in a bounded local
+    /// dead-letter store instead of dropping them.
+    #[serde(default)]
+    pub dead_letter: DeadLetterConfig,
 }
 
 /// Query settings for the `clickhouse` sink.
@@ -221,6 +227,13 @@ impl SinkConfig for ClickhouseConfig {
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
+    }
+
+    // nano (NAN-5567): this sink reports `Errored` only for a transient failure that outlived its
+    // retries (a permanent refusal is dead-lettered and reported `Rejected`), so holding the
+    // record for replay cannot loop on a deterministic failure.
+    fn hold_errored_in_disk_buffer(&self) -> bool {
+        true
     }
 }
 
@@ -307,6 +320,7 @@ impl ValidatedSink for ClickhouseConfig {
             query_settings: self.query_settings,
         };
 
+        let replay = std::sync::Arc::new(clickhouse_service_request_builder.clone());
         let service: HttpService<ClickhouseServiceRequestBuilder, PartitionKey> =
             HttpService::new(client.clone(), clickhouse_service_request_builder);
 
@@ -315,6 +329,12 @@ impl ValidatedSink for ClickhouseConfig {
         let service = ServiceBuilder::new()
             .settings(request_limits, ClickhouseRetryLogic)
             .service(service);
+        // nano (NAN-5567): outside the retry layer, so only a batch's final outcome is judged.
+        let service = DeadLetterService::new(
+            service,
+            resolve_store(self.dead_letter, &cx, self.compression),
+            Some(replay),
+        );
 
         // Resolve the encoding strategy (format + encoder) based on configuration.
         // This happens here in build because Arrow schema fetching requires network access.

@@ -313,6 +313,15 @@ pub trait SinkConfig:
 
     /// Gets the acknowledgements configuration for this sink.
     fn acknowledgements(&self) -> &AcknowledgementsConfig;
+
+    /// nano (NAN-5567): whether a record this sink finalizes as `Errored` is held in its disk
+    /// buffer (never acknowledged; Vector stops so the restart replays it) instead of acknowledged.
+    ///
+    /// Only a sink whose `Errored` status always means "transient, will succeed on replay" may opt
+    /// in; a sink that reports `Errored` for deterministic failures would crash-loop on replay.
+    fn hold_errored_in_disk_buffer(&self) -> bool {
+        false
+    }
 }
 
 dyn_clone::clone_trait_object!(SinkConfig);
@@ -331,6 +340,10 @@ pub struct SinkContext {
     /// Extra context data provided by the running app and shared across all components. This can be
     /// used to pass shared settings or other data from outside the components.
     pub extra_context: ExtraContext,
+
+    /// nano (NAN-5567): the id of the sink being built, when built by the topology. Sinks that
+    /// keep per-sink local state (the ClickHouse dead-letter store) key it on this.
+    pub key: Option<ComponentKey>,
 }
 
 impl Default for SinkContext {
@@ -350,6 +363,7 @@ impl Default for SinkContext {
             app_name: crate::get_app_name().to_string(),
             app_name_slug: crate::get_slugified_app_name(),
             extra_context: ExtraContext::default(),
+            key: None,
         }
     }
 }
