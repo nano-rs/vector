@@ -270,6 +270,9 @@ where
     // Acknowledgements are ordered, so no record at or after the errored one may advance the
     // durable read position; the reader stops and the restart replays them.
     ack_hold: AtomicBool,
+    // nano (NAN-5567): whether `Errored` latches `ack_hold` (opted in by the sink). Off, `Errored`
+    // is acknowledged as upstream does.
+    hold_errored: AtomicBool,
     // The file ID offset of the reader past the acknowledged reader file ID.
     unacked_reader_file_id_offset: AtomicU16,
     // Runtime-only coordination and durable-boundary state for stale data file cleanup.
@@ -618,6 +621,12 @@ where
         self.ack_hold.load(Ordering::Acquire)
     }
 
+    /// Opts this buffer into holding `Errored` records (nano, NAN-5567). Set by the topology for a
+    /// sink whose `Errored` status is always transient, before its first read.
+    pub fn enable_errored_hold(&self) {
+        self.hold_errored.store(true, Ordering::Release);
+    }
+
     /// Applies the finalization status of one record (nano, NAN-5567).
     ///
     /// Statuses arrive in read order (the finalizer is ordered), so this decides how far the
@@ -627,7 +636,8 @@ where
     /// - `Rejected`: a permanent failure the sink has already handled (for the ClickHouse sink,
     ///   written to its dead-letter store). Replaying it would fail the same way forever, so it is
     ///   acknowledged too.
-    /// - `Errored`: a transient failure. Upstream acknowledged it anyway, which advanced the read
+    /// - `Errored`, for a sink that opted in ([`Self::enable_errored_hold`]; otherwise it is
+    ///   acknowledged as upstream does): a transient failure. Upstream acknowledged it anyway, which advanced the read
     ///   position past undelivered records so they were never replayed. Instead, latch a hold: this
     ///   record and every later one stay unacknowledged, and the reader stops with
     ///   [`ReaderError::UndeliveredRecord`](super::reader::ReaderError) so Vector restarts and
@@ -638,6 +648,9 @@ where
         }
         match status {
             BatchStatus::Delivered | BatchStatus::Rejected => self.increment_pending_acks(amount),
+            BatchStatus::Errored if !self.hold_errored.load(Ordering::Acquire) => {
+                self.increment_pending_acks(amount);
+            }
             BatchStatus::Errored => {
                 self.ack_hold.store(true, Ordering::Release);
                 error!(
@@ -881,6 +894,7 @@ where
             writer_done: AtomicBool::new(false),
             pending_acks: AtomicU64::new(0),
             ack_hold: AtomicBool::new(false),
+            hold_errored: AtomicBool::new(false),
             unacked_reader_file_id_offset: AtomicU16::new(0),
             data_file_cleanup: DataFileCleanupState::new(cleanup_reader_file_id),
             last_flush: AtomicCell::new(Instant::now()),

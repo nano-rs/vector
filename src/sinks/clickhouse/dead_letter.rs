@@ -36,7 +36,7 @@ use vector_lib::{
 
 use super::{
     config::Format,
-    service::{ClickhouseRetryLogic, is_permanent_rejection},
+    service::{ClickhouseRetryLogic, ClickhouseServiceRequestBuilder, is_permanent_rejection},
     sink::PartitionKey,
 };
 use crate::sinks::{
@@ -92,7 +92,10 @@ struct DeadLettered {
 
 impl InternalEvent for DeadLettered {
     fn emit(self) {
-        counter!(CounterName::ComponentDeadLetteredEventsTotal).increment(self.count as u64);
+        if self.count > 0 {
+            counter!(CounterName::ComponentDeadLetteredEventsTotal).increment(self.count as u64);
+        }
+        // Set on every outcome, so evictions and failed writes are reflected too.
         gauge!(GaugeName::ComponentDeadLetterBytes).set(self.held_bytes as f64);
     }
 }
@@ -141,12 +144,10 @@ pub(super) struct StoreOutcome {
 
 impl StoreOutcome {
     fn emit(&self) {
-        if self.stored_events > 0 {
-            emit!(DeadLettered {
-                count: self.stored_events,
-                held_bytes: self.held_bytes,
-            });
-        }
+        emit!(DeadLettered {
+            count: self.stored_events,
+            held_bytes: self.held_bytes,
+        });
         emit!(DeadLetterDiscarded {
             count: self.evicted_events,
             reason: "evicted",
@@ -170,6 +171,11 @@ pub(super) struct RejectedBatch {
     pub(super) events: usize,
     pub(super) reason: String,
     pub(super) http_status: Option<u16>,
+    /// The URL query string the batch was sent with (`INSERT` plus settings), if known.
+    pub(super) url_query: Option<String>,
+    /// The batch is also kept in the disk buffer for replay (a transient failure), so replaying
+    /// this copy as well would duplicate it.
+    pub(super) held_for_replay: bool,
 }
 
 /// The bounded dead-letter directory of one sink.
@@ -242,6 +248,30 @@ impl DeadLetterStore {
             return outcome;
         }
 
+        // Write both files under temporary names first, so a failed write never costs the
+        // batches an eviction would have deleted to make room for it.
+        let body_path = self.dir.join(&body_name);
+        let meta_path = self.dir.join(format!("{stem}.meta.json"));
+        let body_tmp = tmp_path(&body_path);
+        let meta_tmp = tmp_path(&meta_path);
+        let staged = create_private_dir(&self.dir)
+            .and_then(|()| write_synced(&body_tmp, &batch.body))
+            .and_then(|()| write_synced(&meta_tmp, meta.as_bytes()));
+        if let Err(error) = staged {
+            _ = fs::remove_file(&body_tmp);
+            _ = fs::remove_file(&meta_tmp);
+            error!(
+                message = "Failed to write a rejected batch to the dead-letter store; discarding it.",
+                path = %self.dir.display(),
+                events = batch.events,
+                %error,
+                reason = %batch.reason,
+            );
+            outcome.failed_events = batch.events;
+            outcome.held_bytes = state.held_bytes;
+            return outcome;
+        }
+
         while state.held_bytes + needed > self.max_bytes {
             let Some(oldest) = state.entries.pop_front() else {
                 break;
@@ -265,12 +295,11 @@ impl DeadLetterStore {
             );
         }
 
-        let body_path = self.dir.join(&body_name);
-        let meta_path = self.dir.join(format!("{stem}.meta.json"));
-        let written = fs::create_dir_all(&self.dir)
-            .and_then(|()| write_atomic(&body_path, &batch.body))
-            .and_then(|()| write_atomic(&meta_path, meta.as_bytes()));
-        match written {
+        // The body is published before its meta: the meta file marks a complete batch.
+        let published = fs::rename(&body_tmp, &body_path)
+            .and_then(|()| fs::rename(&meta_tmp, &meta_path))
+            .and_then(|()| sync_dir(&self.dir));
+        match published {
             Ok(()) => {
                 state.entries.push_back(Entry {
                     files: vec![body_path.clone(), meta_path],
@@ -280,17 +309,19 @@ impl DeadLetterStore {
                 state.held_bytes += needed;
                 outcome.stored_events = batch.events;
                 error!(
-                    message = "ClickHouse permanently rejected a batch; wrote it to the dead-letter store.",
+                    message = "ClickHouse did not accept a batch; wrote it to the dead-letter store.",
                     path = %body_path.display(),
                     events = batch.events,
                     database = %batch.key.database,
                     table = %batch.key.table,
+                    held_for_replay = batch.held_for_replay,
                     reason = %batch.reason,
                 );
             }
             Err(error) => {
-                _ = fs::remove_file(&body_path);
-                _ = fs::remove_file(&meta_path);
+                for file in [&body_tmp, &meta_tmp, &body_path, &meta_path] {
+                    _ = fs::remove_file(file);
+                }
                 error!(
                     message = "Failed to write a rejected batch to the dead-letter store; discarding it.",
                     path = %self.dir.display(),
@@ -325,6 +356,9 @@ impl DeadLetterStore {
             "reason": batch.reason,
             "rejected_at": chrono::Utc::now().to_rfc3339(),
             "replay_query": insert,
+            // The exact URL query the sink sent (INSERT plus input/async-insert settings).
+            "replay_url_query": batch.url_query,
+            "held_for_replay": batch.held_for_replay,
         });
         let mut text = meta.to_string();
         text.push('\n');
@@ -332,17 +366,63 @@ impl DeadLetterStore {
     }
 }
 
-/// Writes `bytes` to a temporary sibling, syncs it, then renames it into place, so a reader never
-/// sees a partial file.
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+/// Creates the store directory readable by the Vector user only (it holds raw log bodies).
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// Writes `bytes` to a new file readable by the Vector user only, and syncs it.
+fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
 
-    let tmp = path.with_extension("tmp");
-    let mut file = fs::File::create(&tmp)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
     file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, path)
+    file.sync_all()
+}
+
+/// Syncs the directory, so the renames survive a host crash.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Whether `name` is one of this store's files: `<13 digits>-<10 digits>-<pid>.<ext>`.
+fn is_store_file(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default();
+    let mut parts = stem.split('-');
+    let (Some(ms), Some(seq), Some(pid), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let digits = |s: &str, len: Option<usize>| {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && len.is_none_or(|l| s.len() == l)
+    };
+    name.len() > stem.len() && digits(ms, Some(13)) && digits(seq, Some(10)) && digits(pid, None)
 }
 
 /// Rebuilds the size accounting from files left in `dir` by earlier runs, oldest first.
@@ -369,9 +449,9 @@ fn scan(dir: &Path) -> State {
     // Group files by stem (the part before the first '.').
     let mut current: Option<(String, Entry)> = None;
     for (name, path, len) in files {
-        if name.ends_with(".tmp") {
-            // An interrupted write: never a complete batch.
-            _ = fs::remove_file(&path);
+        // Only this store's files are counted (and so may be evicted). Temporary files are left
+        // alone: one may belong to a write in progress by the sink instance a reload replaces.
+        if name.ends_with(".tmp") || !is_store_file(&name) {
             continue;
         }
         let stem = name.split('.').next().unwrap_or_default().to_owned();
@@ -517,11 +597,20 @@ impl DriverResponse for ClickhouseResponse {
 pub(super) struct DeadLetterService<S> {
     inner: S,
     store: Option<Arc<DeadLetterStore>>,
+    replay: Option<Arc<ClickhouseServiceRequestBuilder>>,
 }
 
 impl<S> DeadLetterService<S> {
-    pub(super) const fn new(inner: S, store: Option<Arc<DeadLetterStore>>) -> Self {
-        Self { inner, store }
+    pub(super) const fn new(
+        inner: S,
+        store: Option<Arc<DeadLetterStore>>,
+        replay: Option<Arc<ClickhouseServiceRequestBuilder>>,
+    ) -> Self {
+        Self {
+            inner,
+            store,
+            replay,
+        }
     }
 }
 
@@ -531,7 +620,8 @@ async fn dead_letter(store: Option<Arc<DeadLetterStore>>, batch: RejectedBatch) 
     };
     // File I/O off the async runtime; the internal events are emitted back here, inside the
     // component's span, so they carry its tags.
-    match tokio::task::spawn_blocking(move || store.store(&batch)).await {
+    let span = tracing::Span::current();
+    match tokio::task::spawn_blocking(move || span.in_scope(|| store.store(&batch))).await {
         Ok(outcome) => outcome.emit(),
         Err(error) => error!(message = "Dead-letter write task failed.", %error),
     }
@@ -554,6 +644,10 @@ where
     fn call(&mut self, request: HttpRequest<PartitionKey>) -> Self::Future {
         let store = self.store.clone();
         let key = request.get_additional_metadata().clone();
+        let url_query = self
+            .replay
+            .as_ref()
+            .and_then(|replay| replay.replay_url_query(&key));
         let body = request.get_payload().clone();
         let events = request.get_metadata().event_count();
         let future = self.inner.call(request);
@@ -569,7 +663,11 @@ where
                     } else {
                         EventStatus::Errored
                     };
-                    if event_status == EventStatus::Rejected {
+                    // `Errored` is copied too: one disk-buffer record can span two batches, and
+                    // when the other one is `Rejected` the record's merged status is `Rejected`,
+                    // which the buffer acknowledges. The copy (marked `held_for_replay`) keeps
+                    // those events from being lost; when the hold applies, they are replayed too.
+                    if event_status != EventStatus::Delivered {
                         let reason = rejection_reason(status, response.response.body());
                         dead_letter(
                             store,
@@ -579,6 +677,8 @@ where
                                 events,
                                 reason,
                                 http_status: Some(status.as_u16()),
+                                url_query,
+                                held_for_replay: event_status == EventStatus::Errored,
                             },
                         )
                         .await;
@@ -597,6 +697,8 @@ where
                             events,
                             reason: error.to_string(),
                             http_status: None,
+                            url_query,
+                            held_for_replay: false,
                         },
                     )
                     .await;
@@ -627,6 +729,8 @@ mod tests {
             events,
             reason: "HTTP 500: Code: 117. DB::Exception: incorrect data".to_owned(),
             http_status: Some(500),
+            url_query: Some("query=INSERT&date_time_input_format=best_effort".to_owned()),
+            held_for_replay: false,
         }
     }
 
@@ -672,6 +776,17 @@ mod tests {
             meta["replay_query"],
             "INSERT INTO `nanosiem`.`logs_ingest` FORMAT JSONEachRow"
         );
+        assert_eq!(
+            meta["replay_url_query"],
+            "query=INSERT&date_time_input_format=best_effort"
+        );
+        assert_eq!(meta["held_for_replay"], false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(dir.join(&bodies[0])).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "dead-letter files are private: {mode:o}");
+        }
         assert_eq!(outcome.held_bytes, store.state.lock().unwrap().held_bytes);
     }
 
@@ -748,7 +863,7 @@ mod tests {
                 raw_byte_size: 0,
             })
         });
-        let mut service = DeadLetterService::new(inner, store);
+        let mut service = DeadLetterService::new(inner, store, None);
         let response = service
             .call(request(b"{\"a\":1}\n", 1))
             .await
@@ -780,14 +895,24 @@ mod tests {
         assert_eq!(status, EventStatus::Rejected);
         assert_eq!(body_files(&dir).len(), 2);
 
+        // A transient failure that outlived its retries stays `Errored` (held for replay), with
+        // a copy marked `held_for_replay`.
         let status = call_with(Some(Arc::clone(&store)), 503, "Code: 202. Too many").await;
         assert_eq!(status, EventStatus::Errored);
-        assert_eq!(body_files(&dir).len(), 2, "a transient failure is not dead-lettered");
+        assert_eq!(body_files(&dir).len(), 3);
 
-        // An access refusal is retried by the retry logic (NAN-5390), never dead-lettered.
+        // An access refusal is retried by the retry logic (NAN-5390), so it is transient too.
         let status = call_with(Some(Arc::clone(&store)), 403, "Code: 497. ACCESS_DENIED").await;
         assert_eq!(status, EventStatus::Errored);
-        assert_eq!(body_files(&dir).len(), 2);
+        assert_eq!(body_files(&dir).len(), 4);
+        let held = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".meta.json"))
+            .map(|p| serde_json::from_slice::<serde_json::Value>(&fs::read(p).unwrap()).unwrap())
+            .filter(|meta| meta["held_for_replay"] == true)
+            .count();
+        assert_eq!(held, 2);
 
         let status = call_with(None, 200, "").await;
         assert_eq!(status, EventStatus::Delivered);
@@ -806,6 +931,7 @@ mod tests {
         store.store(&batch(4, b"abc"));
         let held = store.store(&batch(6, b"defg")).held_bytes;
         fs::write(dir.join("0000000000000-0000000000-1.ndjson.gz.tmp"), b"partial").unwrap();
+        fs::write(dir.join("README.txt"), b"operator notes").unwrap();
         drop(store);
 
         let reopened = DeadLetterStore::open(
@@ -820,8 +946,11 @@ mod tests {
         assert_eq!(state.entries[0].events, 4);
         assert_eq!(state.entries[1].events, 6);
         assert!(
-            !dir.join("0000000000000-0000000000-1.ndjson.gz.tmp").exists(),
-            "an interrupted write is removed"
+            dir.join("0000000000000-0000000000-1.ndjson.gz.tmp").exists(),
+            "a temporary file may be a write in progress; it is neither counted nor deleted"
         );
+        assert!(is_store_file("1794700000000-0000000001-42.ndjson.gz"));
+        assert!(!is_store_file("README.txt"));
+        assert!(!is_store_file("1794700000000-0000000001-42"));
     }
 }

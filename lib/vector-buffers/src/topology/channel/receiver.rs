@@ -107,6 +107,17 @@ impl<T: Bufferable> BufferReceiver<T> {
         self.overflow = Some(Box::new(overflow));
     }
 
+    /// nano (NAN-5567): holds records finalized as `Errored` in a disk buffer (base and overflow)
+    /// instead of acknowledging them. See `Ledger::apply_finalization`.
+    pub fn hold_errored_records(&self) {
+        if let ReceiverAdapter::DiskV2(reader) = &self.base {
+            reader.ledger().enable_errored_hold();
+        }
+        if let Some(overflow) = &self.overflow {
+            overflow.hold_errored_records();
+        }
+    }
+
     /// Configures this receiver to instrument the items passing through it.
     pub fn with_usage_instrumentation(&mut self, handle: BufferUsageHandle) {
         self.instrumentation = Some(handle);

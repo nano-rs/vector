@@ -117,9 +117,13 @@ async fn wait_for_ledger_release(ledger: Weak<Ledger<FilesystemUnderTest>>) {
 async fn write_read_and_finalize(
     data_dir: &Path,
     statuses: [EventStatus; 3],
+    hold_errored: bool,
 ) -> (Option<ReaderError<SizedRecord>>, bool) {
     let (mut writer, mut reader, ledger) =
         create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+    if hold_errored {
+        ledger.enable_errored_hold();
+    }
     for size in [64, 65, 66] {
         writer
             .write_record(SizedRecord::new(size))
@@ -177,6 +181,7 @@ async fn errored_record_survives_reader_restart() {
                     EventStatus::Errored,
                     EventStatus::Delivered,
                 ],
+                true,
             )
             .await;
             assert!(held, "an errored record must latch the acknowledgement hold");
@@ -223,6 +228,7 @@ async fn rejected_record_is_acknowledged() {
                     EventStatus::Rejected,
                     EventStatus::Delivered,
                 ],
+                true,
             )
             .await;
             assert!(!held);
@@ -254,6 +260,7 @@ async fn errored_status_holds_later_acknowledgements() {
                 .await
                 .expect("ledger should not fail to load/create");
             let ledger = Arc::new(ledger);
+            ledger.enable_errored_hold();
             let finalizer = Arc::clone(&ledger).spawn_finalizer();
 
             let mut batches = Vec::new();
@@ -288,6 +295,31 @@ async fn errored_status_holds_later_acknowledgements() {
                 1,
                 "only the record before the errored one may be acknowledged"
             );
+        }
+    })
+    .await;
+}
+
+/// NAN-5567: without the sink's opt-in, `Errored` is acknowledged as upstream does, so a sink that
+/// reports `Errored` for deterministic failures cannot crash-loop on replay.
+#[tokio::test]
+async fn errored_record_is_acknowledged_without_opt_in() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (error, held) = write_read_and_finalize(
+                &data_dir,
+                [
+                    EventStatus::Delivered,
+                    EventStatus::Errored,
+                    EventStatus::Delivered,
+                ],
+                false,
+            )
+            .await;
+            assert!(!held);
+            assert_eq!(error, None);
         }
     })
     .await;

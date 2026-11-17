@@ -314,6 +314,15 @@ pub trait SinkConfig:
 
     /// Gets the acknowledgements configuration for this sink.
     fn acknowledgements(&self) -> &AcknowledgementsConfig;
+
+    /// nano (NAN-5567): whether a record this sink finalizes as `Errored` is held in its disk
+    /// buffer (never acknowledged; Vector stops so the restart replays it) instead of acknowledged.
+    ///
+    /// Only a sink whose `Errored` status always means "transient, will succeed on replay" may opt
+    /// in; a sink that reports `Errored` for deterministic failures would crash-loop on replay.
+    fn hold_errored_in_disk_buffer(&self) -> bool {
+        false
+    }
 }
 
 dyn_clone::clone_trait_object!(SinkConfig);

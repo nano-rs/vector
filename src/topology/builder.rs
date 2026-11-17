@@ -697,7 +697,13 @@ impl<'a> Builder<'a> {
                     self.errors.push(format!("Sink \"{key}\": {error}"));
                     return;
                 }
-                Ok((tx, rx)) => (tx, Arc::new(Mutex::new(Some(rx.into_stream())))),
+                Ok((tx, rx)) => {
+                    // nano (NAN-5567): opt-in hold of `Errored` records in a disk buffer.
+                    if sink.inner.hold_errored_in_disk_buffer() {
+                        rx.hold_errored_records();
+                    }
+                    (tx, Arc::new(Mutex::new(Some(rx.into_stream()))))
+                }
             }
         };
 

@@ -485,7 +485,7 @@ where
         }
     }
 
-    pub(super) fn ledger(&self) -> &Ledger<FS> {
+    pub(crate) fn ledger(&self) -> &Ledger<FS> {
         self.ledger.as_ref()
     }
 
@@ -845,6 +845,11 @@ where
                                 "Data file does not yet exist. Waiting for writer to create."
                             );
                             self.ledger.wait_for_writer().await;
+                            // nano (NAN-5567): the hold wakes this wait too; return so `next`
+                            // reports it instead of waiting for a data file that may never come.
+                            if self.ledger.is_ack_held() {
+                                return Ok(());
+                            }
                         } else {
                             self.ledger.increment_acked_reader_file_id();
                         }
@@ -1047,6 +1052,11 @@ where
             // stays before it, so stop handing out records and let the sink task fail. The
             // restart replays the record (and everything after it) from the buffer.
             if self.ledger.is_ack_held() {
+                // The finalizer can add acknowledgements for earlier records and latch the hold
+                // between the call above and this check; apply those too, so only the errored
+                // record and the ones after it are replayed.
+                self.handle_pending_acknowledgements(true)
+                    .context(IoSnafu)?;
                 return Err(ReaderError::UndeliveredRecord);
             }
 
@@ -1076,6 +1086,10 @@ where
             }
 
             self.ensure_ready_for_read().await.context(IoSnafu)?;
+            if self.ledger.is_ack_held() {
+                // Returned early because of the hold (NAN-5567): report it at the top of the loop.
+                continue;
+            }
 
             let (reader_file_id, writer_file_id) = self.ledger.get_current_reader_writer_file_id();
 

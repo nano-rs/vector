@@ -229,6 +229,13 @@ impl SinkConfig for ClickhouseConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    // nano (NAN-5567): this sink reports `Errored` only for a transient failure that outlived its
+    // retries (a permanent refusal is dead-lettered and reported `Rejected`), so holding the
+    // record for replay cannot loop on a deterministic failure.
+    fn hold_errored_in_disk_buffer(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait::async_trait]
@@ -314,6 +321,7 @@ impl ValidatedSink for ClickhouseConfig {
             query_settings: self.query_settings,
         };
 
+        let replay = std::sync::Arc::new(clickhouse_service_request_builder.clone());
         let service: HttpService<ClickhouseServiceRequestBuilder, PartitionKey> =
             HttpService::new(client.clone(), clickhouse_service_request_builder);
 
@@ -326,6 +334,7 @@ impl ValidatedSink for ClickhouseConfig {
         let service = DeadLetterService::new(
             service,
             resolve_store(self.dead_letter, &cx, self.compression),
+            Some(replay),
         );
 
         // Resolve the encoding strategy (format + encoder) based on configuration.

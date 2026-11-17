@@ -183,6 +183,27 @@ impl HttpServiceRequestBuilder<PartitionKey> for ClickhouseServiceRequestBuilder
     }
 }
 
+impl ClickhouseServiceRequestBuilder {
+    /// nano (NAN-5567): the URL query string a batch for `key` is sent with (the `INSERT` and the
+    /// input/async-insert settings; credentials travel in headers, never here), recorded with a
+    /// dead-lettered batch so it can be replayed exactly as it would have been sent.
+    pub(super) fn replay_url_query(&self, key: &PartitionKey) -> Option<String> {
+        set_uri_query(
+            &self.endpoint,
+            &key.database,
+            &key.table,
+            key.format,
+            self.skip_unknown_fields,
+            self.date_time_best_effort,
+            self.insert_random_shard,
+            self.query_settings,
+        )
+        .ok()?
+        .query()
+        .map(str::to_owned)
+    }
+}
+
 fn append_param<T: ToString>(uri: &mut String, key: &str, value: Option<T>) {
     if let Some(val) = value {
         write!(uri, "{key}={}&", val.to_string()).expect("writing to a String cannot fail");
