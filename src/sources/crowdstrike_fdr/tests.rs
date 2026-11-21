@@ -477,7 +477,7 @@ impl ObjectStore for MockStore {
             }
             Some(Object::Cut { data, at, cuts }) => {
                 let cut = cuts
-                    .fetch_update(
+                    .try_update(
                         std::sync::atomic::Ordering::SeqCst,
                         std::sync::atomic::Ordering::SeqCst,
                         |left| left.checked_sub(1),

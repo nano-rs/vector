@@ -9,7 +9,7 @@ use vector_lib::{
 
 /// What happened to one SQS manifest message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FdrManifestStatus {
+pub(crate) enum FdrManifestStatus {
     /// Received from the queue.
     Received,
     /// Every event was delivered (or dispatched, without acknowledgements) and the message deleted.
@@ -24,7 +24,7 @@ pub enum FdrManifestStatus {
 
 impl FdrManifestStatus {
     /// Every status, for registering the counters up front.
-    pub const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::Received,
         Self::Acked,
         Self::Released,
@@ -32,7 +32,7 @@ impl FdrManifestStatus {
         Self::Parked,
     ];
 
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Received => "received",
             Self::Acked => "acked",
@@ -44,7 +44,7 @@ impl FdrManifestStatus {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct CrowdstrikeFdrManifest<'a> {
+pub(crate) struct CrowdstrikeFdrManifest<'a> {
     pub status: FdrManifestStatus,
     pub message_id: &'a str,
 }
@@ -78,7 +78,7 @@ impl InternalEvent for CrowdstrikeFdrManifest<'_> {
 /// lifetime. Vector expires internal metrics that are idle for `expire_metrics_secs` (default
 /// 300 s) unless a handle to them is still held; a batch source can be idle far longer than
 /// that, and these series are the record that a batch was received, deleted or released.
-pub struct CrowdstrikeFdrMetrics {
+pub(crate) struct CrowdstrikeFdrMetrics {
     _counters: Vec<metrics::Counter>,
     _gauges: Vec<metrics::Gauge>,
     _histograms: Vec<metrics::Histogram>,
@@ -86,7 +86,7 @@ pub struct CrowdstrikeFdrMetrics {
 
 impl CrowdstrikeFdrMetrics {
     /// Registers every series. Call inside the component's span, so the series carry its tags.
-    pub fn register() -> Self {
+    pub(crate) fn register() -> Self {
         let mut counters = Vec::new();
         let mut gauges = Vec::new();
         for status in FdrManifestStatus::ALL {
@@ -127,7 +127,7 @@ impl CrowdstrikeFdrMetrics {
 
 /// Files of a re-delivered batch skipped because an earlier delivery already landed them.
 #[derive(Debug, NamedInternalEvent)]
-pub struct CrowdstrikeFdrFilesSkipped<'a> {
+pub(crate) struct CrowdstrikeFdrFilesSkipped<'a> {
     pub message_id: &'a str,
     pub skipped: usize,
     pub remaining: usize,
@@ -146,7 +146,7 @@ impl InternalEvent for CrowdstrikeFdrFilesSkipped<'_> {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct CrowdstrikeFdrFileFetched<'a> {
+pub(crate) struct CrowdstrikeFdrFileFetched<'a> {
     pub key: &'a str,
     pub bytes: u64,
 }
@@ -160,7 +160,7 @@ impl InternalEvent for CrowdstrikeFdrFileFetched<'_> {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct CrowdstrikeFdrBatchLag {
+pub(crate) struct CrowdstrikeFdrBatchLag {
     pub lag: Duration,
 }
 
@@ -171,7 +171,7 @@ impl InternalEvent for CrowdstrikeFdrBatchLag {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct CrowdstrikeFdrInflight {
+pub(crate) struct CrowdstrikeFdrInflight {
     pub manifests: usize,
     pub bytes: u64,
 }
@@ -185,7 +185,7 @@ impl InternalEvent for CrowdstrikeFdrInflight {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct CrowdstrikeFdrQueueDepth {
+pub(crate) struct CrowdstrikeFdrQueueDepth {
     pub visible: Option<u64>,
     pub not_visible: Option<u64>,
 }
@@ -206,7 +206,7 @@ impl InternalEvent for CrowdstrikeFdrQueueDepth {
 /// Any error of the source. `error_code` names the operation; the standard
 /// `component_errors_total` counter carries it.
 #[derive(Debug, NamedInternalEvent)]
-pub struct CrowdstrikeFdrError<'a> {
+pub(crate) struct CrowdstrikeFdrError<'a> {
     pub error_code: &'static str,
     pub error_type: &'static str,
     pub stage: &'static str,
@@ -235,7 +235,7 @@ impl InternalEvent for CrowdstrikeFdrError<'_> {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct CrowdstrikeFdrChecksumWarning<'a> {
+pub(crate) struct CrowdstrikeFdrChecksumWarning<'a> {
     pub key: &'a str,
     pub detail: String,
 }
@@ -251,7 +251,7 @@ impl InternalEvent for CrowdstrikeFdrChecksumWarning<'_> {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct CrowdstrikeFdrHoldExpired<'a> {
+pub(crate) struct CrowdstrikeFdrHoldExpired<'a> {
     pub message_id: &'a str,
     pub held: Duration,
 }

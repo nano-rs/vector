@@ -35,7 +35,7 @@ use vector_lib::{
     event::MaybeAsLogMut,
     internal_event::{
         ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol, Registered,
-        error_stage, error_type,
+        emit, error_stage, error_type, register,
     },
     lookup::path,
     source_sender::SendError,
@@ -303,7 +303,7 @@ impl<Q: Queue, O: ObjectStore> Engine<Q, O> {
                     messages
                 }
                 Err(error) => {
-                    emit!(CrowdstrikeFdrError {
+                    emit(CrowdstrikeFdrError {
                         error_code: "failed_receiving_messages",
                         error_type: error_type::REQUEST_FAILED,
                         stage: error_stage::RECEIVING,
@@ -371,8 +371,8 @@ impl<Q: Queue, O: ObjectStore> Engine<Q, O> {
                 .map(|kib| Arc::new(Semaphore::new(kib as usize))),
             inflight_manifests: AtomicUsize::new(0),
             inflight_bytes: AtomicU64::new(0),
-            bytes_received: register!(BytesReceived::from(Protocol::HTTPS)),
-            events_received: register!(EventsReceived),
+            bytes_received: register(BytesReceived::from(Protocol::HTTPS)),
+            events_received: register(EventsReceived),
             pins: Mutex::new(Pins::default()),
             settings,
         }
@@ -545,7 +545,7 @@ impl<'a, Q, O> InflightGuard<'a, Q, O> {
     }
 
     fn publish(&self) {
-        emit!(CrowdstrikeFdrInflight {
+        emit(CrowdstrikeFdrInflight {
             manifests: self.shared.inflight_manifests.load(Ordering::Relaxed),
             bytes: self.shared.inflight_bytes.load(Ordering::Relaxed),
         });
@@ -573,7 +573,7 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
 ) {
     let settings = &shared.settings;
     let received_at = Instant::now();
-    emit!(CrowdstrikeFdrManifest {
+    emit(CrowdstrikeFdrManifest {
         status: FdrManifestStatus::Received,
         message_id: &message.id,
     });
@@ -586,7 +586,7 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
             && let Some(batch_time) = manifest.batch_time()
             && let Ok(lag) = (Utc::now() - batch_time).to_std()
         {
-            emit!(CrowdstrikeFdrBatchLag { lag });
+            emit(CrowdstrikeFdrBatchLag { lag });
         }
         // Before the `max_tries` check: a batch `start_from` skips (released, with
         // `skip_action = release`, on every delivery) is skipped, not parked.
@@ -605,7 +605,7 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
                 .parked
                 .insert(message.id.clone(), manifest.timestamp_ms);
         }
-        emit!(CrowdstrikeFdrManifest {
+        emit(CrowdstrikeFdrManifest {
             status: FdrManifestStatus::Parked,
             message_id: &message.id,
         });
@@ -615,7 +615,7 @@ async fn handle_message<Q: Queue, O: ObjectStore>(
     let manifest = match parsed {
         Ok(manifest) => manifest,
         Err(error) => {
-            emit!(CrowdstrikeFdrError {
+            emit(CrowdstrikeFdrError {
                 error_code: "invalid_manifest",
                 error_type: error_type::PARSER_FAILED,
                 stage: error_stage::PROCESSING,
@@ -687,12 +687,12 @@ async fn conclude<Q: Queue, O: ObjectStore>(
             release(shared, message, settings.retry_delay_secs, reason).await;
         }
         Outcome::HoldExpired => {
-            emit!(CrowdstrikeFdrHoldExpired {
+            emit(CrowdstrikeFdrHoldExpired {
                 message_id: &message.id,
                 held: received_at.elapsed(),
             });
             // The visibility timeout lapses on its own; nothing to call.
-            emit!(CrowdstrikeFdrManifest {
+            emit(CrowdstrikeFdrManifest {
                 status: FdrManifestStatus::Released,
                 message_id: &message.id,
             });
@@ -735,7 +735,7 @@ async fn skip_old_batch<Q: Queue, O: ObjectStore>(
                     files = manifest.files.len(),
                     batch_timestamp = %batch_timestamp(manifest),
                 );
-                emit!(CrowdstrikeFdrManifest {
+                emit(CrowdstrikeFdrManifest {
                     status: FdrManifestStatus::Skipped,
                     message_id: &message.id,
                 });
@@ -757,7 +757,7 @@ async fn skip_old_batch<Q: Queue, O: ObjectStore>(
             )
             .await
             {
-                emit!(CrowdstrikeFdrError {
+                emit(CrowdstrikeFdrError {
                     error_code: "failed_releasing_message",
                     error_type: error_type::REQUEST_FAILED,
                     stage: error_stage::PROCESSING,
@@ -772,7 +772,7 @@ async fn skip_old_batch<Q: Queue, O: ObjectStore>(
                 batch_timestamp = %batch_timestamp(manifest),
                 visible_again_in_secs = settings.retry_delay_secs,
             );
-            emit!(CrowdstrikeFdrManifest {
+            emit(CrowdstrikeFdrManifest {
                 status: FdrManifestStatus::Skipped,
                 message_id: &message.id,
             });
@@ -808,14 +808,14 @@ async fn finish<Q: Queue, O: ObjectStore>(
         held_secs = received_at.elapsed().as_secs(),
         deleted = shared.settings.delete_message,
     );
-    emit!(CrowdstrikeFdrManifest {
+    emit(CrowdstrikeFdrManifest {
         status: FdrManifestStatus::Acked,
         message_id: &message.id,
     });
     if let Some(cursor) = &shared.cursor
         && let Err(error) = cursor.advance(cursor_target(shared, manifest)).await
     {
-        emit!(CrowdstrikeFdrError {
+        emit(CrowdstrikeFdrError {
             error_code: "failed_writing_cursor",
             error_type: error_type::WRITER_FAILED,
             stage: error_stage::PROCESSING,
@@ -844,7 +844,7 @@ async fn delete<Q: Queue, O: ObjectStore>(shared: &Shared<Q, O>, message: &Queue
     {
         Ok(()) => true,
         Err(error) => {
-            emit!(CrowdstrikeFdrError {
+            emit(CrowdstrikeFdrError {
                 error_code: "failed_deleting_message",
                 error_type: error_type::REQUEST_FAILED,
                 stage: error_stage::PROCESSING,
@@ -885,7 +885,7 @@ async fn release<Q: Queue, O: ObjectStore>(
     .await
     {
         // Not fatal: the visibility timeout lapses anyway.
-        emit!(CrowdstrikeFdrError {
+        emit(CrowdstrikeFdrError {
             error_code: "failed_releasing_message",
             error_type: error_type::REQUEST_FAILED,
             stage: error_stage::PROCESSING,
@@ -893,7 +893,7 @@ async fn release<Q: Queue, O: ObjectStore>(
             error,
         });
     }
-    emit!(CrowdstrikeFdrManifest {
+    emit(CrowdstrikeFdrManifest {
         status: FdrManifestStatus::Released,
         message_id: &message.id,
     });
@@ -912,7 +912,7 @@ async fn heartbeat<Q: Queue, O: ObjectStore>(shared: &Shared<Q, O>, message: &Qu
         )
         .await
         {
-            emit!(CrowdstrikeFdrError {
+            emit(CrowdstrikeFdrError {
                 error_code: "failed_extending_visibility",
                 error_type: error_type::REQUEST_FAILED,
                 stage: error_stage::PROCESSING,
@@ -975,7 +975,7 @@ async fn process<Q: Queue, O: ObjectStore>(
         .collect();
     let skipped = manifest.files.len() - todo.len();
     if skipped > 0 {
-        emit!(CrowdstrikeFdrFilesSkipped {
+        emit(CrowdstrikeFdrFilesSkipped {
             message_id,
             skipped,
             remaining: todo.len(),
@@ -1035,11 +1035,11 @@ fn outcome_of(
             return Outcome::Shutdown;
         }
         if matches!(error, FileError::Closed) {
-            emit!(StreamClosedError { count: 0 });
+            emit(StreamClosedError { count: 0 });
             return Outcome::Shutdown;
         }
         let (code, kind) = error.code();
-        emit!(CrowdstrikeFdrError {
+        emit(CrowdstrikeFdrError {
             error_code: code,
             error_type: kind,
             stage: error_stage::RECEIVING,
@@ -1052,7 +1052,7 @@ fn outcome_of(
     match status {
         BatchStatus::Delivered => Outcome::Delivered,
         BatchStatus::Errored => {
-            emit!(CrowdstrikeFdrError {
+            emit(CrowdstrikeFdrError {
                 error_code: "delivery_failed",
                 error_type: error_type::ACKNOWLEDGMENT_FAILED,
                 stage: error_stage::SENDING,
@@ -1235,7 +1235,7 @@ async fn mark_done<Q: Queue, O: ObjectStore>(
 ) {
     if let Err(error) = shared.completions.mark(key, &file.path).await {
         // Still recorded in memory; only a restart would repeat this file.
-        emit!(CrowdstrikeFdrError {
+        emit(CrowdstrikeFdrError {
             error_code: "failed_writing_progress",
             error_type: error_type::WRITER_FAILED,
             stage: error_stage::PROCESSING,
@@ -1441,7 +1441,7 @@ async fn fetch_object<Q: Queue, O: ObjectStore>(
                 });
             }
             Err(detail) => {
-                emit!(CrowdstrikeFdrChecksumWarning { key, detail });
+                emit(CrowdstrikeFdrChecksumWarning { key, detail });
                 None
             }
         },
@@ -1455,7 +1455,7 @@ async fn fetch_object<Q: Queue, O: ObjectStore>(
                 if let Body::Memory(_, held @ None) = &mut object.body {
                     *held = memory.take();
                 }
-                emit!(CrowdstrikeFdrFileFetched { key, bytes });
+                emit(CrowdstrikeFdrFileFetched { key, bytes });
                 return Ok(Fetched { object, slot });
             }
             Err(error) if error.is_transient() && tries < max_tries => {
@@ -1623,14 +1623,14 @@ fn verify_object(
                     detail,
                 });
             }
-            emit!(CrowdstrikeFdrError {
+            emit(CrowdstrikeFdrError {
                 error_code: "checksum_mismatch",
                 error_type: error_type::CONDITION_FAILED,
                 stage: error_stage::RECEIVING,
                 message_id: "",
                 error: detail.clone(),
             });
-            emit!(CrowdstrikeFdrChecksumWarning { key, detail });
+            emit(CrowdstrikeFdrChecksumWarning { key, detail });
         }
     }
     Ok(())
@@ -1686,7 +1686,7 @@ async fn emit_object<Q: Queue, O: ObjectStore>(
             error: error.to_string(),
         })?;
         let Some(bytes) = bytes else {
-            emit!(CrowdstrikeFdrError {
+            emit(CrowdstrikeFdrError {
                 error_code: "line_too_long",
                 error_type: error_type::PARSER_FAILED,
                 stage: error_stage::PROCESSING,
@@ -1824,7 +1824,7 @@ async fn poll_queue_depth<Q: Queue>(
             .await
             .unwrap_or_else(|_| Err(DepthError::Other("timed out".into())));
         match depth {
-            Ok(depth) => emit!(CrowdstrikeFdrQueueDepth {
+            Ok(depth) => emit(CrowdstrikeFdrQueueDepth {
                 visible: depth.visible,
                 not_visible: depth.not_visible,
             }),
