@@ -1,6 +1,4 @@
-use std::{
-    collections::HashMap, convert::Infallible, fmt, net::SocketAddr, sync::Arc, time::Duration,
-};
+use std::{collections::HashMap, fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use futures::{FutureExt, TryFutureExt};
