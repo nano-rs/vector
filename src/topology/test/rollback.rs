@@ -14,11 +14,13 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use vector_lib::event::{Event, EventContainer, LogEvent};
+use vector_lib::{
+    event::{Event, EventContainer, LogEvent},
+    extra_context::ExtraContext,
+};
 
 use crate::{
     config::Config,
-    extra_context::ExtraContext,
     test_util::{
         mock::{basic_sink, basic_source, basic_transform, build_error_source},
         start_topology, trace_init,
