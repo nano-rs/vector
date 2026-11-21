@@ -254,7 +254,7 @@ impl InitialCheckpointStore for AzureBlobCheckpointStore {
 
 /// A position in a partition: the identity of the last event that was processed.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Position {
+pub(crate) struct Position {
     pub offset: Option<String>,
     pub sequence_number: Option<i64>,
 }
@@ -262,7 +262,7 @@ pub struct Position {
 impl Position {
     /// Returns `None` when neither field is set: such a position names nothing, and writing it as
     /// a checkpoint would erase a valid one.
-    pub fn new(offset: Option<String>, sequence_number: Option<i64>) -> Option<Self> {
+    pub(crate) fn new(offset: Option<String>, sequence_number: Option<i64>) -> Option<Self> {
         (offset.is_some() || sequence_number.is_some()).then_some(Self {
             offset,
             sequence_number,
@@ -279,7 +279,7 @@ impl Position {
     }
 
     /// Start right after this position.
-    pub fn after(&self) -> StartPosition {
+    pub(crate) fn after(&self) -> StartPosition {
         StartPosition {
             location: self.location(),
             inclusive: false,
@@ -287,7 +287,7 @@ impl Position {
     }
 
     /// Start at this position, including it.
-    pub fn at(&self) -> StartPosition {
+    pub(crate) fn at(&self) -> StartPosition {
         StartPosition {
             location: self.location(),
             inclusive: true,
@@ -299,7 +299,7 @@ impl Position {
     ///
     /// For a partition that never had an event the service reports offset `-1` and sequence
     /// number `-1`; starting after that is the start of the partition, which is correct.
-    pub fn last_enqueued(properties: &EventHubPartitionProperties) -> Self {
+    pub(crate) fn last_enqueued(properties: &EventHubPartitionProperties) -> Self {
         Self {
             offset: Some(properties.last_enqueued_offset.clone()).filter(|o| !o.is_empty()),
             sequence_number: Some(properties.last_enqueued_sequence_number),
@@ -309,7 +309,7 @@ impl Position {
 
 /// The outcome of [`Checkpointer::initialize`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InitialCheckpoint {
+pub(crate) enum InitialCheckpoint {
     /// The partition had no checkpoint; this position was written as its first one.
     Created(Position),
     /// A checkpoint appeared since the source loaded them (another instance wrote it); it was
@@ -324,7 +324,7 @@ pub enum InitialCheckpoint {
 
 impl InitialCheckpoint {
     /// The position the partition resumes after.
-    pub const fn position(&self) -> &Position {
+    pub(crate) const fn position(&self) -> &Position {
         match self {
             Self::Created(position) | Self::Existing(position) | Self::Unreadable(position) => {
                 position
@@ -335,7 +335,7 @@ impl InitialCheckpoint {
 
 /// Reads and writes the checkpoints of one Event Hub and consumer group.
 #[derive(Clone)]
-pub struct Checkpointer {
+pub(super) struct Checkpointer {
     store: Arc<dyn InitialCheckpointStore>,
     namespace: String,
     event_hub_name: String,
@@ -343,7 +343,7 @@ pub struct Checkpointer {
 }
 
 impl Checkpointer {
-    pub fn new(
+    pub(super) fn new(
         store: Arc<dyn InitialCheckpointStore>,
         namespace: &str,
         event_hub_name: &str,
@@ -359,7 +359,7 @@ impl Checkpointer {
     }
 
     /// Loads the stored positions, keyed by partition ID.
-    pub async fn load(&self) -> azure_core::Result<HashMap<String, Position>> {
+    pub(super) async fn load(&self) -> azure_core::Result<HashMap<String, Position>> {
         let checkpoints = self
             .store
             .list_checkpoints(&self.namespace, &self.event_hub_name, &self.consumer_group)
@@ -384,7 +384,7 @@ impl Checkpointer {
         }
     }
 
-    pub async fn commit(&self, partition_id: &str, position: &Position) -> azure_core::Result<()> {
+    pub(super) async fn commit(&self, partition_id: &str, position: &Position) -> azure_core::Result<()> {
         self.store
             .update_checkpoint(self.checkpoint(partition_id, position))
             .await
@@ -395,7 +395,7 @@ impl Checkpointer {
     ///
     /// The write is create-only ([`InitialCheckpointStore::create_checkpoint`]): if a checkpoint
     /// exists by now, it is kept and returned instead.
-    pub async fn initialize(
+    pub(super) async fn initialize(
         &self,
         partition_id: &str,
         latest: Position,
@@ -417,7 +417,7 @@ impl Checkpointer {
 /// An in-memory [`CheckpointStore`], for tests.
 #[cfg(test)]
 #[derive(Default)]
-pub struct MemoryCheckpointStore {
+pub(super) struct MemoryCheckpointStore {
     pub checkpoints: std::sync::Mutex<HashMap<String, Checkpoint>>,
     pub fail_updates: std::sync::atomic::AtomicBool,
 }

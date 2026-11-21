@@ -28,6 +28,7 @@ use vector_lib::{
     },
     config::{LegacyKey, LogNamespace, SourceAcknowledgementsConfig, SourceOutput},
     configurable::configurable_component,
+    internal_event::emit,
     sensitive_string::SensitiveString,
 };
 use vrl::{owned_value_path, value::Kind};
@@ -377,13 +378,13 @@ where
         match result {
             Ok(started) => {
                 if failures > 0 {
-                    emit!(AzureEventHubsStarted { failures });
+                    emit(AzureEventHubsStarted { failures });
                 }
                 return Some(started);
             }
             Err(error) => {
                 failures += 1;
-                emit!(AzureEventHubsStartupError {
+                emit(AzureEventHubsStartupError {
                     stage: error.stage.as_str(),
                     error: &error.message,
                     retry_in: backoff,

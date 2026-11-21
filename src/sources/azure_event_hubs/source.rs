@@ -18,7 +18,7 @@ use vector_lib::{
     finalizer::OrderedFinalizer,
     internal_event::{
         ByteSize, BytesReceived, CountByteSize, EventsReceived, InternalEventHandle as _, Protocol,
-        Registered,
+        Registered, emit, register,
     },
     shutdown::ShutdownSignal,
 };
@@ -160,9 +160,9 @@ impl PositionState {
 }
 
 impl PartitionReader {
-    pub async fn run(mut self) -> Result<(), ()> {
-        let bytes_received = register!(BytesReceived::from(Protocol::from("amqp")));
-        let events_received = register!(EventsReceived);
+    pub(super) async fn run(mut self) -> Result<(), ()> {
+        let bytes_received = register(BytesReceived::from(Protocol::from("amqp")));
+        let events_received = register(EventsReceived);
         let mut positions = match (self.initial_position.take(), &self.checkpointer) {
             (None, Some(checkpointer)) if self.initial_checkpoint => {
                 match self.initialize_checkpoint(checkpointer).await {
@@ -198,7 +198,7 @@ impl PartitionReader {
             let receiver = match opened {
                 Ok(receiver) => receiver,
                 Err(error) => {
-                    emit!(AzureEventHubsConnectError {
+                    emit(AzureEventHubsConnectError {
                         partition_id: &self.partition_id,
                         error,
                     });
@@ -248,7 +248,7 @@ impl PartitionReader {
                                 }
                             }
                             Some(Err(error)) => {
-                                emit!(AzureEventHubsReceiveError {
+                                emit(AzureEventHubsReceiveError {
                                     partition_id: &self.partition_id,
                                     error,
                                 });
@@ -285,7 +285,7 @@ impl PartitionReader {
                     start = positions.reconnect_start(&self.default_start);
                 }
                 LoopExit::Replay => {
-                    emit!(AzureEventHubsDeliveryFailed {
+                    emit(AzureEventHubsDeliveryFailed {
                         partition_id: &self.partition_id,
                     });
                     // Drop the acknowledgements still pending: everything after the failed event
@@ -348,7 +348,7 @@ impl PartitionReader {
             match properties {
                 Ok(properties) => break Position::last_enqueued(&properties),
                 Err(error) => {
-                    emit!(AzureEventHubsPartitionPropertiesError {
+                    emit(AzureEventHubsPartitionPropertiesError {
                         partition_id: &self.partition_id,
                         error,
                     });
@@ -371,14 +371,14 @@ impl PartitionReader {
             };
             match result {
                 Ok(outcome) => {
-                    emit!(AzureEventHubsInitialCheckpoint {
+                    emit(AzureEventHubsInitialCheckpoint {
                         partition_id: &self.partition_id,
                         outcome: &outcome,
                     });
                     return Some(PositionState::initialized(&outcome));
                 }
                 Err(error) => {
-                    emit!(AzureEventHubsCheckpointError {
+                    emit(AzureEventHubsCheckpointError {
                         partition_id: &self.partition_id,
                         error,
                     });
@@ -399,13 +399,13 @@ impl PartitionReader {
         let position = position.clone();
         match checkpointer.commit(&self.partition_id, &position).await {
             Ok(()) => {
-                emit!(AzureEventHubsCheckpointCommitted {
+                emit(AzureEventHubsCheckpointCommitted {
                     partition_id: &self.partition_id,
                     sequence_number: position.sequence_number,
                 });
                 positions.committed = Some(position);
             }
-            Err(error) => emit!(AzureEventHubsCheckpointError {
+            Err(error) => emit(AzureEventHubsCheckpointError {
                 partition_id: &self.partition_id,
                 error,
             }),
@@ -428,7 +428,7 @@ impl PartitionReader {
         let body = match body_bytes(&event.raw_amqp_message().body) {
             Ok(body) => body,
             Err(kind) => {
-                emit!(AzureEventHubsUnsupportedBody {
+                emit(AzureEventHubsUnsupportedBody {
                     partition_id: &self.partition_id,
                     kind,
                 });
@@ -480,7 +480,7 @@ impl PartitionReader {
         if !events.is_empty() {
             let count = events.len();
             if self.out.send_batch(events).await.is_err() {
-                emit!(StreamClosedError { count });
+                emit(StreamClosedError { count });
                 return Err(());
             }
         }

@@ -39,7 +39,7 @@ const SAS_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
 const EMULATOR_AMQP_PORT: u16 = 5672;
 
 #[derive(Debug, Snafu, PartialEq, Eq)]
-pub enum ConnectionStringError {
+pub(super) enum ConnectionStringError {
     #[snafu(display("connection string segment `{segment}` is not a `key=value` pair"))]
     InvalidSegment { segment: String },
     #[snafu(display("connection string is missing `Endpoint`"))]
@@ -56,7 +56,7 @@ pub enum ConnectionStringError {
 
 /// Credentials carried by a connection string.
 #[derive(Clone, PartialEq, Eq)]
-pub enum SasCredentials {
+pub(super) enum SasCredentials {
     /// A named shared access key. Tokens are signed and renewed locally.
     Key { key_name: String, key: String },
     /// A pre-formed `SharedAccessSignature ...` token. It cannot be renewed.
@@ -78,7 +78,7 @@ impl fmt::Debug for SasCredentials {
 
 /// A parsed Event Hubs connection string.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EventHubsConnectionString {
+pub(super) struct EventHubsConnectionString {
     /// Fully qualified namespace host, for example `myns.servicebus.windows.net` (may carry a port).
     pub namespace: String,
     /// The `EntityPath` (Event Hub name), when present.
@@ -89,7 +89,7 @@ pub struct EventHubsConnectionString {
 }
 
 impl EventHubsConnectionString {
-    pub fn parse(s: &str) -> Result<Self, ConnectionStringError> {
+    pub(super) fn parse(s: &str) -> Result<Self, ConnectionStringError> {
         let mut endpoint = None;
         let mut key_name = None;
         let mut key = None;
@@ -149,14 +149,14 @@ impl EventHubsConnectionString {
     }
 
     /// The namespace host without a port, as used for client and checkpoint identity.
-    pub fn namespace_host(&self) -> &str {
+    pub(super) fn namespace_host(&self) -> &str {
         self.namespace
             .split_once(':')
             .map_or(self.namespace.as_str(), |(host, _)| host)
     }
 
     /// The plain AMQP endpoint of the development emulator, if this connection string targets it.
-    pub fn emulator_endpoint(&self) -> Option<String> {
+    pub(super) fn emulator_endpoint(&self) -> Option<String> {
         self.use_development_emulator.then(|| {
             if self.namespace.contains(':') {
                 format!("amqp://{}", self.namespace)
@@ -168,7 +168,7 @@ impl EventHubsConnectionString {
 }
 
 /// A [`TokenCredential`] that produces Event Hubs SAS tokens.
-pub struct SasTokenCredential {
+pub(super) struct SasTokenCredential {
     resource_uri: String,
     credentials: SasCredentials,
 }
@@ -184,7 +184,7 @@ impl fmt::Debug for SasTokenCredential {
 
 impl SasTokenCredential {
     /// Creates a credential scoped to the given Event Hub in the namespace.
-    pub fn new(namespace_host: &str, event_hub_name: &str, credentials: SasCredentials) -> Self {
+    pub(super) fn new(namespace_host: &str, event_hub_name: &str, credentials: SasCredentials) -> Self {
         Self {
             resource_uri: format!(
                 "https://{}/{}",

@@ -4,7 +4,7 @@ use vector_lib::{
 };
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct AzureEventHubsConnectError<'a> {
+pub(crate) struct AzureEventHubsConnectError<'a> {
     pub partition_id: &'a str,
     pub error: azure_messaging_eventhubs::EventHubsError,
 }
@@ -30,7 +30,7 @@ impl InternalEvent for AzureEventHubsConnectError<'_> {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct AzureEventHubsReceiveError<'a> {
+pub(crate) struct AzureEventHubsReceiveError<'a> {
     pub partition_id: &'a str,
     pub error: azure_messaging_eventhubs::EventHubsError,
 }
@@ -56,7 +56,7 @@ impl InternalEvent for AzureEventHubsReceiveError<'_> {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct AzureEventHubsUnsupportedBody<'a> {
+pub(crate) struct AzureEventHubsUnsupportedBody<'a> {
     pub partition_id: &'a str,
     pub kind: &'static str,
 }
@@ -82,7 +82,7 @@ impl InternalEvent for AzureEventHubsUnsupportedBody<'_> {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct AzureEventHubsCheckpointError<'a> {
+pub(crate) struct AzureEventHubsCheckpointError<'a> {
     pub partition_id: &'a str,
     pub error: azure_core::Error,
 }
@@ -108,7 +108,7 @@ impl InternalEvent for AzureEventHubsCheckpointError<'_> {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct AzureEventHubsDeliveryFailed<'a> {
+pub(crate) struct AzureEventHubsDeliveryFailed<'a> {
     pub partition_id: &'a str,
 }
 
@@ -122,7 +122,7 @@ impl InternalEvent for AzureEventHubsDeliveryFailed<'_> {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct AzureEventHubsCheckpointCommitted<'a> {
+pub(crate) struct AzureEventHubsCheckpointCommitted<'a> {
     pub partition_id: &'a str,
     pub sequence_number: Option<i64>,
 }
@@ -138,7 +138,7 @@ impl InternalEvent for AzureEventHubsCheckpointCommitted<'_> {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct AzureEventHubsPartitionPropertiesError<'a> {
+pub(crate) struct AzureEventHubsPartitionPropertiesError<'a> {
     pub partition_id: &'a str,
     pub error: azure_messaging_eventhubs::EventHubsError,
 }
@@ -164,7 +164,7 @@ impl InternalEvent for AzureEventHubsPartitionPropertiesError<'_> {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct AzureEventHubsInitialCheckpoint<'a> {
+pub(crate) struct AzureEventHubsInitialCheckpoint<'a> {
     pub partition_id: &'a str,
     pub outcome: &'a crate::sources::azure_event_hubs::InitialCheckpoint,
 }
@@ -196,7 +196,7 @@ impl InternalEvent for AzureEventHubsInitialCheckpoint<'_> {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct AzureEventHubsStartupError<'a> {
+pub(crate) struct AzureEventHubsStartupError<'a> {
     pub stage: &'static str,
     pub error: &'a str,
     pub retry_in: std::time::Duration,
@@ -224,7 +224,7 @@ impl InternalEvent for AzureEventHubsStartupError<'_> {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct AzureEventHubsStarted {
+pub(crate) struct AzureEventHubsStarted {
     pub failures: usize,
 }
 
