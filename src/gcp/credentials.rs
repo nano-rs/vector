@@ -36,7 +36,7 @@ use super::{
     GcpError,
     egress::{self, GoogleEndpoint},
 };
-use crate::{config::ProxyConfig, http::client_v1::HttpClient, tls::MaybeTlsSettings};
+use crate::{config::ProxyConfig, http::HttpClient, tls::MaybeTlsSettings};
 
 pub(super) const DEFAULT_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
@@ -469,9 +469,9 @@ async fn impersonate(
         "lifetime": format!("{lifetime_secs}s"),
     })
     .to_string();
-    let request = http_1::Request::post(url)
-        .header(http_1::header::CONTENT_TYPE, "application/json")
-        .header(http_1::header::AUTHORIZATION, format!("Bearer {bearer}"))
+    let request = http::Request::post(url)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::AUTHORIZATION, format!("Bearer {bearer}"))
         .body(full_body(Bytes::from(body)))
         .map_err(|error| GcpError::TokenEndpoint {
             endpoint: url.into(),
@@ -560,12 +560,12 @@ async fn post_form<T: DeserializeOwned>(
     body: String,
     authorization: Option<&str>,
 ) -> Result<T, GcpError> {
-    let mut builder = http_1::Request::post(url).header(
-        http_1::header::CONTENT_TYPE,
+    let mut builder = http::Request::post(url).header(
+        http::header::CONTENT_TYPE,
         "application/x-www-form-urlencoded",
     );
     if let Some(authorization) = authorization {
-        builder = builder.header(http_1::header::AUTHORIZATION, authorization);
+        builder = builder.header(http::header::AUTHORIZATION, authorization);
     }
     let request = builder
         .body(full_body(Bytes::from(body)))
@@ -587,7 +587,7 @@ async fn post_form<T: DeserializeOwned>(
 
 /// Report a token-endpoint failure by its OAuth `error` / `error_description` (or Google API
 /// `error.status` / `error.message`) only. The body is never echoed wholesale.
-fn endpoint_error(url: &str, status: http_1::StatusCode, bytes: &[u8]) -> GcpError {
+fn endpoint_error(url: &str, status: http::StatusCode, bytes: &[u8]) -> GcpError {
     let value: Option<serde_json::Value> = serde_json::from_slice(bytes).ok();
     let field =
         |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_owned);
@@ -617,8 +617,8 @@ fn endpoint_error(url: &str, status: http_1::StatusCode, bytes: &[u8]) -> GcpErr
 }
 
 async fn send(
-    request: http_1::Request<vector_http::RequestBody>,
-) -> Result<(http_1::StatusCode, Bytes), GcpError> {
+    request: http::Request<vector_http::RequestBody>,
+) -> Result<(http::StatusCode, Bytes), GcpError> {
     let endpoint = request.uri().to_string();
     let proxy = ProxyConfig::from_env();
     let tls = MaybeTlsSettings::enable_client().map_err(|error| GcpError::TokenEndpoint {

@@ -206,10 +206,10 @@ async fn authenticator_from_authorized_user_file() {
     assert_eq!(auth.make_token().as_deref(), Some("Bearer ya29.file"));
     assert_eq!(auth.quota_project(), Some("billing-proj"));
 
-    let mut request = http_1::Request::get("https://pubsub.googleapis.com/v1/x")
+    let mut request = http::Request::get("https://pubsub.googleapis.com/v1/x")
         .body(())
         .unwrap();
-    auth.apply_v1(&mut request);
+    auth.apply(&mut request);
     assert_eq!(request.headers()["x-goog-user-project"], "billing-proj");
     assert_eq!(request.headers()["authorization"], "Bearer ya29.file");
 
@@ -234,8 +234,8 @@ async fn no_quota_header_without_quota_project() {
     let auth = GcpAuthenticator::from_file(file.path().to_str().unwrap(), Scope::PubSub)
         .await
         .unwrap();
-    let mut request = http_1::Request::get("https://x/").body(()).unwrap();
-    auth.apply_v1(&mut request);
+    let mut request = http::Request::get("https://x/").body(()).unwrap();
+    auth.apply(&mut request);
     assert!(!request.headers().contains_key("x-goog-user-project"));
 }
 
