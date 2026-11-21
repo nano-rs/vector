@@ -28,10 +28,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use http_1::StatusCode;
+use http::StatusCode;
 use vector_lib::{
     NamedInternalEvent, configurable::configurable_component, counter, gauge,
-    internal_event::{CounterName, GaugeName, InternalEvent},
+    internal_event::{CounterName, GaugeName, InternalEvent, emit},
 };
 
 use super::{
@@ -41,7 +41,7 @@ use super::{
 };
 use crate::sinks::{
     prelude::*,
-    util::{http::HttpRequest, http_v1::HttpResponse},
+    util::http::{HttpRequest, HttpResponse},
 };
 
 /// Default cap on the bytes kept per sink: 256 MiB.
@@ -144,19 +144,19 @@ pub(super) struct StoreOutcome {
 
 impl StoreOutcome {
     fn emit(&self) {
-        emit!(DeadLettered {
+        emit(DeadLettered {
             count: self.stored_events,
             held_bytes: self.held_bytes,
         });
-        emit!(DeadLetterDiscarded {
+        emit(DeadLetterDiscarded {
             count: self.evicted_events,
             reason: "evicted",
         });
-        emit!(DeadLetterDiscarded {
+        emit(DeadLetterDiscarded {
             count: self.oversize_events,
             reason: "oversize",
         });
-        emit!(DeadLetterDiscarded {
+        emit(DeadLetterDiscarded {
             count: self.failed_events,
             reason: "write_failed",
         });
@@ -855,7 +855,7 @@ mod tests {
     ) -> EventStatus {
         let inner = tower::service_fn(move |_request: HttpRequest<PartitionKey>| async move {
             Ok::<_, crate::Error>(HttpResponse {
-                response: http_1::Response::builder()
+                response: http::Response::builder()
                     .status(status)
                     .body(Bytes::from_static(body.as_bytes()))
                     .unwrap(),
