@@ -19,8 +19,9 @@ removed" below). Only the fork's own workflows (`.github/workflows/nano-*.yml`) 
 
 ## The patch series
 
-`nano/v0.61` (cut from upstream `v0.61.0`, NAN-4904) serves the single-tenant ClickHouse
-product (nanosiem `clickhouse/*`). Every patch is a self-contained commit, in this order:
+`nano/v0.62` (cut from upstream `v0.62.0`, NAN-5808; `nano/v0.61` from `v0.61.0`, NAN-4904, stays
+the rollback point for `0.61.0-nano.*` images) serves the single-tenant ClickHouse product
+(nanosiem `clickhouse/*`). Every patch is a self-contained commit, in this order:
 
 1. `feat(sources): add azure_event_hubs source` (NAN-3599): `src/sources/azure_event_hubs/`,
    `src/internal_events/azure_event_hubs.rs`, docs (`website/…/azure_event_hubs*`),
@@ -39,6 +40,29 @@ product (nanosiem `clickhouse/*`). Every patch is a self-contained commit, in th
    `src/common/http/mod.rs`, `src/sources/util/http/prelude.rs`, `src/sources/http_server.rs`
    and `src/sources/splunk_hec/mod.rs`; parity config `parity/open-ingest-tokens.toml`.
 5. `chore(nano): ClickHouse component set`: FEATURES/COMPONENTS/parity for the CH product.
+6. `feat(gcp): ADC credential types + egress policy` (NAN-4935): `src/gcp/credentials.rs`,
+   `src/gcp/egress.rs` (+ tests), hunks in `src/gcp.rs` and `src/sources/gcp_pubsub.rs`.
+7. `fix(buffers): retry transient EOF behind published disk progress` (NAN-4936; port of
+   vectordotdev/vector#26946, still open upstream at v0.62.0) and `fix(topology): a failed
+   reload's rollback no longer Replaces inputs it Removed` (NAN-4936).
+8. `fix(splunk_hec source): decode gzip indexer-ack queries` (NAN-4976).
+9. `feat(sources): crowdstrike_fdr source` (NAN-5005) and its three follow-ups.
+10. `fix(buffers): disk_v2 acknowledges a record only after it reaches the data file` (NAN-5208)
+    and `fix(buffers): disk_v2 fsyncs before acknowledging, with group commit` (NAN-5285).
+11. `fix(clickhouse sink): retry auth and access refusals` (NAN-5390).
+12. `fix(disk buffer, clickhouse sink): honor finalization status; dead-letter permanent
+    rejections` (NAN-5567).
+
+On `nano/v0.62` each patch is followed, where upstream's API moved, by a
+`fix(<area>): adapt … to v0.62.0` commit (NAN-5808): `emit!`/`register!` became functions
+(#27085), `unreachable_pub` is denied (#27055), `http_1`/`http_v1`/`client_v1` became `http`
+(#27048, #27021, #26960), `ExtraContext` moved to `vector_lib` (#26912). The NAN-5567 ledger
+hunk was merged by hand into upstream's weak-reference finalizer (#27083).
+
+Consumers moving from a 0.61 image: 0.62 parses the config before interpolating
+(vectordotdev/vector#26475). An unquoted placeholder such as `max_bytes = ${VAR:-52428800}`
+is now a TOML parse error; quote it (`max_bytes = "${VAR:-52428800}"`, coerced to the field's
+type). 0.61 rejects the quoted form, so the config change and the image bump ship together.
 
 Not carried from `nano/v0.59` (it stays the rollback point for the lake images):
 
@@ -161,20 +185,20 @@ as the entrypoint, `/var/lib/vector` present, and `/etc/vector` holding exactly 
 "Component set" below) with thin LTO and 16 codegen units (`LTO=fat CODEGEN_UNITS=1`
 reproduces upstream's profile). It fails if `vector list` lacks `azure_event_hubs`.
 
-Version scheme: `<upstream version>-nano.<n>`, for example `0.61.0-nano.1`. `<n>` starts at 1
+Version scheme: `<upstream version>-nano.<n>`, for example `0.62.0-nano.1`. `<n>` starts at 1
 and increments for every image cut from the same upstream version; the workflow refuses a
 version that does not start with the `Cargo.toml` version or that already exists in GHCR.
-The git tag is `image-<version>` (`image-0.61.0-nano.1`). The `image-` prefix keeps it clear
+The git tag is `image-<version>` (`image-0.62.0-nano.1`). The `image-` prefix keeps it clear
 of upstream's release tag filters (`v0.*`), which still exist on mirrored branches.
 
-1. Pick `n`: one more than the newest `0.61.0-nano.*` tag at
+1. Pick `n`: one more than the newest `0.62.0-nano.*` tag at
    https://github.com/nano-rs/vector/pkgs/container/vector.
 2. Start the build, either way:
 
    ```sh
-   git tag image-0.61.0-nano.2 origin/nano/v0.61 && git push origin image-0.61.0-nano.2
+   git tag image-0.62.0-nano.2 origin/nano/v0.62 && git push origin image-0.62.0-nano.2
    # or
-   gh workflow run nano-image.yml --repo nano-rs/vector --ref nano/v0.61 -f nano_rev=2
+   gh workflow run nano-image.yml --repo nano-rs/vector --ref nano/v0.62 -f nano_rev=2
    ```
 
 3. Wait (about 2-4 h; amd64 and arm64 build in parallel on native runners). The jobs:

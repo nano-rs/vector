@@ -17,8 +17,10 @@
 # to the FEATURES file (same set on both architectures); pass e.g.
 # `--build-arg FEATURES=target-x86_64-unknown-linux-gnu` for upstream's full release set.
 
-ARG RUST_VERSION=1.96.1
-ARG DEBIAN_DIGEST=sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+# RUST_VERSION follows upstream's rust-toolchain.toml; DEBIAN_DIGEST is upstream's
+# distribution/docker/debian base (v0.62.0).
+ARG RUST_VERSION=1.99.1
+ARG DEBIAN_DIGEST=sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 FROM docker.io/rust:${RUST_VERSION}-trixie AS builder
 
