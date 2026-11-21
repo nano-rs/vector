@@ -302,7 +302,7 @@ mod tests {
         HttpResponse {
             events_byte_size: GroupedCountByteSize::new_untagged(),
             raw_byte_size: 0,
-            response: http_1::Response::builder()
+            response: http::Response::builder()
                 .status(status)
                 .body(Bytes::from_static(body.as_bytes()))
                 .unwrap(),
