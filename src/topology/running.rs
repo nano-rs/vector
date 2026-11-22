@@ -614,6 +614,9 @@ impl RunningTopology {
             .map(|(_, key)| key.clone());
 
         // For any sink whose buffer configuration didn't change, we can reuse their buffer.
+        // nano (NAN-5567, NAN-5808): the `Errored` hold must not change either. A reused buffer
+        // keeps the hold it was built with, so reusing it across a change of sink type would
+        // leave the buffer and the new sink disagreeing on whether `Errored` records are held.
         let reuse_buffers = diff
             .sinks
             .to_change
@@ -623,14 +626,7 @@ impl RunningTopology {
                 if diff.components_to_reload.contains(key) {
                     return false;
                 }
-                self.config
-                    .sink(key)
-                    .map(|s| s.buffer.clone())
-                    .or_else(|| enrichment_table_sink_buffer(&self.config, key))
-                    == new_config
-                        .sink(key)
-                        .map(|s| s.buffer.clone())
-                        .or_else(|| enrichment_table_sink_buffer(new_config, key))
+                sink_buffer_and_hold(&self.config, key) == sink_buffer_and_hold(new_config, key)
             })
             .cloned()
             .collect::<HashSet<_>>();
@@ -1592,6 +1588,22 @@ fn enrichment_table_sink_resources(config: &Config, sink_key: &ComponentKey) -> 
         .unwrap_or_default()
 }
 
+/// nano (NAN-5567, NAN-5808): a sink's buffer configuration and whether its disk buffer holds
+/// `Errored` records. A buffer is reused across a reload only when both are unchanged.
+fn sink_buffer_and_hold(
+    config: &Config,
+    sink_key: &ComponentKey,
+) -> Option<(vector_lib::buffers::BufferConfig, bool)> {
+    config
+        .sink(sink_key)
+        .map(|sink| (sink.buffer.clone(), sink.inner.hold_errored_in_disk_buffer()))
+        .or_else(|| {
+            enrichment_table_sinks(&config.enrichment_tables)
+                .find(|(key, _)| key == sink_key)
+                .map(|(_, sink)| (sink.buffer, sink.inner.hold_errored_in_disk_buffer()))
+        })
+}
+
 fn enrichment_table_sink_buffer(
     config: &Config,
     sink_key: &ComponentKey,
@@ -1667,5 +1679,47 @@ mod tests {
         );
 
         topology.stop().await;
+    }
+
+    /// nano (NAN-5567, NAN-5808), review round 3 P2-2: a buffer is not reused across a reload that
+    /// changes whether the sink holds `Errored` records, even with an identical buffer config.
+    #[cfg(feature = "sinks-clickhouse")]
+    #[test]
+    fn buffer_reuse_requires_the_same_errored_hold() {
+        use crate::sinks::clickhouse::config::ClickhouseConfig;
+
+        let with_sink = |clickhouse: bool| {
+            let mut config = Config::builder();
+            config.add_source("in", basic_source().1);
+            if clickhouse {
+                config.add_sink(
+                    "output",
+                    &["in"],
+                    ClickhouseConfig {
+                        endpoint: "http://localhost:8123"
+                            .parse::<http::Uri>()
+                            .unwrap()
+                            .try_into()
+                            .unwrap(),
+                        table: "logs".try_into().unwrap(),
+                        ..Default::default()
+                    },
+                );
+            } else {
+                config.add_sink("output", &["in"], basic_sink(1).1);
+            }
+            config.build().unwrap()
+        };
+        let key = ComponentKey::from("output");
+        let mock = super::sink_buffer_and_hold(&with_sink(false), &key).unwrap();
+        let clickhouse = super::sink_buffer_and_hold(&with_sink(true), &key).unwrap();
+        assert_eq!(mock.0, clickhouse.0, "same buffer config");
+        assert!(!mock.1 && clickhouse.1);
+        assert_ne!(mock, clickhouse, "the buffer is not reused");
+        assert_eq!(
+            super::sink_buffer_and_hold(&with_sink(true), &key),
+            Some(clickhouse),
+            "an unchanged clickhouse sink still reuses its buffer"
+        );
     }
 }

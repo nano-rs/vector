@@ -705,12 +705,15 @@ async fn dead_letter(
     buffer_holds_errored: bool,
     enabled: bool,
 ) -> StoreResult {
+    let events = batch.events;
     let Some(store) = store else {
-        return if enabled {
-            StoreResult::Failed
-        } else {
-            StoreResult::Disabled
-        };
+        if !enabled {
+            return StoreResult::Disabled;
+        }
+        // Enabled, but no usable `data_dir`: the batch is reported `Errored`, and is lost unless a
+        // disk buffer holds it, so count it like a failed write (review round 3, P2-1).
+        discarded_unless_kept(events, buffer_holds_errored, "no_data_dir");
+        return StoreResult::Failed;
     };
     let permanent = batch.event_status == EventStatus::Rejected;
     // File I/O off the async runtime; the internal events are emitted back here, inside the
@@ -728,8 +731,20 @@ async fn dead_letter(
         }
         Err(error) => {
             error!(message = "Dead-letter write task failed.", %error);
+            // `Failed` is reported `Errored`, kept only by a buffer that holds `Errored` records.
+            discarded_unless_kept(events, buffer_holds_errored, "write_failed");
             StoreResult::Failed
         }
+    }
+}
+
+/// Counts a batch the store never saw as discarded, unless the sink's disk buffer holds it.
+fn discarded_unless_kept(events: usize, buffer_holds_errored: bool, reason: &'static str) {
+    if !buffer_holds_errored {
+        emit(DeadLetterDiscarded {
+            count: events,
+            reason,
+        });
     }
 }
 
@@ -859,7 +874,7 @@ where
 }
 
 /// Logs (and, when disabled, counts) a permanent rejection that was not dead-lettered (nano,
-/// NAN-5808). Oversize and failed writes are already logged and counted by the store.
+/// NAN-5808). Oversize and failed writes are already counted by `dead_letter`.
 fn not_stored(events: usize, holds: bool, result: StoreResult) {
     match result {
         StoreResult::Stored | StoreResult::Oversize => {}
@@ -1195,6 +1210,52 @@ mod tests {
         // An unknown error is permanent.
         let unknown = || -> crate::Error { crate::Error::from("something else") };
         assert_eq!(call_failing(None, true, unknown).await, Ok(EventStatus::Errored));
+    }
+
+    /// Review round 3, P2-1: with the store enabled but no usable `data_dir`, a batch that no disk
+    /// buffer holds is counted as discarded (reason `no_data_dir`); one a disk buffer holds is not.
+    #[tokio::test]
+    async fn missing_store_counts_discarded_unless_held() {
+        use vector_lib::event::metric::MetricValue;
+
+        crate::test_util::components::init_test();
+        let no_data_dir = || {
+            vector_lib::metrics::Controller::get()
+                .unwrap()
+                .capture_metrics()
+                .into_iter()
+                .filter(|m| {
+                    m.name() == "component_dead_letter_discarded_events_total"
+                        && m.tags().is_some_and(|t| t.get("reason") == Some("no_data_dir"))
+                })
+                .map(|m| match m.value() {
+                    MetricValue::Counter { value } => *value,
+                    _ => 0.0,
+                })
+                .sum::<f64>()
+        };
+        let before = no_data_dir();
+
+        // Held by a disk buffer: not discarded.
+        assert_eq!(
+            call_with_hold(None, 400, "Code: 27. Cannot parse", true, true).await,
+            EventStatus::Errored
+        );
+        assert_eq!(no_data_dir(), before);
+
+        // Memory buffer: nothing keeps it, so it is counted.
+        assert_eq!(
+            call_with_hold(None, 400, "Code: 27. Cannot parse", false, true).await,
+            EventStatus::Errored
+        );
+        assert_eq!(no_data_dir(), before + 1.0);
+
+        // Disabled store: counted as `disabled`, not `no_data_dir`.
+        assert_eq!(
+            call_with_hold(None, 400, "Code: 27. Cannot parse", false, false).await,
+            EventStatus::Rejected
+        );
+        assert_eq!(no_data_dir(), before + 1.0);
     }
 
     /// `held_for_replay` is true only when the sink's disk buffer really holds `Errored` records.
