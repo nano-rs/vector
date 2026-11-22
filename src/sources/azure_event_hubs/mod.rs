@@ -36,7 +36,7 @@ use vrl::{owned_value_path, value::Kind};
 use crate::{
     config::{SourceConfig, SourceContext},
     internal_events::{AzureEventHubsStarted, AzureEventHubsStartupError},
-    serde::{bool_or_struct, default_decoding, default_framing_message_based},
+    serde::{default_decoding, default_framing_message_based},
     shutdown::ShutdownSignal,
     sinks::azure_common::config::AzureAuthentication,
 };
@@ -185,7 +185,7 @@ pub struct AzureEventHubsSourceConfig {
     #[derivative(Default(value = "default_decoding()"))]
     pub decoding: DeserializerConfig,
 
-    #[serde(default, deserialize_with = "bool_or_struct")]
+    #[serde(default, deserialize_with = "crate::serde::bool_or_struct")]
     pub acknowledgements: SourceAcknowledgementsConfig,
 
     /// The namespace to use for logs. This overrides the global setting.
@@ -915,5 +915,45 @@ mod tests {
     #[test]
     fn rejects_unknown_fields() {
         assert!(toml::from_str::<AzureEventHubsSourceConfig>(r#"bogus = 1"#).is_err());
+    }
+
+    /// v0.62 coerces the config against the component schema before serde runs
+    /// (vectordotdev/vector#26475). `acknowledgements` must accept the boolean shorthand as well
+    /// as the table form, which needs the schema that `crate::serde::bool_or_struct` (qualified
+    /// path) generates (NAN-5808).
+    #[test]
+    fn acknowledgements_accepts_bool_and_table_through_the_config_loader() {
+        for acknowledgements in [
+            "acknowledgements = true",
+            "acknowledgements = false",
+            "acknowledgements.enabled = true",
+        ] {
+            let config = format!(
+                r#"
+                [sources.eh]
+                type = "azure_event_hubs"
+                namespace = "ns.servicebus.invalid"
+                event_hub_name = "hub"
+                {acknowledgements}
+
+                [sources.eh.auth]
+                azure_credential_kind = "managed_identity"
+
+                [sources.eh.checkpoint_store]
+                type = "azure_blob"
+                account_name = "checkpoints"
+                container_name = "nano"
+
+                [sources.eh.checkpoint_store.auth]
+                azure_credential_kind = "managed_identity"
+
+                [sinks.out]
+                type = "blackhole"
+                inputs = ["eh"]
+                "#
+            );
+            crate::config::load_from_str(&config, crate::config::Format::Toml)
+                .unwrap_or_else(|errors| panic!("{acknowledgements}: {errors:?}"));
+        }
     }
 }

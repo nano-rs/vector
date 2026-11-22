@@ -1600,3 +1600,27 @@ async fn cursor_stops_before_a_held_batch_then_catches_up() {
     until_cursor(&cursor, "older", |ms| ms == Some(older_ms)).await;
     harness.stop().await;
 }
+
+/// v0.62 coerces the config against the component schema before serde runs (vectordotdev/vector#26475).
+/// `acknowledgements` must accept the boolean shorthand as well as the table form, which needs
+/// the schema that `crate::serde::bool_or_struct` (qualified path) generates (NAN-5808).
+#[test]
+fn acknowledgements_accepts_bool_and_table_through_the_config_loader() {
+    for acknowledgements in ["acknowledgements = true", "acknowledgements = false", "acknowledgements.enabled = true"] {
+        let config = format!(
+            r#"
+            [sources.fdr]
+            type = "crowdstrike_fdr"
+            region = "us-west-2"
+            queue_url = "https://sqs.us-west-2.amazonaws.com/000000000000/fdr"
+            {acknowledgements}
+
+            [sinks.out]
+            type = "blackhole"
+            inputs = ["fdr"]
+            "#
+        );
+        crate::config::load_from_str(&config, crate::config::Format::Toml)
+            .unwrap_or_else(|errors| panic!("{acknowledgements}: {errors:?}"));
+    }
+}

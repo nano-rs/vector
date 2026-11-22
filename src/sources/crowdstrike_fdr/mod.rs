@@ -26,7 +26,7 @@ use crate::{
     config::{
         GenerateConfig, SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput,
     },
-    serde::{bool_or_struct, default_decoding},
+    serde::default_decoding,
     tls::TlsConfig,
 };
 
@@ -325,7 +325,7 @@ pub struct CrowdstrikeFdrConfig {
     #[serde(default = "default_decoding")]
     decoding: DeserializerConfig,
 
-    #[serde(default, deserialize_with = "bool_or_struct")]
+    #[serde(default, deserialize_with = "crate::serde::bool_or_struct")]
     acknowledgements: SourceAcknowledgementsConfig,
 
     /// The namespace to use for logs. This overrides the global setting.
