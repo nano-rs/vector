@@ -12,7 +12,8 @@
 //!
 //! The store never blocks or fails delivery: it is capped at `max_bytes`, and when a new batch
 //! does not fit, the oldest batches are deleted first. Every discarded event (evicted, too large
-//! for the cap, or a failed write) is counted in `component_dead_letter_discarded_events_total`.
+//! for the cap, a failed write, or dropped because the store is disabled) is counted in
+//! `component_dead_letter_discarded_events_total`.
 //! Stored events are counted in `component_dead_lettered_events_total`, and the bytes currently
 //! held are reported in the `component_dead_letter_bytes` gauge.
 
@@ -65,11 +66,19 @@ const fn default_max_bytes() -> u64 {
 pub struct DeadLetterConfig {
     /// Write permanently rejected batches to `<data_dir>/dead_letter/<sink_id>/` instead of
     /// dropping them.
+    ///
+    /// When `false`, a permanently rejected batch is dropped and acknowledged (counted as
+    /// discarded with reason `disabled`), as upstream Vector does. When `true`, a permanently
+    /// rejected batch is acknowledged only once its copy is durably stored; if the write fails
+    /// (or there is no usable `data_dir`) it is reported errored, so a disk buffer keeps it until
+    /// the store is fixed.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
     /// The most bytes kept for this sink. When a new batch does not fit, the oldest batches are
-    /// deleted (and counted as discarded).
+    /// deleted (and counted as discarded). A single permanently rejected batch larger than this
+    /// is dropped and acknowledged (counted as discarded with reason `oversize`), since it could
+    /// never be stored. Must be greater than zero.
     #[serde(default = "default_max_bytes")]
     #[configurable(metadata(docs::type_unit = "bytes"))]
     pub max_bytes: u64,
@@ -143,9 +152,15 @@ pub(super) struct StoreOutcome {
 }
 
 impl StoreOutcome {
-    /// Whether the batch is durably in the store.
-    const fn stored(&self) -> bool {
-        self.stored_events > 0
+    /// What happened to the batch.
+    const fn result(&self) -> StoreResult {
+        if self.stored_events > 0 {
+            StoreResult::Stored
+        } else if self.oversize_events > 0 {
+            StoreResult::Oversize
+        } else {
+            StoreResult::Failed
+        }
     }
 
     /// `kept` (nano, NAN-5808): the caller keeps a batch the store could not take (it is reported
@@ -172,6 +187,20 @@ impl StoreOutcome {
     }
 }
 
+/// The result of trying to dead-letter one batch (nano, NAN-5808).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoreResult {
+    /// Durably in the store.
+    Stored,
+    /// Larger than the store's cap: it can never be stored.
+    Oversize,
+    /// The write failed (I/O error, unusable directory, or no usable `data_dir`): fixable by an
+    /// operator, so the batch is kept for replay where the buffer can keep it.
+    Failed,
+    /// The store is disabled (`dead_letter.enabled = false`).
+    Disabled,
+}
+
 /// A rejected batch, as it would have been sent.
 #[derive(Debug)]
 pub(super) struct RejectedBatch {
@@ -183,7 +212,7 @@ pub(super) struct RejectedBatch {
     /// The URL query string the batch was sent with (`INSERT` plus settings), if known.
     pub(super) url_query: Option<String>,
     /// How the batch is reported: `Rejected` (permanent, acknowledged once this copy is stored) or
-    /// `Errored` (transient, or a permanent rejection this store could not take).
+    /// `Errored` (transient, or a permanent rejection whose write failed).
     pub(super) event_status: EventStatus,
     /// The batch is also kept in the sink's disk buffer and replayed after a restart (an
     /// `Errored` batch in a buffer that holds `Errored` records, NAN-5567). Replaying this copy as
@@ -250,7 +279,7 @@ impl DeadLetterStore {
 
         if needed > self.max_bytes {
             error!(
-                message = "Rejected batch is larger than the dead-letter cap; not stored.",
+                message = "Rejected batch is larger than the dead-letter cap; not stored (a permanently rejected one is dropped).",
                 events = batch.events,
                 bytes = needed,
                 max_bytes = self.max_bytes,
@@ -546,7 +575,7 @@ pub(super) fn resolve_store(
         Ok(dir) => dir,
         Err(error) => {
             warn!(
-                message = "No usable data_dir; rejected ClickHouse batches will be dropped, not dead-lettered.",
+                message = "No usable data_dir for the dead-letter store; permanently rejected ClickHouse batches will be reported errored (held by a disk buffer, retried by an acknowledging source) until data_dir is fixed or dead_letter.enabled is set to false.",
                 %error,
             );
             return None;
@@ -628,11 +657,18 @@ impl DriverResponse for ClickhouseResponse {
 ///   - permanent (for example a request that could not be built) is dead-lettered and returned as
 ///     the error, which the driver reports `Rejected`.
 ///
-/// **No acknowledgement without a durable write (NAN-5808).** A batch is reported `Rejected`
-/// (which the disk buffer acknowledges) only once its copy is durably in the dead-letter store.
-/// When the store cannot take it (disabled, no usable `data_dir`, larger than the cap, or a failed
-/// write), it is reported `Errored` instead, so a disk buffer that holds `Errored` records keeps
-/// it: Vector stops and replays it after a restart rather than losing it.
+/// **No acknowledgement without a durable write, unless it can never be stored (NAN-5808).** With
+/// the store enabled, a permanent rejection is reported `Rejected` (which the disk buffer
+/// acknowledges) only once its copy is durably in the dead-letter store. When the write fails for
+/// a reason an operator can fix (an I/O error such as a full disk, or no usable `data_dir`), it is
+/// reported `Errored` instead, so a disk buffer that holds `Errored` records keeps it and replays
+/// it after a restart rather than losing it.
+///
+/// A permanent rejection that can never be stored is still reported `Rejected` (dropped and
+/// counted as discarded), so one poison batch cannot wedge the pipeline or crash-loop Vector:
+/// - the store is disabled (`dead_letter.enabled = false`, the explicit opt-out), reason
+///   `disabled`;
+/// - the batch is larger than `dead_letter.max_bytes`, reason `oversize`.
 #[derive(Clone)]
 pub(super) struct DeadLetterService<S> {
     inner: S,
@@ -640,6 +676,8 @@ pub(super) struct DeadLetterService<S> {
     replay: Option<Arc<ClickhouseServiceRequestBuilder>>,
     /// The sink's disk buffer holds `Errored` records for replay (`SinkContext::buffer_holds_errored`).
     buffer_holds_errored: bool,
+    /// `dead_letter.enabled`: when `false`, a permanent rejection is dropped, not held.
+    enabled: bool,
 }
 
 impl<S> DeadLetterService<S> {
@@ -648,39 +686,49 @@ impl<S> DeadLetterService<S> {
         store: Option<Arc<DeadLetterStore>>,
         replay: Option<Arc<ClickhouseServiceRequestBuilder>>,
         buffer_holds_errored: bool,
+        enabled: bool,
     ) -> Self {
         Self {
             inner,
             store,
             replay,
             buffer_holds_errored,
+            enabled,
         }
     }
 }
 
-/// Writes `batch` to the store. Returns whether it is durably stored.
+/// Writes `batch` to the store and reports what happened to it.
 async fn dead_letter(
     store: Option<Arc<DeadLetterStore>>,
     batch: RejectedBatch,
     buffer_holds_errored: bool,
-) -> bool {
+    enabled: bool,
+) -> StoreResult {
     let Some(store) = store else {
-        return false;
+        return if enabled {
+            StoreResult::Failed
+        } else {
+            StoreResult::Disabled
+        };
     };
-    // A batch this store cannot take is reported `Errored`; it is kept only by a buffer that
-    // holds `Errored` records.
-    let kept = buffer_holds_errored;
+    let permanent = batch.event_status == EventStatus::Rejected;
     // File I/O off the async runtime; the internal events are emitted back here, inside the
     // component's span, so they carry its tags.
     let span = tracing::Span::current();
     match tokio::task::spawn_blocking(move || span.in_scope(|| store.store(&batch))).await {
         Ok(outcome) => {
+            let result = outcome.result();
+            // A batch the store could not take is kept only when it is reported `Errored` into a
+            // buffer that holds `Errored` records; a permanent oversize batch is dropped.
+            let kept = buffer_holds_errored
+                && undelivered_status(permanent, result) == EventStatus::Errored;
             outcome.emit(kept);
-            outcome.stored()
+            result
         }
         Err(error) => {
             error!(message = "Dead-letter write task failed.", %error);
-            false
+            StoreResult::Failed
         }
     }
 }
@@ -702,13 +750,15 @@ fn is_transient_error(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// The status for a batch that was not delivered, given whether its copy is durably stored:
-/// `Rejected` only for a permanent failure that is stored; otherwise `Errored`.
-const fn undelivered_status(permanent: bool, stored: bool) -> EventStatus {
-    if permanent && stored {
-        EventStatus::Rejected
-    } else {
-        EventStatus::Errored
+/// The status for a batch that was not delivered. A transient failure is always `Errored`. A
+/// permanent one is `Rejected` once stored, or when it can never be stored (store disabled, or
+/// larger than the cap), and `Errored` only when the write failed for a fixable reason.
+const fn undelivered_status(permanent: bool, result: StoreResult) -> EventStatus {
+    match (permanent, result) {
+        (true, StoreResult::Stored | StoreResult::Oversize | StoreResult::Disabled) => {
+            EventStatus::Rejected
+        }
+        _ => EventStatus::Errored,
     }
 }
 
@@ -729,6 +779,7 @@ where
     fn call(&mut self, request: HttpRequest<PartitionKey>) -> Self::Future {
         let store = self.store.clone();
         let holds = self.buffer_holds_errored;
+        let enabled = self.enabled;
         let key = request.get_additional_metadata().clone();
         let url_query = self
             .replay
@@ -763,26 +814,36 @@ where
                     }
                     let permanent = is_permanent_rejection(&ClickhouseRetryLogic, &response);
                     let reason = rejection_reason(status, response.response.body());
-                    let stored =
-                        dead_letter(store, copy(reason, Some(status.as_u16()), permanent), holds)
-                            .await;
-                    let event_status = undelivered_status(permanent, stored);
-                    if permanent && !stored {
-                        not_stored(events, holds);
+                    let result = dead_letter(
+                        store,
+                        copy(reason, Some(status.as_u16()), permanent),
+                        holds,
+                        enabled,
+                    )
+                    .await;
+                    if permanent {
+                        not_stored(events, holds, result);
                     }
-                    Ok(ClickhouseResponse::new(Some(response), event_status))
+                    Ok(ClickhouseResponse::new(
+                        Some(response),
+                        undelivered_status(permanent, result),
+                    ))
                 }
                 Err(error) => {
                     let permanent = !is_transient_error(error.as_ref());
-                    let stored =
-                        dead_letter(store, copy(error.as_ref().to_string(), None, permanent), holds)
-                            .await;
-                    if undelivered_status(permanent, stored) == EventStatus::Rejected {
-                        // Stored: the driver reports the error as `Rejected`.
-                        return Err(error);
-                    }
+                    let result = dead_letter(
+                        store,
+                        copy(error.as_ref().to_string(), None, permanent),
+                        holds,
+                        enabled,
+                    )
+                    .await;
                     if permanent {
-                        not_stored(events, holds);
+                        not_stored(events, holds, result);
+                    }
+                    if undelivered_status(permanent, result) == EventStatus::Rejected {
+                        // Stored, or never storable: the driver reports the error as `Rejected`.
+                        return Err(error);
                     }
                     error!(
                         message = "ClickHouse request failed; reporting the batch as errored.",
@@ -797,13 +858,27 @@ where
     }
 }
 
-/// Logs a permanent rejection that could not be dead-lettered (nano, NAN-5808).
-fn not_stored(events: usize, holds: bool) {
-    error!(
-        message = "A batch ClickHouse rejected could not be written to the dead-letter store; reporting it errored instead of acknowledging it.",
-        events,
-        held_for_replay = holds,
-    );
+/// Logs (and, when disabled, counts) a permanent rejection that was not dead-lettered (nano,
+/// NAN-5808). Oversize and failed writes are already logged and counted by the store.
+fn not_stored(events: usize, holds: bool, result: StoreResult) {
+    match result {
+        StoreResult::Stored | StoreResult::Oversize => {}
+        StoreResult::Disabled => {
+            warn!(
+                message = "ClickHouse permanently rejected a batch; dropped it (dead_letter.enabled = false).",
+                events,
+            );
+            emit(DeadLetterDiscarded {
+                count: events,
+                reason: "disabled",
+            });
+        }
+        StoreResult::Failed => error!(
+            message = "A batch ClickHouse rejected could not be written to the dead-letter store; reporting it errored instead of acknowledging it.",
+            events,
+            held_for_replay = holds,
+        ),
+    }
 }
 
 fn rejection_reason(status: StatusCode, body: &[u8]) -> String {
@@ -952,7 +1027,7 @@ mod tests {
         status: u16,
         body: &'static str,
     ) -> EventStatus {
-        call_with_hold(store, status, body, true).await
+        call_with_hold(store, status, body, true, true).await
     }
 
     async fn call_with_hold(
@@ -960,6 +1035,7 @@ mod tests {
         status: u16,
         body: &'static str,
         holds: bool,
+        enabled: bool,
     ) -> EventStatus {
         let inner = tower::service_fn(move |_request: HttpRequest<PartitionKey>| async move {
             Ok::<_, crate::Error>(HttpResponse {
@@ -971,7 +1047,7 @@ mod tests {
                 raw_byte_size: 0,
             })
         });
-        let mut service = DeadLetterService::new(inner, store, None, holds);
+        let mut service = DeadLetterService::new(inner, store, None, holds, enabled);
         let response = service
             .call(request(b"{\"a\":1}\n", 1))
             .await
@@ -983,12 +1059,13 @@ mod tests {
     /// the service reported; `Err` means it returned the error (the driver reports `Rejected`).
     async fn call_failing(
         store: Option<Arc<DeadLetterStore>>,
+        enabled: bool,
         error: fn() -> crate::Error,
     ) -> Result<EventStatus, ()> {
         let inner = tower::service_fn(move |_request: HttpRequest<PartitionKey>| async move {
             Err::<HttpResponse, crate::Error>(error())
         });
-        let mut service = DeadLetterService::new(inner, store, None, true);
+        let mut service = DeadLetterService::new(inner, store, None, true, enabled);
         service
             .call(request(b"{\"a\":1}\n", 1))
             .await
@@ -1017,22 +1094,14 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// NAN-5808: no acknowledgement without a durable write. A permanent rejection is reported
-    /// `Rejected` (acknowledged) only when its copy is stored; otherwise it is `Errored`, which a
-    /// disk buffer that holds `Errored` records keeps.
+    /// NAN-5808: no acknowledgement without a durable write. With the store enabled, a permanent
+    /// rejection is reported `Rejected` (acknowledged) only when its copy is stored; when the write
+    /// fails for a fixable reason it is `Errored`, which a disk buffer that holds `Errored`
+    /// records keeps.
     #[tokio::test]
-    async fn permanent_rejection_that_cannot_be_stored_is_errored() {
-        // No store (disabled, or no usable data_dir).
+    async fn permanent_rejection_whose_write_fails_is_errored() {
+        // Enabled, but no usable data_dir (no store).
         assert_eq!(call_with(None, 400, "Code: 27. Cannot parse").await, EventStatus::Errored);
-
-        // Larger than the cap.
-        let tmp = tempfile::tempdir().unwrap();
-        let tiny = open_store(tmp.path(), 8);
-        assert_eq!(
-            call_with(Some(tiny), 400, "Code: 27. Cannot parse").await,
-            EventStatus::Errored
-        );
-        assert!(metas(tmp.path()).is_empty());
 
         // The write fails (a directory Vector cannot write to).
         #[cfg(unix)]
@@ -1054,6 +1123,51 @@ mod tests {
         }
     }
 
+    /// NAN-5808 (review round 2, P1-1): a permanent rejection that can never be stored is
+    /// dropped and reported `Rejected`, never held as `Errored`: holding it would replay the same
+    /// poison batch forever (a disk buffer crash-loops Vector on it; an acknowledging source
+    /// redelivers it forever).
+    #[tokio::test]
+    async fn permanent_rejection_that_can_never_be_stored_is_rejected() {
+        // `dead_letter.enabled = false`: the explicit opt-out drops it, as upstream does.
+        assert_eq!(
+            call_with_hold(None, 400, "Code: 27. Cannot parse", true, false).await,
+            EventStatus::Rejected
+        );
+        assert_eq!(
+            call_with_hold(None, 500, "Code: 117. DB::Exception", true, false).await,
+            EventStatus::Rejected
+        );
+        // A transient failure is still `Errored` (held for replay) with the store disabled.
+        assert_eq!(
+            call_with_hold(None, 503, "Code: 202. Too many", true, false).await,
+            EventStatus::Errored
+        );
+
+        // Larger than the cap: it would never fit, so it is dropped rather than held.
+        let tmp = tempfile::tempdir().unwrap();
+        let tiny = open_store(tmp.path(), 8);
+        assert_eq!(
+            call_with(Some(Arc::clone(&tiny)), 400, "Code: 27. Cannot parse").await,
+            EventStatus::Rejected
+        );
+        assert!(metas(tmp.path()).is_empty());
+        // A transient oversize batch is still `Errored`: retrying it may succeed.
+        assert_eq!(
+            call_with(Some(tiny), 503, "Code: 202. Too many").await,
+            EventStatus::Errored
+        );
+
+        // A permanent request error with the store disabled is returned as the error, which the
+        // driver reports `Rejected`.
+        let permanent = || -> crate::Error {
+            Box::new(vector_http::HttpError::from(crate::Error::from("bad request template")))
+        };
+        assert_eq!(call_failing(None, false, permanent).await, Err(()));
+        let transient = || -> crate::Error { Box::new(vector_http::HttpError::new("connection reset")) };
+        assert_eq!(call_failing(None, false, transient).await, Ok(EventStatus::Errored));
+    }
+
     /// NAN-5808: a request that failed without a response. Transient (retriable transport error,
     /// timeout) is `Errored` with a copy; permanent is returned as the error (`Rejected`) only
     /// once its copy is stored, otherwise it is `Errored` too.
@@ -1064,9 +1178,9 @@ mod tests {
         let store = open_store(&dir, u64::MAX);
 
         let transient = || -> crate::Error { Box::new(vector_http::HttpError::new("connection reset")) };
-        assert_eq!(call_failing(Some(Arc::clone(&store)), transient).await, Ok(EventStatus::Errored));
+        assert_eq!(call_failing(Some(Arc::clone(&store)), true, transient).await, Ok(EventStatus::Errored));
         let timeout = || -> crate::Error { Box::new(tower::timeout::error::Elapsed::new()) };
-        assert_eq!(call_failing(Some(Arc::clone(&store)), timeout).await, Ok(EventStatus::Errored));
+        assert_eq!(call_failing(Some(Arc::clone(&store)), true, timeout).await, Ok(EventStatus::Errored));
         let copies = metas(&dir);
         assert_eq!(copies.len(), 2);
         assert!(copies.iter().all(|m| m["event_status"] == "errored" && m["held_for_replay"] == true));
@@ -1074,13 +1188,13 @@ mod tests {
         let permanent = || -> crate::Error {
             Box::new(vector_http::HttpError::from(crate::Error::from("bad request template")))
         };
-        assert_eq!(call_failing(Some(Arc::clone(&store)), permanent).await, Err(()));
+        assert_eq!(call_failing(Some(Arc::clone(&store)), true, permanent).await, Err(()));
         assert_eq!(metas(&dir).len(), 3);
         // Not stored: reported `Errored`, never returned as the error the driver would reject.
-        assert_eq!(call_failing(None, permanent).await, Ok(EventStatus::Errored));
+        assert_eq!(call_failing(None, true, permanent).await, Ok(EventStatus::Errored));
         // An unknown error is permanent.
         let unknown = || -> crate::Error { crate::Error::from("something else") };
-        assert_eq!(call_failing(None, unknown).await, Ok(EventStatus::Errored));
+        assert_eq!(call_failing(None, true, unknown).await, Ok(EventStatus::Errored));
     }
 
     /// `held_for_replay` is true only when the sink's disk buffer really holds `Errored` records.
@@ -1090,7 +1204,7 @@ mod tests {
         let dir = tmp.path().to_path_buf();
         let store = open_store(&dir, u64::MAX);
         assert_eq!(
-            call_with_hold(Some(Arc::clone(&store)), 503, "Code: 202. Too many", false).await,
+            call_with_hold(Some(Arc::clone(&store)), 503, "Code: 202. Too many", false, true).await,
             EventStatus::Errored
         );
         let copies = metas(&dir);

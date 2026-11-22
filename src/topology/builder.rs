@@ -715,13 +715,17 @@ impl<'a> Builder<'a> {
             app_name_slug: crate::get_slugified_app_name(),
             extra_context: self.extra_context.clone(),
             key: Some(key.clone()),
-            // nano (NAN-5567, NAN-5808): mirrors `hold_errored_records` above, which applies to a
-            // disk base stage (a reused buffer keeps the hold it was built with).
+            // nano (NAN-5567, NAN-5808): mirrors `hold_errored_records` above, which holds
+            // `Errored` records in every disk stage (base and overflow) of the buffer (a reused
+            // buffer keeps the hold it was built with). A record is held only if it is finalized
+            // in a disk stage, and a chained buffer with a memory stage cannot say which stage a
+            // batch came from, so this is true only when every stage is a disk stage.
             buffer_holds_errored: sink.inner.hold_errored_in_disk_buffer()
-                && matches!(
-                    sink.buffer.stages().first(),
-                    Some(BufferType::DiskV2 { .. })
-                ),
+                && sink
+                    .buffer
+                    .stages()
+                    .iter()
+                    .all(|stage| matches!(stage, BufferType::DiskV2 { .. })),
         };
 
         let (sink, healthcheck) = match sink.build(cx).await {
