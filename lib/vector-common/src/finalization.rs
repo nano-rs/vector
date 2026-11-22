@@ -275,6 +275,26 @@ impl BatchNotifier {
         let notifier = OwnedBatchNotifier {
             status: AtomicCell::new(BatchStatus::Delivered),
             notifier: Some(sender),
+            errored_wins: false,
+        };
+        (Self(Arc::new(notifier)), BatchStatusReceiver(receiver))
+    }
+
+    /// nano (NAN-5567, NAN-5808): like [`Self::new_with_receiver`], but `Errored` outranks
+    /// `Rejected` when the statuses of the batch's events are merged.
+    ///
+    /// For a disk buffer that holds `Errored` records for replay. One buffer record can be split
+    /// across several sink requests; when one is rejected (and dead-lettered) and another errored
+    /// (transient, not stored), the upstream precedence (`Rejected` wins) would acknowledge the
+    /// whole record and lose the errored part. With `Errored` winning, the record is held and
+    /// replayed; the rejected part is rejected and dead-lettered again on replay.
+    #[must_use]
+    pub fn new_with_receiver_errored_wins() -> (Self, BatchStatusReceiver) {
+        let (sender, receiver) = oneshot::channel();
+        let notifier = OwnedBatchNotifier {
+            status: AtomicCell::new(BatchStatus::Delivered),
+            notifier: Some(sender),
+            errored_wins: true,
         };
         (Self(Arc::new(notifier)), BatchStatusReceiver(receiver))
     }
@@ -317,9 +337,16 @@ impl BatchNotifier {
         // The status starts as Delivered and can only change if the new
         // status is different than that.
         if status != EventStatus::Delivered && status != EventStatus::Dropped {
+            let errored_wins = self.0.errored_wins;
             self.0
                 .status
-                .fetch_update(|old_status| Some(old_status.update(status)))
+                .fetch_update(|old_status| {
+                    Some(if errored_wins {
+                        old_status.update_errored_wins(status)
+                    } else {
+                        old_status.update(status)
+                    })
+                })
                 .unwrap_or_else(|_| unreachable!());
         }
     }
@@ -330,6 +357,8 @@ impl BatchNotifier {
 pub struct OwnedBatchNotifier {
     status: AtomicCell<BatchStatus>,
     notifier: Option<oneshot::Sender<BatchStatus>>,
+    /// nano (NAN-5567, NAN-5808): see [`BatchNotifier::new_with_receiver_errored_wins`].
+    errored_wins: bool,
 }
 
 impl OwnedBatchNotifier {
@@ -380,6 +409,16 @@ impl BatchStatus {
             // `Errored` overrides `Delivered`
             (Self::Errored, _) | (_, EventStatus::Errored) => Self::Errored,
             // No change for `Delivered`
+            _ => self,
+        }
+    }
+
+    /// nano (NAN-5567, NAN-5808): [`Self::update`] with `Errored` outranking `Rejected`.
+    fn update_errored_wins(self, status: EventStatus) -> Self {
+        match (self, status) {
+            (_, EventStatus::Dropped | EventStatus::Delivered) => self,
+            (Self::Errored, _) | (_, EventStatus::Errored) => Self::Errored,
+            (Self::Rejected, _) | (_, EventStatus::Rejected) => Self::Rejected,
             _ => self,
         }
     }
@@ -615,6 +654,40 @@ mod tests {
         drop(event2);
         assert_eq!(receiver.try_recv(), Err(Empty));
         drop(event4);
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
+    }
+
+    /// nano (NAN-5567, NAN-5808): two events of one batch, one rejected and one errored.
+    fn rejected_and_errored(
+        (batch, mut receiver): (BatchNotifier, BatchStatusReceiver),
+    ) -> BatchStatus {
+        let rejected = EventFinalizers::new(EventFinalizer::new(batch.clone()));
+        let errored = EventFinalizers::new(EventFinalizer::new(batch));
+        rejected.update_status(EventStatus::Rejected);
+        errored.update_status(EventStatus::Errored);
+        drop(rejected);
+        drop(errored);
+        receiver.try_recv().expect("both events finalized")
+    }
+
+    #[test]
+    fn errored_wins_only_for_the_opt_in_notifier() {
+        assert_eq!(
+            rejected_and_errored(BatchNotifier::new_with_receiver()),
+            BatchStatus::Rejected
+        );
+        assert_eq!(
+            rejected_and_errored(BatchNotifier::new_with_receiver_errored_wins()),
+            BatchStatus::Errored
+        );
+        // Otherwise the opt-in notifier merges like the upstream one.
+        let (batch, mut receiver) = BatchNotifier::new_with_receiver_errored_wins();
+        let fin = EventFinalizers::new(EventFinalizer::new(batch));
+        fin.update_status(EventStatus::Rejected);
+        drop(fin);
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Rejected));
+        let (batch, mut receiver) = BatchNotifier::new_with_receiver_errored_wins();
+        drop(EventFinalizers::new(EventFinalizer::new(batch)));
         assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
     }
 

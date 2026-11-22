@@ -627,6 +627,11 @@ where
         self.hold_errored.store(true, Ordering::Release);
     }
 
+    /// Whether this buffer holds `Errored` records (nano, NAN-5567). See [`Self::enable_errored_hold`].
+    pub fn holds_errored(&self) -> bool {
+        self.hold_errored.load(Ordering::Acquire)
+    }
+
     /// Applies the finalization status of one record (nano, NAN-5567).
     ///
     /// Statuses arrive in read order (the finalizer is ordered), so this decides how far the

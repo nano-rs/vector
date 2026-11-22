@@ -1294,7 +1294,13 @@ where
         };
         self.track_read(record_id, record_bytes, record_events);
 
-        let (batch, receiver) = BatchNotifier::new_with_receiver();
+        // nano (NAN-5567, NAN-5808): a buffer that holds `Errored` records must not let a rejected
+        // sibling request acknowledge a record whose other part errored.
+        let (batch, receiver) = if self.ledger.holds_errored() {
+            BatchNotifier::new_with_receiver_errored_wins()
+        } else {
+            BatchNotifier::new_with_receiver()
+        };
         record.add_batch_notifier(batch);
         self.finalizer.add(record_events.get(), receiver);
 
