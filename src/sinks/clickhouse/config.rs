@@ -334,6 +334,7 @@ impl ValidatedSink for ClickhouseConfig {
             service,
             resolve_store(self.dead_letter, &cx, self.compression),
             Some(replay),
+            cx.buffer_holds_errored,
         );
 
         // Resolve the encoding strategy (format + encoder) based on configuration.

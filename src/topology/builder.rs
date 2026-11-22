@@ -715,6 +715,13 @@ impl<'a> Builder<'a> {
             app_name_slug: crate::get_slugified_app_name(),
             extra_context: self.extra_context.clone(),
             key: Some(key.clone()),
+            // nano (NAN-5567, NAN-5808): mirrors `hold_errored_records` above, which applies to a
+            // disk base stage (a reused buffer keeps the hold it was built with).
+            buffer_holds_errored: sink.inner.hold_errored_in_disk_buffer()
+                && matches!(
+                    sink.buffer.stages().first(),
+                    Some(BufferType::DiskV2 { .. })
+                ),
         };
 
         let (sink, healthcheck) = match sink.build(cx).await {

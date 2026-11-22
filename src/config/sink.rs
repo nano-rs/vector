@@ -344,6 +344,11 @@ pub struct SinkContext {
     /// nano (NAN-5567): the id of the sink being built, when built by the topology. Sinks that
     /// keep per-sink local state (the ClickHouse dead-letter store) key it on this.
     pub key: Option<ComponentKey>,
+
+    /// nano (NAN-5567, NAN-5808): whether this sink's (first-stage) disk buffer holds records
+    /// finalized as `Errored` for replay instead of acknowledging them. Set by the topology for a
+    /// sink that opted in with [`SinkConfig::hold_errored_in_disk_buffer`].
+    pub buffer_holds_errored: bool,
 }
 
 impl Default for SinkContext {
@@ -364,6 +369,7 @@ impl Default for SinkContext {
             app_name_slug: crate::get_slugified_app_name(),
             extra_context: ExtraContext::default(),
             key: None,
+            buffer_holds_errored: false,
         }
     }
 }
