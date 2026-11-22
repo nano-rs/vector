@@ -580,14 +580,13 @@ where
             let response = service.call(request).await?;
             let response = collect_response(response, byte_size, &protocol, &endpoint)
                 .await
-                .map_err(|error| {
-                    // Decompression preserves transport errors but boxes them alongside decoder errors.
-                    if error.is::<hyper::Error>() {
-                        HttpError::new(error)
-                    } else {
-                        HttpError::from(error)
-                    }
-                })?;
+                // nano (NAN-5808): every failure to read the response body is retriable. Upstream
+                // (#27094) classed a decoder error as permanent, but with the response compressed a
+                // body cut mid-stream by ClickHouse or a proxy surfaces as an `io::Error`
+                // (`UnexpectedEof` / `InvalidData`) rather than a `hyper::Error`. Permanent meant zero
+                // retries, and the batch was reported rejected without ever reaching storage. A
+                // response that cannot be read says nothing about whether the request was bad.
+                .map_err(HttpError::new)?;
             Ok(HttpResponse {
                 response,
                 events_byte_size,
@@ -810,12 +809,61 @@ mod tests {
         assert!(!no_retry_logic.is_retriable_error(&error));
     }
 
+    /// nano (NAN-5808): upstream treats an undecodable response as permanent (zero retries, the
+    /// batch rejected unsent). A response that cannot be read says nothing about the request, so
+    /// it is retried like any other transport failure.
     #[tokio::test]
-    async fn rejects_invalid_compressed_response() {
+    async fn retries_invalid_compressed_response() {
         let mut service = compressed_response_service(b"not a gzip response".to_vec()).await;
         let error = service.call(request()).await.unwrap_err();
         let retry_logic = http_response_retry_logic::<HttpRequest<()>>(RetryStrategy::Default);
-        assert!(!retry_logic.is_retriable_error(&error));
+        assert!(retry_logic.is_retriable_error(&error), "{error:?}");
+    }
+
+    /// nano (NAN-5808): a compressed body delimited by the connection close (no content-length)
+    /// and cut short ends with a clean EOF, so hyper reports no error and the decoder fails with
+    /// `UnexpectedEof`. Upstream classed that as permanent; it is retried.
+    #[tokio::test]
+    async fn retries_close_delimited_compressed_body_cut_short() {
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(&b"Code: 202. DB::Exception: Too many simultaneous queries. ".repeat(64))
+            .unwrap();
+        let body = encoder.finish().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut request_body = [0; 6];
+            stream.read_exact(&mut request_body).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            stream.write_all(&body[..body.len() / 2]).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let mut service = HttpService::new(client(), request_builder(&uri));
+        let error =
+            tokio::time::timeout(std::time::Duration::from_secs(5), service.call(request()))
+                .await
+                .unwrap()
+                .unwrap_err();
+        server.await.unwrap();
+        assert!(error.is_retriable(), "{error:?}");
+        let retry_logic = http_response_retry_logic::<HttpRequest<()>>(RetryStrategy::Default);
+        assert!(retry_logic.is_retriable_error(&error), "{error:?}");
     }
 
     #[test]
