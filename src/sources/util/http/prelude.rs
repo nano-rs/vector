@@ -206,7 +206,7 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
                           body: Bytes,
                           query_parameters: HashMap<String, String>,
                           addr: Option<PeerAddr>| {
-                        debug!(message = "Handling HTTP request.", headers = ?headers);
+                        debug!(message = "Handling HTTP request.", headers = ?RedactedHeaders(&headers));
                         let http_path = path.as_str();
                         let file_auth = hashed_tokens.as_ref().map(|store| {
                             store.check_authorization(
@@ -352,6 +352,34 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
     }
 }
 
+/// nano (NAN-3770, NAN-5808): request headers for the debug log, with credential values
+/// replaced. Incoming header values are not marked sensitive, so `Debug` on the map would print
+/// a plaintext `Authorization: Bearer <token>` before the token is even checked.
+struct RedactedHeaders<'a>(&'a HeaderMap);
+
+/// Headers whose values are never logged.
+const REDACTED_HEADERS: [&str; 5] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+];
+
+impl fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut map = f.debug_map();
+        for (name, value) in self.0 {
+            if value.is_sensitive() || REDACTED_HEADERS.contains(&name.as_str()) {
+                map.entry(&name.as_str(), &"<redacted>");
+            } else {
+                map.entry(&name.as_str(), value);
+            }
+        }
+        map.finish()
+    }
+}
+
 fn stamp_credential(events: &mut [Event], credential: &HashedCredential) {
     for event in events {
         credential.stamp(event);
@@ -423,5 +451,33 @@ async fn handle_batch_status(
                 "Contents failed to deliver to sink".into(),
             ))),
         },
+    }
+}
+
+#[cfg(test)]
+mod redacted_headers_tests {
+    use warp::http::{HeaderMap, HeaderValue};
+
+    use super::RedactedHeaders;
+
+    /// nano (NAN-5808): the debug log of a request never carries a credential.
+    #[test]
+    fn credentials_are_redacted_and_other_headers_kept() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer s3cr3t-token"));
+        headers.insert("Proxy-Authorization", HeaderValue::from_static("Basic cHJveHk6cHc="));
+        headers.insert("cookie", HeaderValue::from_static("session=abc"));
+        headers.insert("x-api-key", HeaderValue::from_static("key-123"));
+        let mut marked = HeaderValue::from_static("marked-secret");
+        marked.set_sensitive(true);
+        headers.insert("x-custom", marked);
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let logged = format!("{:?}", RedactedHeaders(&headers));
+        for secret in ["s3cr3t-token", "cHJveHk6cHc=", "session=abc", "key-123", "marked-secret"] {
+            assert!(!logged.contains(secret), "{secret} leaked: {logged}");
+        }
+        assert!(logged.contains("application/json"), "{logged}");
+        assert!(logged.contains("\"authorization\": \"<redacted>\""), "{logged}");
     }
 }
