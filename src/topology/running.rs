@@ -89,6 +89,13 @@ pub struct RunningTopology {
     /// a failed reload correct (NAN-4936): there `self.config` is the OLD config, while the
     /// pauses/removals were decided against the failed NEW config.
     paused_inputs: HashSet<(ComponentKey, OutputId)>,
+    /// NAN-5874: connections a reload stops using whose upstream keeps running
+    /// (the consumer is removed, or no longer reads that input). They are
+    /// paused like a changed consumer's input until the new topology is
+    /// connected, and removed only then: removing them up front left the
+    /// unchanged upstream with no consumer for the whole build, and every
+    /// event it emitted meanwhile was dropped and finalized as delivered.
+    deferred_removals: HashSet<(ComponentKey, OutputId)>,
 }
 
 impl RunningTopology {
@@ -117,6 +124,7 @@ impl RunningTopology {
             sink_confinement_gauges: HashMap::new(),
             orphaned_disk_buffer_scanner: OrphanedDiskBufferScanner::new(),
             paused_inputs: HashSet::new(),
+            deferred_removals: HashSet::new(),
         }
     }
 
@@ -172,6 +180,16 @@ impl RunningTopology {
     /// The returned future resolves to `true` if every component finished on its own before
     /// the graceful shutdown deadline, or `false` if any component had to be forcefully killed.
     pub fn stop(self) -> impl Future<Output = bool> {
+        // NAN-5874: tell every fanout no paused sink will be replaced (a reload whose rollback
+        // failed leaves connections paused), so a send waiting on one discards its events as
+        // errored and its component drains, instead of waiting for the control channel to close.
+        // It may never close: the API's tap watch holds clones of every control channel. The
+        // watch is cleared too, so tap subscribers drop theirs.
+        for output in self.outputs.values() {
+            _ = output.send(ControlMessage::Stop);
+        }
+        _ = self.watch.0.send(TapResource::default());
+
         // Create handy handles collections of all tasks for the subsequent
         // operations.
         let mut wait_handles = Vec::new();
@@ -405,6 +423,22 @@ impl RunningTopology {
             internal_log_rate_limit = false
         );
 
+        // NAN-5874: neither topology could be built, so nothing will replace or remove the
+        // connections `shutdown_diff` paused, and Vector stops next. They stay paused: sending
+        // `Remove` would let their upstreams emit into fanouts with no consumer and finalize those
+        // events as delivered. `stop` then sends every fanout `ControlMessage::Stop`: a send
+        // waiting on a paused connection discards its events marked errored (never acknowledged)
+        // and the component drains and stops.
+        let held = self.deferred_removals.len() + self.paused_inputs.len();
+        if held > 0 {
+            warn!(
+                message = "Connections paused by the failed reload stay paused until Vector stops; events waiting on them are not acknowledged.",
+                connections = held,
+            );
+        }
+        self.deferred_removals.clear();
+        self.paused_inputs.clear();
+
         Err(ReloadError::FailedToRestore)
     }
 
@@ -519,25 +553,36 @@ impl RunningTopology {
         // components, the shutdown of sources they depend on, or the shutdown of transforms they
         // depend on, and thus the closing of their buffer, will naturally cause them to shutdown,
         // which is why we don't do any manual triggering of shutdown here.
+        //
+        // NAN-5874: every changed/removed transform's outputs are dropped BEFORE any of their
+        // inputs are touched, as is already done for sources ahead of transforms and transforms
+        // ahead of sinks. Otherwise `remove_inputs(T2)`, for a chain `T1 -> T2` of changing or
+        // removed transforms (`to_remove` and `to_change` are sets, so in any order), sent
+        // `Remove(T2)` to the OLD `T1`, which then emitted everything it still had buffered or in
+        // flight into a fanout with no senders: dropped, and finalized as delivered. With `T1`'s
+        // outputs gone from `self.outputs` that `Remove` is never sent; the old `T1` keeps its
+        // sender to the old `T2` and drains into it, and the old `T2` drains downstream once its
+        // input closes, as a changed transform feeding a sink always did.
         for key in &diff.transforms.to_remove {
             debug!(component_id = %key, "Removing transform.");
 
             let previous = self.tasks.remove(key).unwrap();
             drop(previous); // detach and forget
 
-            self.remove_inputs(key, diff, new_config);
-            self.remove_outputs(key);
-
             if let Some(registry) = self.utilization_registry.as_ref() {
                 registry.remove_component(key);
             }
         }
-
+        for key in diff.transforms.removed_and_changed() {
+            self.remove_outputs(key);
+        }
+        for key in &diff.transforms.to_remove {
+            self.remove_inputs(key, diff, new_config);
+        }
         for key in &diff.transforms.to_change {
             debug!(component_id = %key, "Changing transform.");
 
             self.remove_inputs(key, diff, new_config);
-            self.remove_outputs(key);
         }
 
         // Now we'll process any changed/removed sinks.
@@ -963,6 +1008,16 @@ impl RunningTopology {
         // sources/transforms, to ensure we're connecting components in order.
         self.reattach_severed_inputs(diff);
 
+        // NAN-5874: every consumer of the new topology is connected; only now remove the
+        // connections the new topology no longer uses (paused since `shutdown_diff`). Only an
+        // input absent from the diff is deferred, so its fanout is the one that held them.
+        for (key, input) in std::mem::take(&mut self.deferred_removals) {
+            if let Some(output) = self.outputs.get_mut(&input) {
+                debug!(component_id = %key, fanout_id = %input, "Removing paused component input from fanout.");
+                _ = output.send(ControlMessage::Remove(key));
+            }
+        }
+
         // Broadcast any topology changes to subscribers.
         if !self.watch.0.is_closed() {
             let outputs = self
@@ -1049,7 +1104,10 @@ impl RunningTopology {
             // OLD config on the rollback path of a failed reload. An input the failed config had
             // dropped was then sent `Replace` for a sink the fanout had already removed, and
             // `Fanout::replace` panicked on the next event through that upstream.
-            let paused = self.paused_inputs.remove(&(key.clone(), input.clone()));
+            // NAN-5874: a connection paused for deferred removal that the topology being
+            // connected reads again (the rollback of a failed reload) is resumed in place.
+            let deferred = self.deferred_removals.remove(&(key.clone(), input.clone()));
+            let paused = self.paused_inputs.remove(&(key.clone(), input.clone())) || deferred;
             if diff.contains(&input.component) || !paused {
                 // If the input we're connecting to is changing, that means its outputs will have been
                 // recreated, so instead of replacing a paused sink, we have to add it to this new
@@ -1075,6 +1133,21 @@ impl RunningTopology {
             .map(|trigger| self.detach_triggers.insert(key.clone(), trigger.into()));
     }
 
+    /// NAN-5874: whether the new topology connects `input` to a component it does not feed now
+    /// (an added or changed component that reads it). Only an unchanged component's connections
+    /// carry over, and an unchanged component reads exactly what it read before.
+    fn input_gains_a_consumer(input: &OutputId, diff: &ConfigDiff, new_config: &Config) -> bool {
+        diff.transforms
+            .changed_and_added()
+            .chain(diff.sinks.changed_and_added())
+            .chain(diff.enrichment_tables.sinks.changed_and_added())
+            .any(|key| {
+                new_config
+                    .inputs_for_node(key)
+                    .is_some_and(|inputs| inputs.contains(input))
+            })
+    }
+
     fn remove_outputs(&mut self, key: &ComponentKey) {
         self.outputs.retain(|id, _output| &id.component != key);
     }
@@ -1091,8 +1164,26 @@ impl RunningTopology {
             .collect::<HashSet<_>>();
 
         for input in old_inputs {
+            let defer = !diff.contains(&input.component)
+                && (diff.is_removed(key) || !new_inputs.contains(input))
+                && Self::input_gains_a_consumer(input, diff, new_config);
             if let Some(output) = self.outputs.get_mut(input) {
-                if diff.contains(&input.component)
+                if defer {
+                    // NAN-5874: the input itself is not changing, so it keeps running
+                    // through the build, and the new topology connects it to a component that
+                    // does not read it yet (this one re-pointed, or its replacement). Pause this
+                    // connection (its sends wait, as for a changed consumer) and remove it once
+                    // the new topology is connected (`connect_diff`), so whatever the input takes
+                    // in meanwhile reaches the new consumer instead of being dropped as
+                    // delivered. An input that only loses consumers is not held (Case 2/3
+                    // below): the new topology drops those events anyway, and holding them
+                    // would stall its other consumers for the whole build.
+                    debug!(component_id = %key, fanout_id = %input, "Pausing component input in fanout until the new topology is connected.");
+
+                    self.paused_inputs.remove(&(key.clone(), input.clone()));
+                    self.deferred_removals.insert((key.clone(), input.clone()));
+                    _ = output.send(ControlMessage::Pause(key.clone()));
+                } else if diff.contains(&input.component)
                     || diff.is_removed(key)
                     || !new_inputs.contains(input)
                 {

@@ -17,7 +17,10 @@ use self::{
         BackpressureSourceConfig, BasicSourceConfig, BuildErrorSourceConfig, ErrorSourceConfig,
         PanicSourceConfig, TripwireSourceConfig,
     },
-    transforms::{BasicTransformConfig, ErrorDefinitionTransformConfig},
+    transforms::{
+        BasicTransformConfig, ErrorDefinitionTransformConfig, FlakyBuildTransformConfig,
+        SlowBuildTransformConfig, SlowProcessTransformConfig,
+    },
 };
 
 pub mod sinks;
@@ -78,6 +81,32 @@ pub fn tripwire_source() -> (Trigger, TripwireSourceConfig) {
 #[must_use]
 pub fn basic_transform(suffix: &str, increase: f64) -> BasicTransformConfig {
     BasicTransformConfig::new(suffix.to_owned(), increase)
+}
+
+/// A concurrent transform with ports `a` and `b` that sends everything to `a` (NAN-5874).
+#[must_use]
+pub fn two_port_transform() -> transforms::TwoPortTransformConfig {
+    transforms::TwoPortTransformConfig::default()
+}
+
+/// A `basic_transform` whose build takes `build_ms` milliseconds (NAN-5874).
+#[must_use]
+pub fn slow_build_transform(suffix: &str, build_ms: u64) -> SlowBuildTransformConfig {
+    SlowBuildTransformConfig::new(suffix.to_owned(), build_ms)
+}
+
+/// A `basic_transform` that takes `per_event_ms` to process each event, so it holds a backlog
+/// in its input buffer when a reload starts (NAN-5874).
+#[must_use]
+pub fn slow_process_transform(suffix: &str, per_event_ms: u64) -> SlowProcessTransformConfig {
+    SlowProcessTransformConfig::new(suffix.to_owned(), per_event_ms)
+}
+
+/// A `basic_transform` whose first `ok_builds` builds succeed and every later one fails, so a
+/// reload's rollback can be made to fail (NAN-5874).
+#[must_use]
+pub fn flaky_build_transform(suffix: &str, ok_builds: usize) -> FlakyBuildTransformConfig {
+    FlakyBuildTransformConfig::new(suffix.to_owned(), ok_builds)
 }
 
 #[must_use]

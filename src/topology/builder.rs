@@ -1345,7 +1345,14 @@ impl Runner {
             .filter(move |events| ready(filter_events_type(events, self.input_type)));
 
         self.timer_tx.try_send_start_wait();
-        while let Some(events) = input_rx.next().await {
+        loop {
+            // NAN-5874: apply control messages while idle (see `Fanout::serve_control_message`).
+            let events = tokio::select! {
+                biased;
+                () = self.outputs.serve_control_messages() => continue,
+                events = input_rx.next() => events,
+            };
+            let Some(events) = events else { break };
             self.on_events_received(&events);
             self.transform.transform_all(events, &mut outputs_buf);
             self.send_outputs(&mut outputs_buf)
@@ -1374,6 +1381,12 @@ impl Runner {
         loop {
             tokio::select! {
                 biased;
+
+                // NAN-5874: control messages first (allocation-free), so sustained traffic cannot
+                // starve a reload that waits on one of this transform's sinks (see
+                // `Fanout::serve_control_message`). Disabled once the input ended and nothing is
+                // in flight, so the `else` branch ends the task.
+                () = self.outputs.serve_control_messages(), if !shutting_down || !in_flight.is_empty() => {}
 
                 result = in_flight.next(), if !in_flight.is_empty() => {
                     match result {
