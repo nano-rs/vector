@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use futures::{FutureExt, TryFutureExt};
+use futures::FutureExt;
 use tower::ServiceBuilder;
 use tracing::Span;
 use vector_lib::{
@@ -411,21 +411,29 @@ async fn handle_request(
     acknowledgements: bool,
     response_code: StatusCode,
     mut out: SourceSender,
-) -> Result<impl warp::Reply, Rejection> {
+) -> Result<warp::reply::Response, Rejection> {
     match events {
         Ok(mut events) => {
             let receiver = BatchNotifier::maybe_apply_to(acknowledgements, &mut events);
 
             let count = events.len();
-            out.send_batch(events)
-                .map_err(|_| {
+            match out.send_batch(events).await {
+                Ok(()) => handle_batch_status(response_code, receiver)
+                    .await
+                    .map(warp::Reply::into_response),
+                // NAN-5874: the source's `send_timeout` elapsed while the topology held its
+                // output (a reload); refuse the request so the client retries, instead of
+                // holding it and its events.
+                Err(vector_lib::source_sender::SendError::Timeout) => {
+                    Ok(super::service_unavailable_retry_after())
+                }
+                Err(vector_lib::source_sender::SendError::Closed) => {
                     // can only fail if receiving end disconnected, so we are shutting down,
                     // probably not gracefully.
                     emit(StreamClosedError { count });
-                    warp::reject::custom(RejectShuttingDown)
-                })
-                .and_then(|()| handle_batch_status(response_code, receiver))
-                .await
+                    Err(warp::reject::custom(RejectShuttingDown))
+                }
+            }
         }
         Err(error) => {
             emit(HttpBadRequest::new(error.code(), error.message()));

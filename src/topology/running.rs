@@ -413,6 +413,22 @@ impl RunningTopology {
             internal_log_rate_limit = false
         );
 
+        // NAN-5874: neither topology could be built, so nothing will replace or remove the
+        // connections `shutdown_diff` paused, and Vector stops next. They stay paused: sending
+        // `Remove` would let their upstreams emit into fanouts with no consumer and finalize those
+        // events as delivered. When `stop` drops the control channels, a send waiting on a paused
+        // connection fails with its events marked errored (never acknowledged), and an idle
+        // component no longer spins on the closed channel (`Fanout::wait_for_replacements`).
+        let held = self.deferred_removals.len() + self.paused_inputs.len();
+        if held > 0 {
+            warn!(
+                message = "Connections paused by the failed reload stay paused until Vector stops; events waiting on them are not acknowledged.",
+                connections = held,
+            );
+        }
+        self.deferred_removals.clear();
+        self.paused_inputs.clear();
+
         Err(ReloadError::FailedToRestore)
     }
 
@@ -527,25 +543,36 @@ impl RunningTopology {
         // components, the shutdown of sources they depend on, or the shutdown of transforms they
         // depend on, and thus the closing of their buffer, will naturally cause them to shutdown,
         // which is why we don't do any manual triggering of shutdown here.
+        //
+        // NAN-5874: every changed/removed transform's outputs are dropped BEFORE any of their
+        // inputs are touched, as is already done for sources ahead of transforms and transforms
+        // ahead of sinks. Otherwise `remove_inputs(T2)`, for a chain `T1 -> T2` of changing or
+        // removed transforms (`to_remove` and `to_change` are sets, so in any order), sent
+        // `Remove(T2)` to the OLD `T1`, which then emitted everything it still had buffered or in
+        // flight into a fanout with no senders: dropped, and finalized as delivered. With `T1`'s
+        // outputs gone from `self.outputs` that `Remove` is never sent; the old `T1` keeps its
+        // sender to the old `T2` and drains into it, and the old `T2` drains downstream once its
+        // input closes, as a changed transform feeding a sink always did.
         for key in &diff.transforms.to_remove {
             debug!(component_id = %key, "Removing transform.");
 
             let previous = self.tasks.remove(key).unwrap();
             drop(previous); // detach and forget
 
-            self.remove_inputs(key, diff, new_config);
-            self.remove_outputs(key);
-
             if let Some(registry) = self.utilization_registry.as_ref() {
                 registry.remove_component(key);
             }
         }
-
+        for key in diff.transforms.removed_and_changed() {
+            self.remove_outputs(key);
+        }
+        for key in &diff.transforms.to_remove {
+            self.remove_inputs(key, diff, new_config);
+        }
         for key in &diff.transforms.to_change {
             debug!(component_id = %key, "Changing transform.");
 
             self.remove_inputs(key, diff, new_config);
-            self.remove_outputs(key);
         }
 
         // Now we'll process any changed/removed sinks.
@@ -1092,6 +1119,21 @@ impl RunningTopology {
             .map(|trigger| self.detach_triggers.insert(key.clone(), trigger.into()));
     }
 
+    /// NAN-5874: whether the new topology connects `input` to a component it does not feed now
+    /// (an added or changed component that reads it). Only an unchanged component's connections
+    /// carry over, and an unchanged component reads exactly what it read before.
+    fn input_gains_a_consumer(input: &OutputId, diff: &ConfigDiff, new_config: &Config) -> bool {
+        diff.transforms
+            .changed_and_added()
+            .chain(diff.sinks.changed_and_added())
+            .chain(diff.enrichment_tables.sinks.changed_and_added())
+            .any(|key| {
+                new_config
+                    .inputs_for_node(key)
+                    .is_some_and(|inputs| inputs.contains(input))
+            })
+    }
+
     fn remove_outputs(&mut self, key: &ComponentKey) {
         self.outputs.retain(|id, _output| &id.component != key);
     }
@@ -1108,15 +1150,20 @@ impl RunningTopology {
             .collect::<HashSet<_>>();
 
         for input in old_inputs {
+            let defer = !diff.contains(&input.component)
+                && (diff.is_removed(key) || !new_inputs.contains(input))
+                && Self::input_gains_a_consumer(input, diff, new_config);
             if let Some(output) = self.outputs.get_mut(input) {
-                if !diff.contains(&input.component)
-                    && (diff.is_removed(key) || !new_inputs.contains(input))
-                {
+                if defer {
                     // NAN-5874: the input itself is not changing, so it keeps running
-                    // through the build. Pause this connection (its sends wait, as for
-                    // a changed consumer) and remove it once the new topology is
-                    // connected (`connect_diff`), so the input is never left without
-                    // a consumer while it is still taking events in.
+                    // through the build, and the new topology connects it to a component that
+                    // does not read it yet (this one re-pointed, or its replacement). Pause this
+                    // connection (its sends wait, as for a changed consumer) and remove it once
+                    // the new topology is connected (`connect_diff`), so whatever the input takes
+                    // in meanwhile reaches the new consumer instead of being dropped as
+                    // delivered. An input that only loses consumers is not held (Case 2/3
+                    // below): the new topology drops those events anyway, and holding them
+                    // would stall its other consumers for the whole build.
                     debug!(component_id = %key, fanout_id = %input, "Pausing component input in fanout until the new topology is connected.");
 
                     self.paused_inputs.remove(&(key.clone(), input.clone()));

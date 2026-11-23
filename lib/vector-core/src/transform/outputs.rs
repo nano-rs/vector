@@ -108,19 +108,60 @@ impl TransformOutputs {
         &mut self,
         buf: &mut TransformOutputsBuf,
     ) -> Result<(), Box<dyn error::Error + Send + Sync>> {
+        // NAN-5874: the ports are sent one after the other, and a send to a port with a paused
+        // sink waits until the reload replaces or removes it. Meanwhile every other port keeps
+        // applying its control messages: a reload that pauses one of THEIR sinks waits
+        // (`wait_for_sinks`) for the sink's sender to be dropped, and it must not wait on this
+        // send, which only that reload's completion unblocks.
+        let mut ports: Vec<(Option<&str>, &mut TransformOutput)> = Vec::new();
         if let Some(primary) = self.primary_output.as_mut() {
-            let Some(buf) = buf.primary_buffer.as_mut() else {
-                unreachable!("mismatched outputs");
-            };
-            Self::send_single_buffer(buf, primary).await?;
+            ports.push((None, primary));
         }
-        for (key, buf) in &mut buf.named_buffers {
-            let Some(output) = self.named_outputs.get_mut(key) else {
-                unreachable!("unknown output");
+        for (name, output) in &mut self.named_outputs {
+            ports.push((Some(name.as_str()), output));
+        }
+        for i in 0..ports.len() {
+            let (before, rest) = ports.split_at_mut(i);
+            let ((name, current), after) = rest.split_first_mut().expect("index in range");
+            let out_buf = match name {
+                None => buf.primary_buffer.as_mut().expect("mismatched outputs"),
+                Some(name) => buf.named_buffers.get_mut(*name).expect("unknown output"),
             };
-            Self::send_single_buffer(buf, output).await?;
+            let mut siblings: Vec<&mut Fanout> = before
+                .iter_mut()
+                .chain(after.iter_mut())
+                .map(|(_, output)| &mut output.fanout)
+                .collect();
+            let send = Self::send_single_buffer(out_buf, current);
+            tokio::pin!(send);
+            if siblings.is_empty() {
+                send.await?;
+                continue;
+            }
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut send => {
+                        result?;
+                        break;
+                    }
+                    () = serve_any(&mut siblings) => {}
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Waits for a control message on any port and applies it (for an idle transform; see
+    /// `Fanout::serve_control_message`). Never resolves once every port's channel is closed.
+    pub async fn serve_control_messages(&mut self) {
+        let mut ports: Vec<&mut Fanout> = self
+            .primary_output
+            .iter_mut()
+            .chain(self.named_outputs.values_mut())
+            .map(|output| &mut output.fanout)
+            .collect();
+        serve_any(&mut ports).await;
     }
 
     async fn send_single_buffer(
@@ -140,6 +181,18 @@ impl TransformOutputs {
         output.events_sent.emit(CountByteSize(count, byte_size));
         Ok(())
     }
+}
+
+/// Applies the first control message any of `fanouts` receives. Pending forever when there are
+/// none, or once every channel is closed.
+async fn serve_any(fanouts: &mut [&mut Fanout]) {
+    if fanouts.is_empty() {
+        return futures::future::pending().await;
+    }
+    let serves = fanouts
+        .iter_mut()
+        .map(|fanout| Box::pin(fanout.serve_control_message()));
+    futures::future::select_all(serves).await;
 }
 
 #[derive(Debug, Clone)]
@@ -374,5 +427,98 @@ impl From<Vec<Event>> for OutputBuffer {
         let mut result = Self::default();
         result.extend(events.into_iter());
         result
+    }
+}
+
+#[cfg(test)]
+mod nan5874_tests {
+    use std::{collections::HashMap, num::NonZeroUsize, time::Duration};
+
+    use futures::StreamExt;
+    use tracing::Span;
+    use vector_buffers::{
+        WhenFull,
+        topology::{
+            builder::TopologyBuilder,
+            channel::{BufferReceiver, BufferSender},
+        },
+    };
+
+    use super::TransformOutputs;
+    use crate::{
+        config::{self, ComponentKey, DataType},
+        event::{Event, EventArray, LogEvent},
+        fanout::ControlMessage,
+    };
+
+    fn pair() -> (BufferSender<EventArray>, BufferReceiver<EventArray>) {
+        TopologyBuilder::standalone_memory(
+            NonZeroUsize::new(4).unwrap(),
+            WhenFull::Block,
+            &Span::current(),
+            None,
+            None,
+        )
+    }
+
+    // NAN-5874: a send blocked on one port's paused sink keeps applying the other ports' control
+    // messages. A reload that pauses or removes a sink of another port waits for that sink's
+    // sender to be dropped, and only the reload's completion unblocks the paused port.
+    #[tokio::test]
+    async fn a_paused_port_does_not_block_its_siblings_control_messages() {
+        let specs = vec![
+            config::TransformOutput::new(DataType::all_bits(), HashMap::new()).with_port("a"),
+            config::TransformOutput::new(DataType::all_bits(), HashMap::new()).with_port("b"),
+        ];
+        let (mut outputs, controls) = TransformOutputs::new(specs, &ComponentKey::from("route"));
+        let (a_tx, _a_rx) = pair();
+        let (b_tx, b_rx) = pair();
+        let control_a = &controls[&Some("a".to_string())];
+        let control_b = &controls[&Some("b".to_string())];
+        control_a.send(ControlMessage::Add(ComponentKey::from("sink_a"), a_tx)).unwrap();
+        control_b.send(ControlMessage::Add(ComponentKey::from("sink_b"), b_tx)).unwrap();
+        control_a.send(ControlMessage::Pause(ComponentKey::from("sink_a"))).unwrap();
+
+        let mut buf = outputs.new_buf_with_capacity(1);
+        buf.push(Some("a"), Event::Log(LogEvent::from("to a")));
+        buf.push(Some("b"), Event::Log(LogEvent::from("to b")));
+        let send = tokio::spawn(async move {
+            // Port order is not fixed: whichever port sends first, port `a` blocks.
+            let _ = outputs.send(&mut buf).await;
+            outputs
+        });
+
+        control_b.send(ControlMessage::Remove(ComponentKey::from("sink_b"))).unwrap();
+        let mut b_stream = b_rx.into_stream();
+        let drained = tokio::time::timeout(Duration::from_secs(2), async {
+            while b_stream.next().await.is_some() {}
+        })
+        .await;
+        assert!(drained.is_ok(), "port b applied Remove(sink_b) while port a waited");
+        assert!(!send.is_finished(), "port a is still waiting for its paused sink");
+        send.abort();
+    }
+
+    // NAN-5874: an idle transform applies its ports' control messages.
+    #[tokio::test]
+    async fn serve_control_messages_applies_any_ports_messages() {
+        let specs = vec![
+            config::TransformOutput::new(DataType::all_bits(), HashMap::new()),
+            config::TransformOutput::new(DataType::all_bits(), HashMap::new()).with_port("b"),
+        ];
+        let (mut outputs, controls) = TransformOutputs::new(specs, &ComponentKey::from("t"));
+        let (b_tx, b_rx) = pair();
+        let control_b = &controls[&Some("b".to_string())];
+        control_b.send(ControlMessage::Add(ComponentKey::from("sink_b"), b_tx)).unwrap();
+        control_b.send(ControlMessage::Remove(ComponentKey::from("sink_b"))).unwrap();
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(1), outputs.serve_control_messages())
+                .await
+                .expect("a message was applied");
+        }
+        let next = tokio::time::timeout(Duration::from_secs(1), b_rx.into_stream().next())
+            .await
+            .expect("the removed sink's sender was dropped");
+        assert!(next.is_none());
     }
 }

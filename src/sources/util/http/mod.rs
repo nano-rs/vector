@@ -29,6 +29,20 @@ pub use encoding::{decompress_body, emit_decompress_error, set_max_decompressed_
 #[cfg(feature = "sources-utils-http-headers")]
 pub use headers::add_headers;
 pub use method::HttpMethod;
+
+/// NAN-5874: the answer to a request whose events the topology did not accept within the
+/// source's `send_timeout_secs` (it held the source's output, e.g. during a reload): 503 with
+/// `Retry-After`, so the client retries instead of the source holding the request and its events.
+#[cfg(feature = "sources-utils-http-prelude")]
+pub(crate) fn service_unavailable_retry_after() -> warp::reply::Response {
+    use warp::Reply as _;
+    warp::reply::with_header(
+        warp::reply::with_status("Service unavailable", warp::http::StatusCode::SERVICE_UNAVAILABLE),
+        warp::http::header::RETRY_AFTER,
+        "1",
+    )
+    .into_response()
+}
 #[cfg(feature = "sources-utils-http-prelude")]
 pub use prelude::HttpSource;
 #[cfg(feature = "sources-utils-http-query")]
