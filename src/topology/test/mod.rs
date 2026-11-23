@@ -55,6 +55,7 @@ mod panic;
     feature = "enrichment-tables-memory",
 ))]
 mod reload;
+mod reload_hazards;
 mod repointed_reload;
 mod rollback;
 #[cfg(all(feature = "sinks-console", feature = "sources-demo_logs"))]
