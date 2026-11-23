@@ -35,13 +35,16 @@ pub use method::HttpMethod;
 /// `Retry-After`, so the client retries instead of the source holding the request and its events.
 #[cfg(feature = "sources-utils-http-prelude")]
 pub(crate) fn service_unavailable_retry_after() -> warp::reply::Response {
-    let mut response = warp::http::Response::new(warp::hyper::Body::from("Service unavailable"));
-    *response.status_mut() = warp::http::StatusCode::SERVICE_UNAVAILABLE;
-    response.headers_mut().insert(
+    use warp::Reply as _;
+    warp::reply::with_header(
+        warp::reply::with_status(
+            "Service unavailable",
+            warp::http::StatusCode::SERVICE_UNAVAILABLE,
+        ),
         warp::http::header::RETRY_AFTER,
-        warp::http::HeaderValue::from_static("1"),
-    );
-    response
+        "1",
+    )
+    .into_response()
 }
 #[cfg(feature = "sources-utils-http-prelude")]
 pub use prelude::HttpSource;
