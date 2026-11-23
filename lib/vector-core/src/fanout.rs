@@ -136,7 +136,8 @@ impl Fanout {
         }
         if let Some(msg) = self.control_channel.recv().await {
             self.apply_control_message(msg);
-            true
+            // `false` once the message was `Stop`: nothing follows it.
+            !self.control_channel_closed
         } else {
             self.control_channel_closed = true;
             false
@@ -269,8 +270,16 @@ impl Fanout {
         send_reference: Option<Instant>,
     ) -> crate::Result<()> {
         // First, process any available control messages in a non-blocking fashion.
-        while let Ok(message) = self.control_channel.try_recv() {
-            self.apply_control_message(message);
+        // NAN-5874: nothing after `Stop` (or a closed channel) is applied.
+        while !self.control_channel_closed {
+            match self.control_channel.try_recv() {
+                Ok(message) => self.apply_control_message(message),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.control_channel_closed = true;
+                    break;
+                }
+            }
         }
 
         // Wait for any senders that are paused to be replaced first before continuing with the send.
@@ -1114,5 +1123,53 @@ mod tests {
         .expect("the idle stream applied the Remove and dropped the sender");
         assert!(next.is_none());
         sending.abort();
+    }
+
+    // NAN-5874: no control message after `Stop` is applied, so a `Replace` or `Remove` queued
+    // behind it cannot release a held batch: it is still discarded as errored.
+    #[tokio::test]
+    async fn control_messages_after_stop_are_ignored() {
+        use crate::event::{BatchNotifier, BatchStatus};
+
+        for after in ["replace", "remove"] {
+            let (mut fanout, control, mut receivers) = fanout_from_senders(&[2]);
+            control
+                .send(ControlMessage::Pause(ComponentKey::from("0")))
+                .unwrap();
+            control.send(ControlMessage::Stop).unwrap();
+            let mut replacement = None;
+            if after == "replace" {
+                let (sender, receiver) = build_sender_pair(2);
+                replacement = Some(receiver);
+                control
+                    .send(ControlMessage::Replace(ComponentKey::from("0"), sender))
+                    .unwrap();
+            } else {
+                remove_sender_from_fanout(&control, 0);
+            }
+
+            let (batch, receiver) = BatchNotifier::new_with_receiver();
+            let event = Event::Log(LogEvent::from("held").with_batch_notifier(&batch));
+            drop(batch);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                fanout.send(event.into(), None),
+            )
+            .await
+            .expect("the send returns")
+            .expect("the component keeps draining");
+            assert_eq!(receiver.await, BatchStatus::Errored, "{after}");
+            assert!(
+                !fanout.recv_control_message().await,
+                "{after}: nothing follows Stop"
+            );
+            if let Some(replacement) = replacement {
+                drop(fanout);
+                let next = replacement.into_stream().next().await;
+                assert!(next.is_none(), "the Replace after Stop was not applied");
+            }
+            receivers.clear();
+            drop(control);
+        }
     }
 }
