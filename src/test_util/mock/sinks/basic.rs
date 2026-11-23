@@ -32,6 +32,11 @@ pub struct BasicSinkConfig {
     #[serde(skip)]
     confinement: Option<crate::template::ConfinementConfig>,
 
+    /// Resources this sink claims, so tests can make two sinks conflict (e.g. the same port)
+    /// and drive a reload through `shutdown_diff`'s wait-for-sink path. Nothing is bound.
+    #[serde(skip)]
+    resources: Vec<crate::config::Resource>,
+
     /// Dummy field used for generating unique configurations to trigger reloads.
     data: Option<String>,
 
@@ -65,6 +70,7 @@ impl BasicSinkConfig {
             sink: Mode::Normal(sink),
             healthy,
             confinement: None,
+            resources: Vec::new(),
             data: None,
             acknowledgements: AcknowledgementsConfig::DEFAULT,
             extra: TestComponentData::DEFAULT,
@@ -77,6 +83,7 @@ impl BasicSinkConfig {
             sink: Mode::Normal(sink),
             healthy,
             confinement: None,
+            resources: Vec::new(),
             data: Some(data.into()),
             acknowledgements: AcknowledgementsConfig::DEFAULT,
             extra: TestComponentData::DEFAULT,
@@ -92,6 +99,13 @@ impl BasicSinkConfig {
         self.confinement = Some(crate::template::ConfinementConfig {
             dangerously_allow_unconfined_template_resolution: allowed,
         });
+        self
+    }
+
+    /// Claim `resource` (see `resources`), without binding anything.
+    #[must_use]
+    pub fn with_resource(mut self, resource: crate::config::Resource) -> Self {
+        self.resources.push(resource);
         self
     }
 }
@@ -111,6 +125,10 @@ impl SinkConfig for BasicSinkConfig {
 
     fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
         self.confinement.as_ref()
+    }
+
+    fn resources(&self) -> Vec<crate::config::Resource> {
+        self.resources.clone()
     }
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
