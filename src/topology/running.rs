@@ -417,8 +417,9 @@ impl RunningTopology {
         // connections `shutdown_diff` paused, and Vector stops next. They stay paused: sending
         // `Remove` would let their upstreams emit into fanouts with no consumer and finalize those
         // events as delivered. When `stop` drops the control channels, a send waiting on a paused
-        // connection fails with its events marked errored (never acknowledged), and an idle
-        // component no longer spins on the closed channel (`Fanout::wait_for_replacements`).
+        // connection discards its events marked errored (never acknowledged) and the component
+        // drains and stops, instead of spinning on the closed channel
+        // (`Fanout::wait_for_replacements`).
         let held = self.deferred_removals.len() + self.paused_inputs.len();
         if held > 0 {
             warn!(

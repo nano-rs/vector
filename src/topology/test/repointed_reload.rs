@@ -249,14 +249,22 @@ async fn a_reload_waiting_on_a_sink_fed_by_an_idle_transform_completes() {
     let mut old = Config::builder();
     old.add_source("in", source.clone());
     old.add_transform("mid", &["in"], basic_transform("", 0.0));
-    old.add_sink("s1", &["mid"], sink1.with_resource(crate::config::Resource::tcp(port)));
+    old.add_sink(
+        "s1",
+        &["mid"],
+        sink1.with_resource(crate::config::Resource::tcp(port)),
+    );
     let (mut topology, _crash) = start_topology(old.build().unwrap(), false).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut new = Config::builder();
     new.add_source("in", source);
     new.add_transform("mid", &["in"], basic_transform("", 0.0));
-    new.add_sink("s2", &["mid"], sink2.with_resource(crate::config::Resource::tcp(port)));
+    new.add_sink(
+        "s2",
+        &["mid"],
+        sink2.with_resource(crate::config::Resource::tcp(port)),
+    );
     tokio::time::timeout(
         Duration::from_secs(10),
         topology.reload_config_and_respawn(new.build().unwrap(), ExtraContext::default()),
@@ -292,7 +300,10 @@ async fn chained_changed_and_removed_transforms_lose_no_event() {
 
         let sender = tokio::spawn(async move {
             for i in 0..EVENTS {
-                in_tx.send_event(Event::Log(LogEvent::from(format!("e{i}")))).await.unwrap();
+                in_tx
+                    .send_event(Event::Log(LogEvent::from(format!("e{i}"))))
+                    .await
+                    .unwrap();
             }
             in_tx
         });
@@ -310,7 +321,11 @@ async fn chained_changed_and_removed_transforms_lose_no_event() {
 
         let got = collect(&mut out_rx, Duration::from_secs(5)).await;
         let _in_tx = sender.await.unwrap();
-        assert_eq!(got.len(), EVENTS, "round {round}: events lost in the chain: {got:?}");
+        assert_eq!(
+            got.len(),
+            EVENTS,
+            "round {round}: events lost in the chain: {got:?}"
+        );
         topology.stop().await;
     }
 }
@@ -347,25 +362,26 @@ async fn removing_a_consumer_does_not_stall_its_siblings_during_the_build() {
     let sender = spawn_sender(in_tx);
     tokio::time::sleep(Duration::from_millis(200)).await;
     {
-    let reload = topology.reload_config_and_respawn(new.build().unwrap(), ExtraContext::default());
-    tokio::pin!(reload);
-    // While the reload builds, c1 keeps delivering.
-    let mut during = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(BUILD_MS / 2);
-    loop {
-        tokio::select! {
-            result = &mut reload => {
-                result.expect("the reload succeeds");
-                panic!("the reload finished before the build window was observed");
+        let reload =
+            topology.reload_config_and_respawn(new.build().unwrap(), ExtraContext::default());
+        tokio::pin!(reload);
+        // While the reload builds, c1 keeps delivering.
+        let mut during = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(BUILD_MS / 2);
+        loop {
+            tokio::select! {
+                result = &mut reload => {
+                    result.expect("the reload succeeds");
+                    panic!("the reload finished before the build window was observed");
+                }
+                item = out1_rx.next() => {
+                    if let Some(item) = item { during += item.events.len(); }
+                }
+                () = tokio::time::sleep_until(deadline) => break,
             }
-            item = out1_rx.next() => {
-                if let Some(item) = item { during += item.events.len(); }
-            }
-            () = tokio::time::sleep_until(deadline) => break,
         }
-    }
-    assert!(during > 0, "c1 delivered nothing while the reload built");
-    reload.await.expect("the reload succeeds");
+        assert!(during > 0, "c1 delivered nothing while the reload built");
+        reload.await.expect("the reload succeeds");
     }
     sender.await.unwrap();
     topology.stop().await;

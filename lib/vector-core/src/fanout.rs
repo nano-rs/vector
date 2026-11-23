@@ -50,17 +50,8 @@ pub struct Fanout {
     control_channel: mpsc::UnboundedReceiver<ControlMessage>,
     /// The control channel returned `None` (the topology dropped its handle: Vector is stopping).
     control_channel_closed: bool,
+    reported_closed_while_paused: bool,
     upstream_component: ComponentKey,
-}
-
-/// The control channel closed while a sink was paused: the topology that would have replaced
-/// it is gone (Vector is stopping, or a failed reload could not restore the old topology).
-#[derive(Debug, snafu::Snafu)]
-#[snafu(display(
-    "Fanout of '{upstream}' was stopped while a downstream component was paused; the events are not delivered"
-))]
-pub struct ClosedWhilePaused {
-    upstream: String,
 }
 
 impl Fanout {
@@ -71,6 +62,7 @@ impl Fanout {
             senders: Default::default(),
             control_channel: control_rx,
             control_channel_closed: false,
+            reported_closed_while_paused: false,
             upstream_component,
         };
 
@@ -134,15 +126,12 @@ impl Fanout {
         if self.control_channel_closed {
             return false;
         }
-        match self.control_channel.recv().await {
-            Some(msg) => {
-                self.apply_control_message(msg);
-                true
-            }
-            None => {
-                self.control_channel_closed = true;
-                false
-            }
+        if let Some(msg) = self.control_channel.recv().await {
+            self.apply_control_message(msg);
+            true
+        } else {
+            self.control_channel_closed = true;
+            false
         }
     }
 
@@ -183,19 +172,17 @@ impl Fanout {
     ///
     /// Control messages are processed until all senders have been replaced, so it is guaranteed
     /// that when this method returns, all senders are ready for the next send to be triggered.
-    async fn wait_for_replacements(&mut self) -> Result<(), ClosedWhilePaused> {
+    /// Returns `false` if the control channel closed with a sink still paused.
+    async fn wait_for_replacements(&mut self) -> bool {
         while self.has_paused() {
             if !self.recv_control_message().await {
-                // NAN-5874: the control channel closed with a sink still paused, so nothing will
-                // ever replace it (Vector is stopping, e.g. after a reload whose rollback failed).
-                // This used to loop on `recv() == None` without yielding (a worker at 100% CPU
-                // until the shutdown deadline). The caller fails the send instead.
-                return Err(ClosedWhilePaused {
-                    upstream: self.upstream_component.to_string(),
-                });
+                // NAN-5874: nothing will ever replace the paused sink (Vector is stopping, e.g.
+                // after a reload whose rollback failed). This used to loop on `recv() == None`
+                // without yielding: a worker at 100% CPU until the shutdown deadline.
+                return false;
             }
         }
-        Ok(())
+        true
     }
 
     /// Send a stream of events to all connected sinks.
@@ -260,12 +247,20 @@ impl Fanout {
         }
 
         // Wait for any senders that are paused to be replaced first before continuing with the send.
-        if let Err(error) = self.wait_for_replacements().await {
-            // Never finalize these as delivered: an acknowledging source must not acknowledge
-            // them. `Errored` tells it they were not.
+        if !self.wait_for_replacements().await {
+            // The events cannot reach the paused sink. Never finalize them as delivered: an
+            // acknowledging source must not acknowledge them (`Errored` tells it they were not).
+            // The send itself succeeds, so the component keeps draining and stops cleanly.
             let mut events = events;
             events.for_each_metadata_mut(|metadata| metadata.update_status(EventStatus::Errored));
-            return Err(Box::new(error));
+            if !self.reported_closed_while_paused {
+                self.reported_closed_while_paused = true;
+                warn!(
+                    message = "Discarding events, not acknowledged: a downstream component was paused by a reload that never completed and Vector is stopping.",
+                    component_id = %self.upstream_component,
+                );
+            }
+            return Ok(());
         }
 
         // Drop empty event batches before they reach any downstream buffer, this is technically
@@ -1020,10 +1015,10 @@ mod tests {
     }
 
     // NAN-5874: a send waiting on a paused sink whose control channel closes (Vector stopping
-    // after a reload whose rollback failed) fails promptly, and its events are not finalized as
-    // delivered.
+    // after a reload whose rollback failed) returns promptly, and its events are finalized as
+    // errored, never as delivered.
     #[tokio::test]
-    async fn a_send_paused_when_the_control_channel_closes_fails_without_delivering() {
+    async fn a_send_paused_when_the_control_channel_closes_returns_without_delivering() {
         use crate::event::{BatchNotifier, BatchStatus};
 
         let (mut fanout, control, _receivers) = fanout_from_senders(&[2, 2]);
@@ -1041,7 +1036,7 @@ mod tests {
         )
         .await
         .expect("the send returns instead of spinning");
-        assert!(result.is_err(), "the send fails");
+        assert!(result.is_ok(), "the component keeps draining");
         assert_eq!(receiver.await, BatchStatus::Errored);
     }
 
@@ -1052,9 +1047,12 @@ mod tests {
     async fn serve_control_message_applies_messages_then_pends_once_closed() {
         let (mut fanout, control, mut receivers) = fanout_from_senders(&[2]);
         remove_sender_from_fanout(&control, 0);
-        tokio::time::timeout(std::time::Duration::from_secs(1), fanout.serve_control_message())
-            .await
-            .expect("the message is applied");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fanout.serve_control_message(),
+        )
+        .await
+        .expect("the message is applied");
         // The removed sink's sender was dropped, so its receiver ends.
         let receiver = receivers.remove(0);
         assert!(receiver.into_stream().next().await.is_none());
@@ -1070,18 +1068,20 @@ mod tests {
     #[tokio::test]
     async fn send_stream_applies_control_messages_while_idle() {
         let (mut fanout, control, mut receivers) = fanout_from_senders(&[2]);
-        let (_items_tx, items_rx) = futures::channel::mpsc::unbounded::<(EventArray, std::time::Instant)>();
+        let (_items_tx, items_rx) =
+            futures::channel::mpsc::unbounded::<(EventArray, std::time::Instant)>();
         let sending = tokio::spawn(async move {
             fanout.send_stream(items_rx).await.unwrap();
         });
         remove_sender_from_fanout(&control, 0);
         let receiver = receivers.remove(0);
-        let next =
-            tokio::time::timeout(std::time::Duration::from_secs(2), receiver.into_stream().next())
-                .await
-                .expect("the idle stream applied the Remove and dropped the sender");
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            receiver.into_stream().next(),
+        )
+        .await
+        .expect("the idle stream applied the Remove and dropped the sender");
         assert!(next.is_none());
         sending.abort();
     }
-
 }
