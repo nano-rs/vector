@@ -180,6 +180,16 @@ impl RunningTopology {
     /// The returned future resolves to `true` if every component finished on its own before
     /// the graceful shutdown deadline, or `false` if any component had to be forcefully killed.
     pub fn stop(self) -> impl Future<Output = bool> {
+        // NAN-5874: tell every fanout no paused sink will be replaced (a reload whose rollback
+        // failed leaves connections paused), so a send waiting on one discards its events as
+        // errored and its component drains, instead of waiting for the control channel to close.
+        // It may never close: the API's tap watch holds clones of every control channel. The
+        // watch is cleared too, so tap subscribers drop theirs.
+        for output in self.outputs.values() {
+            _ = output.send(ControlMessage::Stop);
+        }
+        _ = self.watch.0.send(TapResource::default());
+
         // Create handy handles collections of all tasks for the subsequent
         // operations.
         let mut wait_handles = Vec::new();
@@ -416,10 +426,9 @@ impl RunningTopology {
         // NAN-5874: neither topology could be built, so nothing will replace or remove the
         // connections `shutdown_diff` paused, and Vector stops next. They stay paused: sending
         // `Remove` would let their upstreams emit into fanouts with no consumer and finalize those
-        // events as delivered. When `stop` drops the control channels, a send waiting on a paused
-        // connection discards its events marked errored (never acknowledged) and the component
-        // drains and stops, instead of spinning on the closed channel
-        // (`Fanout::wait_for_replacements`).
+        // events as delivered. `stop` then sends every fanout `ControlMessage::Stop`: a send
+        // waiting on a paused connection discards its events marked errored (never acknowledged)
+        // and the component drains and stops.
         let held = self.deferred_removals.len() + self.paused_inputs.len();
         if held > 0 {
             warn!(
@@ -1678,7 +1687,12 @@ fn sink_buffer_and_hold(
 ) -> Option<(vector_lib::buffers::BufferConfig, bool)> {
     config
         .sink(sink_key)
-        .map(|sink| (sink.buffer.clone(), sink.inner.hold_errored_in_disk_buffer()))
+        .map(|sink| {
+            (
+                sink.buffer.clone(),
+                sink.inner.hold_errored_in_disk_buffer(),
+            )
+        })
         .or_else(|| {
             enrichment_table_sinks(&config.enrichment_tables)
                 .find(|(key, _)| key == sink_key)

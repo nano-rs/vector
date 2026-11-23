@@ -86,6 +86,12 @@ pub fn basic_transform(suffix: &str, increase: f64) -> BasicTransformConfig {
     BasicTransformConfig::new(suffix.to_owned(), increase)
 }
 
+/// A concurrent transform with ports `a` and `b` that sends everything to `a` (NAN-5874).
+#[must_use]
+pub fn two_port_transform() -> transforms::TwoPortTransformConfig {
+    transforms::TwoPortTransformConfig::default()
+}
+
 /// A `basic_transform` whose build takes `build_ms` milliseconds (NAN-5874).
 #[must_use]
 pub fn slow_build_transform(suffix: &str, build_ms: u64) -> SlowBuildTransformConfig {

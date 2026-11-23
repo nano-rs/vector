@@ -145,17 +145,6 @@ pub struct SimpleHttpConfig {
 
     #[serde(default)]
     keepalive: KeepaliveConfig,
-
-    /// How long a request may wait for the topology to accept its events before Vector answers
-    /// it with HTTP 503 Service Unavailable and a `Retry-After` header.
-    ///
-    /// If not set, a request waits until connected components accept its events, holding its
-    /// events in memory meanwhile (for example while a configuration reload holds this source's
-    /// output). When set, a request that waits longer is refused instead, and the client retries.
-    /// Events of that request the topology already accepted are still delivered, so the retry
-    /// can deliver them twice.
-    #[serde(default)]
-    pub send_timeout_secs: Option<f64>,
 }
 
 impl SimpleHttpConfig {
@@ -248,7 +237,6 @@ impl Default for SimpleHttpConfig {
             acknowledgements: SourceAcknowledgementsConfig::default(),
             log_namespace: None,
             keepalive: KeepaliveConfig::default(),
-            send_timeout_secs: None,
         }
     }
 }
@@ -325,11 +313,6 @@ pub fn build_param_matcher(list: &[String]) -> crate::Result<Vec<HttpConfigParam
 #[async_trait::async_trait]
 #[typetag::serde(name = "http_server")]
 impl SourceConfig for SimpleHttpConfig {
-    fn send_timeout(&self) -> Option<std::time::Duration> {
-        self.send_timeout_secs
-            .map(std::time::Duration::from_secs_f64)
-    }
-
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
         let decoder = self
@@ -605,7 +588,6 @@ mod tests {
                 acknowledgements: acknowledgements.into(),
                 log_namespace: None,
                 keepalive: KeepaliveConfig::default(),
-                send_timeout_secs: None,
             }
             .build(context)
             .await
@@ -615,52 +597,6 @@ mod tests {
         });
         wait_for_tcp(address).await;
         (recv, address)
-    }
-
-    /// NAN-5874: a request the topology does not accept within `send_timeout_secs` gets 503 with
-    /// `Retry-After` instead of waiting with its events.
-    #[tokio::test]
-    async fn a_send_timeout_answers_503_with_retry_after() {
-        let (sender, _recv) = SourceSender::new_test_sender_with_options(
-            1,
-            Some(std::time::Duration::from_millis(200)),
-        );
-        let (_guard, address) = next_addr();
-        let context = SourceContext::new_test(sender, None);
-        tokio::spawn(async move {
-            SimpleHttpConfig {
-                address,
-                send_timeout_secs: Some(0.2),
-                ..SimpleHttpConfig::default()
-            }
-            .build(context)
-            .await
-            .unwrap()
-            .await
-            .unwrap();
-        });
-        wait_for_tcp(address).await;
-        let mut refused = None;
-        for i in 0..20 {
-            let response = reqwest::Client::new()
-                .post(format!("http://{address}/"))
-                .body(format!("e{i}"))
-                .send()
-                .await
-                .unwrap();
-            if response.status() == 503 {
-                refused = Some(response);
-                break;
-            }
-        }
-        let refused = refused.expect("a request the topology cannot take is refused");
-        assert_eq!(
-            refused
-                .headers()
-                .get("retry-after")
-                .map(|v| v.to_str().unwrap()),
-            Some("1")
-        );
     }
 
     async fn send(address: SocketAddr, body: &str) -> u16 {

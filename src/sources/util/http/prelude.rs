@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use futures::FutureExt;
+use futures::{FutureExt, TryFutureExt};
 use tower::ServiceBuilder;
 use tracing::Span;
 use vector_lib::{
@@ -411,29 +411,21 @@ async fn handle_request(
     acknowledgements: bool,
     response_code: StatusCode,
     mut out: SourceSender,
-) -> Result<warp::reply::Response, Rejection> {
+) -> Result<impl warp::Reply, Rejection> {
     match events {
         Ok(mut events) => {
             let receiver = BatchNotifier::maybe_apply_to(acknowledgements, &mut events);
 
             let count = events.len();
-            match out.send_batch(events).await {
-                Ok(()) => handle_batch_status(response_code, receiver)
-                    .await
-                    .map(warp::Reply::into_response),
-                // NAN-5874: the source's `send_timeout` elapsed while the topology held its
-                // output (a reload); refuse the request so the client retries, instead of
-                // holding it and its events.
-                Err(vector_lib::source_sender::SendError::Timeout) => {
-                    Ok(super::service_unavailable_retry_after())
-                }
-                Err(vector_lib::source_sender::SendError::Closed) => {
+            out.send_batch(events)
+                .map_err(|_| {
                     // can only fail if receiving end disconnected, so we are shutting down,
                     // probably not gracefully.
                     emit(StreamClosedError { count });
-                    Err(warp::reject::custom(RejectShuttingDown))
-                }
-            }
+                    warp::reject::custom(RejectShuttingDown)
+                })
+                .and_then(|()| handle_batch_status(response_code, receiver))
+                .await
         }
         Err(error) => {
             emit(HttpBadRequest::new(error.code(), error.message()));
@@ -472,14 +464,8 @@ mod redacted_headers_tests {
     #[test]
     fn credentials_are_redacted_and_other_headers_kept() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            HeaderValue::from_static("Bearer s3cr3t-token"),
-        );
-        headers.insert(
-            "Proxy-Authorization",
-            HeaderValue::from_static("Basic cHJveHk6cHc="),
-        );
+        headers.insert("authorization", HeaderValue::from_static("Bearer s3cr3t-token"));
+        headers.insert("Proxy-Authorization", HeaderValue::from_static("Basic cHJveHk6cHc="));
         headers.insert("cookie", HeaderValue::from_static("session=abc"));
         headers.insert("x-api-key", HeaderValue::from_static("key-123"));
         let mut marked = HeaderValue::from_static("marked-secret");
@@ -488,19 +474,10 @@ mod redacted_headers_tests {
         headers.insert("content-type", HeaderValue::from_static("application/json"));
 
         let logged = format!("{:?}", RedactedHeaders(&headers));
-        for secret in [
-            "s3cr3t-token",
-            "cHJveHk6cHc=",
-            "session=abc",
-            "key-123",
-            "marked-secret",
-        ] {
+        for secret in ["s3cr3t-token", "cHJveHk6cHc=", "session=abc", "key-123", "marked-secret"] {
             assert!(!logged.contains(secret), "{secret} leaked: {logged}");
         }
         assert!(logged.contains("application/json"), "{logged}");
-        assert!(
-            logged.contains("\"authorization\": \"<redacted>\""),
-            "{logged}"
-        );
+        assert!(logged.contains("\"authorization\": \"<redacted>\""), "{logged}");
     }
 }
