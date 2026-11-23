@@ -100,6 +100,10 @@ impl TransformOutputs {
 
     /// Sends the events in the buffer to their respective outputs.
     ///
+    /// # Panics
+    ///
+    /// Panics if `buf` was not created by this `TransformOutputs` (mismatched outputs).
+    ///
     /// # Errors
     ///
     /// If an error occurs while sending events to their respective output, an error variant will be
@@ -475,27 +479,41 @@ mod nan5874_tests {
         let (b_tx, b_rx) = pair();
         let control_a = &controls[&Some("a".to_string())];
         let control_b = &controls[&Some("b".to_string())];
-        control_a.send(ControlMessage::Add(ComponentKey::from("sink_a"), a_tx)).unwrap();
-        control_b.send(ControlMessage::Add(ComponentKey::from("sink_b"), b_tx)).unwrap();
-        control_a.send(ControlMessage::Pause(ComponentKey::from("sink_a"))).unwrap();
+        control_a
+            .send(ControlMessage::Add(ComponentKey::from("sink_a"), a_tx))
+            .unwrap();
+        control_b
+            .send(ControlMessage::Add(ComponentKey::from("sink_b"), b_tx))
+            .unwrap();
+        control_a
+            .send(ControlMessage::Pause(ComponentKey::from("sink_a")))
+            .unwrap();
 
         let mut buf = outputs.new_buf_with_capacity(1);
         buf.push(Some("a"), Event::Log(LogEvent::from("to a")));
         buf.push(Some("b"), Event::Log(LogEvent::from("to b")));
         let send = tokio::spawn(async move {
             // Port order is not fixed: whichever port sends first, port `a` blocks.
-            let _ = outputs.send(&mut buf).await;
+            let _sent = outputs.send(&mut buf).await;
             outputs
         });
 
-        control_b.send(ControlMessage::Remove(ComponentKey::from("sink_b"))).unwrap();
+        control_b
+            .send(ControlMessage::Remove(ComponentKey::from("sink_b")))
+            .unwrap();
         let mut b_stream = b_rx.into_stream();
         let drained = tokio::time::timeout(Duration::from_secs(2), async {
             while b_stream.next().await.is_some() {}
         })
         .await;
-        assert!(drained.is_ok(), "port b applied Remove(sink_b) while port a waited");
-        assert!(!send.is_finished(), "port a is still waiting for its paused sink");
+        assert!(
+            drained.is_ok(),
+            "port b applied Remove(sink_b) while port a waited"
+        );
+        assert!(
+            !send.is_finished(),
+            "port a is still waiting for its paused sink"
+        );
         send.abort();
     }
 
@@ -509,8 +527,12 @@ mod nan5874_tests {
         let (mut outputs, controls) = TransformOutputs::new(specs, &ComponentKey::from("t"));
         let (b_tx, b_rx) = pair();
         let control_b = &controls[&Some("b".to_string())];
-        control_b.send(ControlMessage::Add(ComponentKey::from("sink_b"), b_tx)).unwrap();
-        control_b.send(ControlMessage::Remove(ComponentKey::from("sink_b"))).unwrap();
+        control_b
+            .send(ControlMessage::Add(ComponentKey::from("sink_b"), b_tx))
+            .unwrap();
+        control_b
+            .send(ControlMessage::Remove(ComponentKey::from("sink_b")))
+            .unwrap();
         for _ in 0..2 {
             tokio::time::timeout(Duration::from_secs(1), outputs.serve_control_messages())
                 .await
