@@ -168,17 +168,6 @@ pub struct SplunkConfig {
     /// endpoint preserves its existing behavior of one event per request body.
     #[serde(default)]
     pub raw: CodecConfig,
-
-    /// How long a request may wait for the topology to accept its events before Vector answers
-    /// it with HTTP 503 Service Unavailable and a `Retry-After` header.
-    ///
-    /// If not set, a request waits until connected components accept its events, holding its
-    /// events in memory meanwhile (for example while a configuration reload holds this source's
-    /// output). When set, a request that waits longer is refused instead, and the client retries.
-    /// Events of that request the topology already accepted are still delivered, so the retry
-    /// can deliver them twice; no acknowledgement id is returned for it.
-    #[serde(default)]
-    pub send_timeout_secs: Option<f64>,
 }
 
 /// Codec configuration applied to one of the `splunk_hec` endpoints.
@@ -236,7 +225,6 @@ impl Default for SplunkConfig {
             keepalive: KeepaliveConfig::default(),
             event: CodecConfig::default(),
             raw: CodecConfig::default(),
-            send_timeout_secs: None,
         }
     }
 }
@@ -482,11 +470,6 @@ impl SourceConfig for SplunkConfig {
         vec![Resource::tcp(self.address)]
     }
 
-    fn send_timeout(&self) -> Option<std::time::Duration> {
-        self.send_timeout_secs
-            .map(std::time::Duration::from_secs_f64)
-    }
-
     fn can_acknowledge(&self) -> bool {
         true
     }
@@ -688,7 +671,7 @@ impl SplunkSource {
                                     return Err(Rejection::from(ApiError::ServerShutdown));
                                 }
                                 Err(SendError::Timeout) => {
-                                    return Err(Rejection::from(ApiError::SendTimedOut));
+                                    unreachable!("No timeout is configured for this source.")
                                 }
                             }
                         }
@@ -777,7 +760,9 @@ impl SplunkSource {
                                 credential.stamp(&mut event);
                             }
                             let res = out.send_event(event).await;
-                            return res.map(|()| maybe_ack_id).map_err(send_rejection);
+                            return res
+                                .map(|()| maybe_ack_id)
+                                .map_err(|_| Rejection::from(ApiError::ServerShutdown));
                         };
 
                         // Decoder path: pass the optional HEC token into raw_event so
@@ -813,14 +798,17 @@ impl SplunkSource {
                             // Forward the partial events with no ack so the source's
                             // existing partial-delivery semantics still apply.
                             let res = out.send_batch(events).await;
-                            return res.map(|()| None).map_err(send_rejection);
+                            return res
+                                .map(|()| None)
+                                .map_err(|_| Rejection::from(ApiError::ServerShutdown));
                         }
 
                         let maybe_ack_id =
                             register_ack(idx_ack, receiver, Some(channel_id)).await?;
 
                         let res = out.send_batch(events).await;
-                        res.map(|()| maybe_ack_id).map_err(send_rejection)
+                        res.map(|()| maybe_ack_id)
+                            .map_err(|_| Rejection::from(ApiError::ServerShutdown))
                     }
                 },
             )
@@ -1982,28 +1970,13 @@ pub(crate) enum ApiError {
     UnsupportedContentType,
     MissingChannel,
     NoData,
-    InvalidDataFormat {
-        event: usize,
-    },
+    InvalidDataFormat { event: usize },
     ServerShutdown,
-    EmptyEventField {
-        event: usize,
-    },
-    MissingEventField {
-        event: usize,
-    },
+    EmptyEventField { event: usize },
+    MissingEventField { event: usize },
     BadRequest,
     ServiceUnavailable,
     AckIsDisabled,
-    /// The topology did not accept the events within `send_timeout_secs`.
-    SendTimedOut,
-}
-
-fn send_rejection(error: SendError) -> Rejection {
-    match error {
-        SendError::Timeout => Rejection::from(ApiError::SendTimedOut),
-        SendError::Closed => Rejection::from(ApiError::ServerShutdown),
-    }
 }
 
 impl warp::reject::Reject for ApiError {}
@@ -2152,17 +2125,6 @@ async fn finish_err(rejection: Rejection) -> Result<(Response,), Rejection> {
             ApiError::AckIsDisabled => {
                 response_json(StatusCode::BAD_REQUEST, splunk_response::ACK_IS_DISABLED)
             }
-            ApiError::SendTimedOut => {
-                let mut response = response_json(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    splunk_response::SERVER_IS_BUSY,
-                );
-                response.headers_mut().insert(
-                    warp::http::header::RETRY_AFTER,
-                    warp::http::HeaderValue::from_static("1"),
-                );
-                response
-            }
         },))
     } else if let Some(error) = rejection.find::<ErrorMessage>() {
         Ok((response_json(error.status_code(), error),))
@@ -2295,7 +2257,6 @@ mod tests {
                 keepalive: KeepaliveConfig::default(),
                 event: CodecConfig::default(),
                 raw: CodecConfig::default(),
-                send_timeout_secs: None,
             }
             .build(cx)
             .await
@@ -2305,61 +2266,6 @@ mod tests {
         });
         wait_for_tcp(address).await;
         (recv, address, port_guard)
-    }
-
-    /// NAN-5874: a request the topology does not accept within `send_timeout_secs` (here a
-    /// one-slot sender nobody reads, as when a reload holds the source's output) gets 503 with
-    /// `Retry-After` instead of waiting with its events.
-    #[tokio::test]
-    async fn a_send_timeout_answers_503_with_retry_after() {
-        let (sender, _recv) =
-            SourceSender::new_test_sender_with_options(1, Some(Duration::from_millis(200)));
-        let (_port_guard, address) = next_addr();
-        let cx = SourceContext::new_test(sender, None);
-        tokio::spawn(async move {
-            SplunkConfig {
-                address,
-                token: Some(TOKEN.to_owned().into()),
-                send_timeout_secs: Some(0.2),
-                ..SplunkConfig::default()
-            }
-            .build(cx)
-            .await
-            .unwrap()
-            .await
-            .unwrap();
-        });
-        wait_for_tcp(address).await;
-
-        let options = SendWithOpts {
-            channel: Some(Channel::Header("channel")),
-            forwarded_for: None,
-        };
-        let mut refused = None;
-        for i in 0..20 {
-            let response = build_request(
-                address,
-                "services/collector/event",
-                &format!(r#"{{"event":"e{i}"}}"#),
-                TOKEN,
-                &options,
-            )
-            .send()
-            .await
-            .unwrap();
-            if response.status() == 503 {
-                refused = Some(response);
-                break;
-            }
-        }
-        let refused = refused.expect("a request the topology cannot take is refused");
-        assert_eq!(
-            refused
-                .headers()
-                .get("retry-after")
-                .map(|v| v.to_str().unwrap()),
-            Some("1")
-        );
     }
 
     async fn sink(
@@ -3858,7 +3764,6 @@ mod tests {
                 keepalive: KeepaliveConfig::default(),
                 event,
                 raw,
-                send_timeout_secs: None,
             }
             .build(cx)
             .await
@@ -4250,7 +4155,6 @@ mod tests {
                 keepalive: KeepaliveConfig::default(),
                 event: CodecConfig::default(),
                 raw: codec_decoding(vector_lib::codecs::JsonDeserializerConfig::default().into()),
-                send_timeout_secs: None,
             }
             .build(cx)
             .await
@@ -4310,7 +4214,6 @@ mod tests {
                     )),
                     Some(vector_lib::codecs::JsonDeserializerConfig::default().into()),
                 ),
-                send_timeout_secs: None,
             }
             .build(cx)
             .await

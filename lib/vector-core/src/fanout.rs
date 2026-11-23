@@ -27,6 +27,13 @@ pub enum ControlMessage {
 
     /// Replaces a paused sink with its new sender.
     Replace(ComponentKey, BufferSender<EventArray>),
+
+    /// The topology is stopping (NAN-5874): no paused sink will ever be replaced and no further
+    /// control message follows. A send waiting on a paused sink then discards its events as
+    /// errored (never acknowledged) instead of waiting for a replacement. Sent explicitly because
+    /// the channel itself may never close: the API's tap watch holds clones of every control
+    /// channel for as long as it runs.
+    Stop,
 }
 
 impl fmt::Debug for ControlMessage {
@@ -37,6 +44,7 @@ impl fmt::Debug for ControlMessage {
             Self::Remove(id) => write!(f, "Remove({id:?})"),
             Self::Pause(id) => write!(f, "Pause({id:?})"),
             Self::Replace(id, _) => write!(f, "Replace({id:?})"),
+            Self::Stop => write!(f, "Stop"),
         }
     }
 }
@@ -144,8 +152,26 @@ impl Fanout {
     /// sink's sender, and the component may receive nothing until the reload completes (its own
     /// upstream may be paused by the same reload).
     pub async fn serve_control_message(&mut self) {
-        if !self.recv_control_message().await {
-            future::pending::<()>().await;
+        future::poll_fn(|cx| self.poll_serve_control_message(cx)).await;
+    }
+
+    /// `serve_control_message` as a poll, allocation-free: `Ready` once a control message was
+    /// applied; `Pending` while none is queued, and for good once the channel is closed or the
+    /// topology sent `Stop` (no waker is kept then, so nothing spins).
+    pub fn poll_serve_control_message(&mut self, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        if self.control_channel_closed {
+            return Poll::Pending;
+        }
+        match self.control_channel.poll_recv(cx) {
+            Poll::Ready(Some(message)) => {
+                self.apply_control_message(message);
+                Poll::Ready(())
+            }
+            Poll::Ready(None) => {
+                self.control_channel_closed = true;
+                Poll::Pending
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -165,6 +191,7 @@ impl Fanout {
             ControlMessage::Remove(id) => self.remove(&id),
             ControlMessage::Pause(id) => self.pause(&id),
             ControlMessage::Replace(id, sink) => self.replace(&id, sink),
+            ControlMessage::Stop => self.control_channel_closed = true,
         }
     }
 
@@ -326,6 +353,10 @@ impl Fanout {
                         },
                         Some(ControlMessage::Replace(id, sink)) => {
                             send_group.replace(&id, Sender::new(sink));
+                        },
+                        Some(ControlMessage::Stop) => {
+                            control_channel_open = false;
+                            self.control_channel_closed = true;
                         },
                         None => {
                             // Control channel is closed, which means Vector is shutting down.

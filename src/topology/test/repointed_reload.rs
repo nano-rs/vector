@@ -22,7 +22,8 @@ use crate::{
     extra_context::ExtraContext,
     test_util::{
         mock::{
-            basic_sink, basic_source, basic_transform, build_error_source, slow_build_transform,
+            basic_sink, basic_source, basic_transform, build_error_source, flaky_build_transform,
+            slow_build_transform, two_port_transform,
         },
         start_topology, trace_init,
     },
@@ -242,9 +243,9 @@ async fn a_reload_waiting_on_a_sink_fed_by_an_idle_transform_completes() {
     trace_init();
 
     let port = free_port();
-    let (_in_tx, source) = basic_source();
+    let (in_tx, source) = basic_source();
     let (_out1_rx, sink1) = basic_sink(10);
-    let (mut out2_rx, sink2) = basic_sink(10);
+    let (_out2_rx, sink2) = basic_sink(10);
 
     let mut old = Config::builder();
     old.add_source("in", source.clone());
@@ -273,8 +274,7 @@ async fn a_reload_waiting_on_a_sink_fed_by_an_idle_transform_completes() {
     .expect("the reload must not wait forever on the idle transform")
     .expect("the reload succeeds");
 
-    drop(_in_tx);
-    let _ = &mut out2_rx;
+    drop(in_tx);
     topology.stop().await;
 }
 
@@ -385,4 +385,141 @@ async fn removing_a_consumer_does_not_stall_its_siblings_during_the_build() {
     }
     sender.await.unwrap();
     topology.stop().await;
+}
+
+/// `FailedToRestore` with a tap watch subscriber alive, as with `api.enabled = true` (nano enables
+/// the API): the watch holds clones of every control channel, so the channels never close during
+/// `stop()`. The paused connection must still be released (`ControlMessage::Stop`): `stop()`
+/// completes gracefully, and the events that waited on it are not acknowledged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_restore_with_a_tap_watch_alive_still_stops_gracefully() {
+    use vector_lib::event::{BatchNotifier, BatchStatus};
+
+    trace_init();
+
+    let (mut in_tx, source) = basic_source();
+    let (_out_rx, out) = basic_sink(1000);
+    let prepare = basic_transform("", 0.0);
+
+    let mut old = Config::builder();
+    old.add_source("in", source.clone());
+    old.add_transform("prepare", &["in"], prepare.clone());
+    old.add_transform("parse", &["prepare"], flaky_build_transform(" p", 1));
+    old.add_sink("out", &["parse"], out.clone());
+    let (mut topology, _crash) = start_topology(old.build().unwrap(), false).await;
+    let watch = topology.watch();
+
+    let (_bad_rx, bad_sink) = basic_sink(10);
+    let mut new = Config::builder();
+    new.add_source("in", source);
+    new.add_transform("prepare", &["in"], prepare);
+    new.add_transform("parse_new", &["prepare"], basic_transform(" p2", 0.0));
+    new.add_sink("out", &["parse_new"], out);
+    new.add_source("bad", build_error_source());
+    new.add_sink("bad_out", &["bad"], bad_sink);
+    let result = topology
+        .reload_config_and_respawn(new.build().unwrap(), ExtraContext::default())
+        .await;
+    assert!(
+        matches!(result, Err(ReloadError::FailedToRestore)),
+        "{result:?}"
+    );
+
+    // An event that reaches the paused connection after the failed restore.
+    let (batch, receiver) = BatchNotifier::new_with_receiver();
+    in_tx
+        .send_event(Event::Log(
+            LogEvent::from("held").with_batch_notifier(&batch),
+        ))
+        .await
+        .unwrap();
+    drop(batch);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(in_tx);
+
+    let stopped = tokio::time::timeout(Duration::from_secs(10), topology.stop())
+        .await
+        .expect("stop() finishes while a tap watch is alive");
+    assert!(stopped, "stop() was graceful");
+    let status = tokio::time::timeout(Duration::from_secs(5), receiver)
+        .await
+        .expect("the held event was finalized");
+    assert_ne!(
+        status,
+        BatchStatus::Delivered,
+        "a held event must not be acknowledged"
+    );
+    drop(watch);
+}
+
+/// A concurrent multi-port transform under sustained traffic on port `a`, while a reload waits
+/// for a sink on its idle port `b` (removed; its replacement claims the same port). Its control
+/// messages are served before new input, so the traffic cannot starve the reload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sustained_traffic_does_not_starve_a_reload_waiting_on_an_idle_port() {
+    trace_init();
+
+    let port = free_port();
+    let (mut in_tx, source) = basic_source();
+    let (mut a_rx, sink_a) = basic_sink(1000);
+    let (_b_rx, sink_b) = basic_sink(10);
+    let (_b2_rx, sink_b2) = basic_sink(10);
+
+    let mut old = Config::builder();
+    old.add_source("in", source.clone());
+    old.add_transform("split", &["in"], two_port_transform());
+    old.add_sink("out_a", &["split.a"], sink_a.clone());
+    old.add_sink(
+        "s_b",
+        &["split.b"],
+        sink_b.with_resource(crate::config::Resource::tcp(port)),
+    );
+    let (mut topology, _crash) = start_topology(old.build().unwrap(), false).await;
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sending = {
+        let stop = std::sync::Arc::clone(&stop);
+        tokio::spawn(async move {
+            let mut sent = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                in_tx
+                    .send_event(Event::Log(LogEvent::from(format!("e{sent}"))))
+                    .await
+                    .unwrap();
+                sent += 1;
+            }
+            sent
+        })
+    };
+    let draining = tokio::spawn(async move {
+        let mut got = 0usize;
+        while let Some(item) = a_rx.next().await {
+            got += item.events.len();
+        }
+        got
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut new = Config::builder();
+    new.add_source("in", source);
+    new.add_transform("split", &["in"], two_port_transform());
+    new.add_sink("out_a", &["split.a"], sink_a);
+    new.add_sink(
+        "s_b2",
+        &["split.b"],
+        sink_b2.with_resource(crate::config::Resource::tcp(port)),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        topology.reload_config_and_respawn(new.build().unwrap(), ExtraContext::default()),
+    )
+    .await
+    .expect("sustained traffic must not starve the reload")
+    .expect("the reload succeeds");
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let sent = sending.await.unwrap();
+    topology.stop().await;
+    let got = draining.await.unwrap();
+    assert_eq!(got, sent, "port a lost events across the reload");
 }

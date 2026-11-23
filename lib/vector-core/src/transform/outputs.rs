@@ -19,6 +19,8 @@ use crate::{
 };
 
 struct TransformOutput {
+    /// `None` for the default output.
+    port: Option<String>,
     fanout: Fanout,
     events_sent: Registered<EventsSent>,
     log_schema_definitions: HashMap<OutputId, Arc<schema::Definition>>,
@@ -27,8 +29,9 @@ struct TransformOutput {
 
 pub struct TransformOutputs {
     outputs_spec: Vec<config::TransformOutput>,
-    primary_output: Option<TransformOutput>,
-    named_outputs: HashMap<String, TransformOutput>,
+    /// Every output, the default one (if any) first. One `Vec` so a send can borrow the port it
+    /// sends to and its siblings at once without allocating (NAN-5874).
+    outputs: Vec<TransformOutput>,
 }
 
 impl TransformOutputs {
@@ -37,8 +40,7 @@ impl TransformOutputs {
         component_key: &ComponentKey,
     ) -> (Self, HashMap<Option<String>, fanout::ControlChannel>) {
         let outputs_spec = outputs_in.clone();
-        let mut primary_output = None;
-        let mut named_outputs = HashMap::new();
+        let mut outputs = Vec::with_capacity(outputs_in.len());
         let mut controls = HashMap::new();
 
         for output in outputs_in {
@@ -50,45 +52,35 @@ impl TransformOutputs {
                 .map(|(id, definition)| (id, Arc::new(definition)))
                 .collect();
 
-            match output.port {
-                None => {
-                    primary_output = Some(TransformOutput {
-                        fanout,
-                        events_sent: register(EventsSent::from(internal_event::Output(Some(
-                            DEFAULT_OUTPUT.into(),
-                        )))),
-                        log_schema_definitions,
-                        output_id: Arc::new(OutputId {
-                            component: component_key.clone(),
-                            port: None,
-                        }),
-                    });
-                    controls.insert(None, control);
-                }
-                Some(name) => {
-                    named_outputs.insert(
-                        name.clone(),
-                        TransformOutput {
-                            fanout,
-                            events_sent: register(EventsSent::from(internal_event::Output(Some(
-                                name.clone().into(),
-                            )))),
-                            log_schema_definitions,
-                            output_id: Arc::new(OutputId {
-                                component: component_key.clone(),
-                                port: Some(name.clone()),
-                            }),
-                        },
-                    );
-                    controls.insert(Some(name.clone()), control);
-                }
+            let events_sent = match &output.port {
+                None => register(EventsSent::from(internal_event::Output(Some(
+                    DEFAULT_OUTPUT.into(),
+                )))),
+                Some(name) => register(EventsSent::from(internal_event::Output(Some(
+                    name.clone().into(),
+                )))),
+            };
+            let transform_output = TransformOutput {
+                port: output.port.clone(),
+                fanout,
+                events_sent,
+                log_schema_definitions,
+                output_id: Arc::new(OutputId {
+                    component: component_key.clone(),
+                    port: output.port.clone(),
+                }),
+            };
+            if output.port.is_none() {
+                outputs.insert(0, transform_output);
+            } else {
+                outputs.push(transform_output);
             }
+            controls.insert(output.port, control);
         }
 
         let me = Self {
             outputs_spec,
-            primary_output,
-            named_outputs,
+            outputs,
         };
 
         (me, controls)
@@ -116,32 +108,22 @@ impl TransformOutputs {
         // sink waits until the reload replaces or removes it. Meanwhile every other port keeps
         // applying its control messages: a reload that pauses one of THEIR sinks waits
         // (`wait_for_sinks`) for the sink's sender to be dropped, and it must not wait on this
-        // send, which only that reload's completion unblocks.
-        let mut ports: Vec<(Option<&str>, &mut TransformOutput)> = Vec::new();
-        if let Some(primary) = self.primary_output.as_mut() {
-            ports.push((None, primary));
-        }
-        for (name, output) in &mut self.named_outputs {
-            ports.push((Some(name.as_str()), output));
-        }
-        for i in 0..ports.len() {
-            let (before, rest) = ports.split_at_mut(i);
-            let ((name, current), after) = rest.split_first_mut().expect("index in range");
-            let out_buf = match name {
+        // send, which only that reload's completion unblocks. No allocation: the siblings are
+        // the two halves of `outputs` around the port being sent.
+        for i in 0..self.outputs.len() {
+            let (before, rest) = self.outputs.split_at_mut(i);
+            let (current, after) = rest.split_first_mut().expect("index in range");
+            let out_buf = match &current.port {
                 None => buf.primary_buffer.as_mut().expect("mismatched outputs"),
-                Some(name) => buf.named_buffers.get_mut(*name).expect("unknown output"),
+                Some(name) => buf.named_buffers.get_mut(name).expect("unknown output"),
             };
-            let mut siblings: Vec<&mut Fanout> = before
-                .iter_mut()
-                .chain(after.iter_mut())
-                .map(|(_, output)| &mut output.fanout)
-                .collect();
-            let send = Self::send_single_buffer(out_buf, current);
-            tokio::pin!(send);
-            if siblings.is_empty() {
-                send.await?;
+            if out_buf.is_empty() || (before.is_empty() && after.is_empty()) {
+                // Nothing to wait for on this port, or no sibling to serve.
+                Self::send_single_buffer(out_buf, current).await?;
                 continue;
             }
+            let send = Self::send_single_buffer(out_buf, current);
+            tokio::pin!(send);
             loop {
                 tokio::select! {
                     biased;
@@ -149,7 +131,7 @@ impl TransformOutputs {
                         result?;
                         break;
                     }
-                    () = serve_any(&mut siblings) => {}
+                    () = serve_any(before, after) => {}
                 }
             }
         }
@@ -158,14 +140,9 @@ impl TransformOutputs {
 
     /// Waits for a control message on any port and applies it (for an idle transform; see
     /// `Fanout::serve_control_message`). Never resolves once every port's channel is closed.
+    /// Allocation-free, so a runner can poll it on every iteration.
     pub async fn serve_control_messages(&mut self) {
-        let mut ports: Vec<&mut Fanout> = self
-            .primary_output
-            .iter_mut()
-            .chain(self.named_outputs.values_mut())
-            .map(|output| &mut output.fanout)
-            .collect();
-        serve_any(&mut ports).await;
+        serve_any(&mut self.outputs, &mut []).await;
     }
 
     async fn send_single_buffer(
@@ -187,16 +164,18 @@ impl TransformOutputs {
     }
 }
 
-/// Applies the first control message any of `fanouts` receives. Pending forever when there are
-/// none, or once every channel is closed.
-async fn serve_any(fanouts: &mut [&mut Fanout]) {
-    if fanouts.is_empty() {
-        return futures::future::pending().await;
-    }
-    let serves = fanouts
-        .iter_mut()
-        .map(|fanout| Box::pin(fanout.serve_control_message()));
-    futures::future::select_all(serves).await;
+/// Applies the first control message any output in `a` or `b` receives. Pending forever when
+/// there are none, or once every channel is closed. Allocation-free.
+async fn serve_any(a: &mut [TransformOutput], b: &mut [TransformOutput]) {
+    std::future::poll_fn(|cx| {
+        for output in a.iter_mut().chain(b.iter_mut()) {
+            if output.fanout.poll_serve_control_message(cx).is_ready() {
+                return std::task::Poll::Ready(());
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await;
 }
 
 #[derive(Debug, Clone)]
@@ -542,5 +521,61 @@ mod nan5874_tests {
             .await
             .expect("the removed sink's sender was dropped");
         assert!(next.is_none());
+    }
+
+    /// NAN-5874 review: per-batch cost of `TransformOutputs::send` on a 1-port transform and a
+    /// 50-port route (events on 5 ports), sinks drained. Run with
+    /// `cargo test -p vector-core --release --lib -- --ignored --nocapture bench_send`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "benchmark"]
+    #[allow(clippy::print_stderr, reason = "a benchmark reports its timings")]
+    async fn bench_send() {
+        const ROUNDS: u32 = 20_000;
+        for (ports, used) in [(1usize, 1usize), (50, 5)] {
+            let specs: Vec<_> = (0..ports)
+                .map(|i| {
+                    let spec = config::TransformOutput::new(DataType::all_bits(), HashMap::new());
+                    if ports == 1 {
+                        spec
+                    } else {
+                        spec.with_port(format!("p{i}"))
+                    }
+                })
+                .collect();
+            let (mut outputs, controls) = TransformOutputs::new(specs, &ComponentKey::from("t"));
+            for (name, control) in &controls {
+                let (tx, rx) = TopologyBuilder::standalone_memory(
+                    NonZeroUsize::new(1024).unwrap(),
+                    WhenFull::Block,
+                    &Span::current(),
+                    None,
+                    None,
+                );
+                control
+                    .send(ControlMessage::Add(
+                        ComponentKey::from(format!("sink_{name:?}")),
+                        tx,
+                    ))
+                    .unwrap();
+                tokio::spawn(async move {
+                    let mut stream = rx.into_stream();
+                    while stream.next().await.is_some() {}
+                });
+            }
+            let mut buf = outputs.new_buf_with_capacity(1);
+            let names: Vec<Option<String>> = (0..used)
+                .map(|i| (ports > 1).then(|| format!("p{i}")))
+                .collect();
+            let event = Event::Log(LogEvent::from("x"));
+            let started = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                for name in &names {
+                    buf.push(name.as_deref(), event.clone());
+                }
+                outputs.send(&mut buf).await.unwrap();
+            }
+            let per = started.elapsed() / ROUNDS;
+            eprintln!("bench_send: {ports} ports, {used} used: {per:?} per batch");
+        }
     }
 }
