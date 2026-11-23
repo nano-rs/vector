@@ -9,6 +9,9 @@ pub use self::noop::NoopTransformConfig;
 mod error_definitions;
 pub use self::error_definitions::ErrorDefinitionTransformConfig;
 
+mod slow_build;
+pub use self::slow_build::SlowBuildTransformConfig;
+
 /// Transform types.
 #[configurable_component]
 #[derive(Clone, Debug)]

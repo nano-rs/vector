@@ -17,7 +17,7 @@ use self::{
         BackpressureSourceConfig, BasicSourceConfig, BuildErrorSourceConfig, ErrorSourceConfig,
         PanicSourceConfig, TripwireSourceConfig,
     },
-    transforms::{BasicTransformConfig, ErrorDefinitionTransformConfig},
+    transforms::{BasicTransformConfig, ErrorDefinitionTransformConfig, SlowBuildTransformConfig},
 };
 
 pub mod sinks;
@@ -78,6 +78,12 @@ pub fn tripwire_source() -> (Trigger, TripwireSourceConfig) {
 #[must_use]
 pub fn basic_transform(suffix: &str, increase: f64) -> BasicTransformConfig {
     BasicTransformConfig::new(suffix.to_owned(), increase)
+}
+
+/// A `basic_transform` whose build takes `build_ms` milliseconds (NAN-5874).
+#[must_use]
+pub fn slow_build_transform(suffix: &str, build_ms: u64) -> SlowBuildTransformConfig {
+    SlowBuildTransformConfig::new(suffix.to_owned(), build_ms)
 }
 
 #[must_use]
