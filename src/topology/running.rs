@@ -90,6 +90,13 @@ pub struct RunningTopology {
     /// a failed reload correct (NAN-4936): there `self.config` is the OLD config, while the
     /// pauses/removals were decided against the failed NEW config.
     paused_inputs: HashSet<(ComponentKey, OutputId)>,
+    /// NAN-5874: connections a reload stops using whose upstream keeps running
+    /// (the consumer is removed, or no longer reads that input). They are
+    /// paused like a changed consumer's input until the new topology is
+    /// connected, and removed only then: removing them up front left the
+    /// unchanged upstream with no consumer for the whole build, and every
+    /// event it emitted meanwhile was dropped and finalized as delivered.
+    deferred_removals: HashSet<(ComponentKey, OutputId)>,
 }
 
 impl RunningTopology {
@@ -118,6 +125,7 @@ impl RunningTopology {
             sink_confinement_gauges: HashMap::new(),
             orphaned_disk_buffer_scanner: OrphanedDiskBufferScanner::new(),
             paused_inputs: HashSet::new(),
+            deferred_removals: HashSet::new(),
         }
     }
 
@@ -959,6 +967,16 @@ impl RunningTopology {
         // sources/transforms, to ensure we're connecting components in order.
         self.reattach_severed_inputs(diff);
 
+        // NAN-5874: every consumer of the new topology is connected; only now remove the
+        // connections the new topology no longer uses (paused since `shutdown_diff`). Only an
+        // input absent from the diff is deferred, so its fanout is the one that held them.
+        for (key, input) in std::mem::take(&mut self.deferred_removals) {
+            if let Some(output) = self.outputs.get_mut(&input) {
+                debug!(component_id = %key, fanout_id = %input, "Removing paused component input from fanout.");
+                _ = output.send(ControlMessage::Remove(key));
+            }
+        }
+
         // Broadcast any topology changes to subscribers.
         if !self.watch.0.is_closed() {
             let outputs = self
@@ -1045,7 +1063,10 @@ impl RunningTopology {
             // OLD config on the rollback path of a failed reload. An input the failed config had
             // dropped was then sent `Replace` for a sink the fanout had already removed, and
             // `Fanout::replace` panicked on the next event through that upstream.
-            let paused = self.paused_inputs.remove(&(key.clone(), input.clone()));
+            // NAN-5874: a connection paused for deferred removal that the topology being
+            // connected reads again (the rollback of a failed reload) is resumed in place.
+            let deferred = self.deferred_removals.remove(&(key.clone(), input.clone()));
+            let paused = self.paused_inputs.remove(&(key.clone(), input.clone())) || deferred;
             if diff.contains(&input.component) || !paused {
                 // If the input we're connecting to is changing, that means its outputs will have been
                 // recreated, so instead of replacing a paused sink, we have to add it to this new
@@ -1088,7 +1109,20 @@ impl RunningTopology {
 
         for input in old_inputs {
             if let Some(output) = self.outputs.get_mut(input) {
-                if diff.contains(&input.component)
+                if !diff.contains(&input.component)
+                    && (diff.is_removed(key) || !new_inputs.contains(input))
+                {
+                    // NAN-5874: the input itself is not changing, so it keeps running
+                    // through the build. Pause this connection (its sends wait, as for
+                    // a changed consumer) and remove it once the new topology is
+                    // connected (`connect_diff`), so the input is never left without
+                    // a consumer while it is still taking events in.
+                    debug!(component_id = %key, fanout_id = %input, "Pausing component input in fanout until the new topology is connected.");
+
+                    self.paused_inputs.remove(&(key.clone(), input.clone()));
+                    self.deferred_removals.insert((key.clone(), input.clone()));
+                    _ = output.send(ControlMessage::Pause(key.clone()));
+                } else if diff.contains(&input.component)
                     || diff.is_removed(key)
                     || !new_inputs.contains(input)
                 {

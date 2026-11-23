@@ -47,7 +47,6 @@ mod doesnt_reload;
 mod end_to_end;
 mod latency_metrics;
 mod panic;
-mod rollback;
 #[cfg(all(
     feature = "sources-prometheus",
     feature = "sinks-prometheus",
@@ -56,6 +55,8 @@ mod rollback;
     feature = "enrichment-tables-memory",
 ))]
 mod reload;
+mod repointed_reload;
+mod rollback;
 #[cfg(all(feature = "sinks-console", feature = "sources-demo_logs"))]
 mod source_finished;
 mod transient_state;
