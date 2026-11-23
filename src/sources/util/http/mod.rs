@@ -37,7 +37,10 @@ pub use method::HttpMethod;
 pub(crate) fn service_unavailable_retry_after() -> warp::reply::Response {
     use warp::Reply as _;
     warp::reply::with_header(
-        warp::reply::with_status("Service unavailable", warp::http::StatusCode::SERVICE_UNAVAILABLE),
+        warp::reply::with_status(
+            "Service unavailable",
+            warp::http::StatusCode::SERVICE_UNAVAILABLE,
+        ),
         warp::http::header::RETRY_AFTER,
         "1",
     )

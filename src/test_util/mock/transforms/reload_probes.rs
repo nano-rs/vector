@@ -123,7 +123,7 @@ impl TransformConfig for FlakyBuildTransformConfig {
     async fn build(&self, globals: &TransformContext) -> crate::Result<Transform> {
         let left = self
             .ok_builds
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
         if left.is_err() {
             return Err("test_flaky_build: no successful builds left".into());
         }

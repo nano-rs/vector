@@ -472,8 +472,14 @@ mod redacted_headers_tests {
     #[test]
     fn credentials_are_redacted_and_other_headers_kept() {
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", HeaderValue::from_static("Bearer s3cr3t-token"));
-        headers.insert("Proxy-Authorization", HeaderValue::from_static("Basic cHJveHk6cHc="));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer s3cr3t-token"),
+        );
+        headers.insert(
+            "Proxy-Authorization",
+            HeaderValue::from_static("Basic cHJveHk6cHc="),
+        );
         headers.insert("cookie", HeaderValue::from_static("session=abc"));
         headers.insert("x-api-key", HeaderValue::from_static("key-123"));
         let mut marked = HeaderValue::from_static("marked-secret");
@@ -482,10 +488,19 @@ mod redacted_headers_tests {
         headers.insert("content-type", HeaderValue::from_static("application/json"));
 
         let logged = format!("{:?}", RedactedHeaders(&headers));
-        for secret in ["s3cr3t-token", "cHJveHk6cHc=", "session=abc", "key-123", "marked-secret"] {
+        for secret in [
+            "s3cr3t-token",
+            "cHJveHk6cHc=",
+            "session=abc",
+            "key-123",
+            "marked-secret",
+        ] {
             assert!(!logged.contains(secret), "{secret} leaked: {logged}");
         }
         assert!(logged.contains("application/json"), "{logged}");
-        assert!(logged.contains("\"authorization\": \"<redacted>\""), "{logged}");
+        assert!(
+            logged.contains("\"authorization\": \"<redacted>\""),
+            "{logged}"
+        );
     }
 }
