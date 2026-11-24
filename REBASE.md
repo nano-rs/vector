@@ -52,6 +52,13 @@ the rollback point for `0.61.0-nano.*` images) serves the single-tenant ClickHou
 11. `fix(clickhouse sink): retry auth and access refusals` (NAN-5390).
 12. `fix(disk buffer, clickhouse sink): honor finalization status; dead-letter permanent
     rejections` (NAN-5567).
+13. `fix(topology): pause, don't remove, a re-pointed unchanged input until the new topology
+    connects` (NAN-5874, `0.61.0-nano.14`) and its review follow-ups (no reload deadlock,
+    `ControlMessage::Stop` at shutdown, a held connection with a closed control channel
+    discards as errored; `reload_hazards` and `repointed_reload` tests).
+14. `fix(disk buffer): no finalizer for records the startup seek re-reads` (NAN-5885,
+    `0.61.0-nano.15`). On 0.62 the registration also keeps the NAN-5567 Errored-wins notifier.
+    Upstream `reader.rs` has the same code from at least v0.25.0 through v0.62.0.
 
 On `nano/v0.62` each patch is followed, where upstream's API moved, by a
 `fix(<area>): adapt … to v0.62.0` commit (NAN-5808): `emit!`/`register!` became functions
