@@ -13,6 +13,7 @@ use vector_lib::codecs::{
 use vector_lib::stream::BatcherSettings;
 
 use super::{
+    dead_letter::{DeadLetterConfig, DeadLetterService, resolve_store},
     arrow,
     request_builder::ClickhouseRequestBuilder,
     service::{ClickhouseRetryLogic, ClickhouseServiceRequestBuilder},
@@ -152,6 +153,11 @@ pub struct ClickhouseConfig {
 
     #[serde(flatten)]
     pub confinement: ConfinementConfig,
+
+    /// nano (NAN-5567): keep batches ClickHouse permanently rejects in a bounded local
+    /// dead-letter store instead of dropping them.
+    #[serde(default)]
+    pub dead_letter: DeadLetterConfig,
 }
 
 /// Query settings for the `clickhouse` sink.
@@ -222,6 +228,16 @@ impl SinkConfig for ClickhouseConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    // nano (NAN-5567, NAN-5808): this sink reports `Errored` for a transient failure that outlived
+    // its retries, and for a permanent refusal only while its dead-letter write fails for a
+    // fixable reason (an I/O error, no usable `data_dir`). A permanent refusal that can never be
+    // stored (`dead_letter.enabled = false`, or larger than `dead_letter.max_bytes`) is reported
+    // `Rejected` and dropped, so holding `Errored` records for replay cannot loop forever on a
+    // deterministic failure.
+    fn hold_errored_in_disk_buffer(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait::async_trait]
@@ -261,6 +277,23 @@ impl ValidatedSink for ClickhouseConfig {
 
         // Compute batch settings
         let batch_settings = self.batch.into_batcher_settings()?;
+
+        // nano (NAN-5808): a zero cap would drop every permanently rejected batch as oversize.
+        if self.dead_letter.enabled {
+            if self.dead_letter.max_bytes == 0 {
+                return Err(
+                    "'dead_letter.max_bytes' must be greater than zero (set 'dead_letter.enabled = false' to drop rejected batches)."
+                        .into(),
+                );
+            }
+            if self.dead_letter.max_bytes < batch_settings.size_limit as u64 {
+                warn!(
+                    message = "dead_letter.max_bytes is smaller than batch.max_bytes; a permanently rejected batch larger than the cap is dropped, not dead-lettered.",
+                    dead_letter_max_bytes = self.dead_letter.max_bytes,
+                    batch_max_bytes = batch_settings.size_limit,
+                );
+            }
+        }
 
         // Confine templates
         let confined_table =
@@ -307,6 +340,7 @@ impl ValidatedSink for ClickhouseConfig {
             query_settings: self.query_settings,
         };
 
+        let replay = std::sync::Arc::new(clickhouse_service_request_builder.clone());
         let service: HttpService<ClickhouseServiceRequestBuilder, PartitionKey> =
             HttpService::new(client.clone(), clickhouse_service_request_builder);
 
@@ -315,6 +349,14 @@ impl ValidatedSink for ClickhouseConfig {
         let service = ServiceBuilder::new()
             .settings(request_limits, ClickhouseRetryLogic)
             .service(service);
+        // nano (NAN-5567): outside the retry layer, so only a batch's final outcome is judged.
+        let service = DeadLetterService::new(
+            service,
+            resolve_store(self.dead_letter, &cx, self.compression),
+            Some(replay),
+            cx.buffer_holds_errored,
+            self.dead_letter.enabled,
+        );
 
         // Resolve the encoding strategy (format + encoder) based on configuration.
         // This happens here in build because Arrow schema fetching requires network access.
@@ -767,5 +809,29 @@ mod tests {
             err.contains("confinement") || err.contains("prefix"),
             "Error should mention confinement/prefix: {err}"
         );
+    }
+
+    /// nano (NAN-5808): a zero dead-letter cap is refused while the store is enabled.
+    #[test]
+    fn rejects_zero_dead_letter_cap() {
+        let mut config = ClickhouseConfig {
+            endpoint: "http://localhost:8123"
+                .parse::<http::Uri>()
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            table: "test_table".try_into().unwrap(),
+            format: Format::JsonEachRow,
+            dead_letter: DeadLetterConfig {
+                enabled: true,
+                max_bytes: 0,
+            },
+            ..Default::default()
+        };
+        let error = config.validate().err().expect("a zero cap is refused").to_string();
+        assert!(error.contains("dead_letter.max_bytes"), "{error}");
+
+        config.dead_letter.enabled = false;
+        config.validate().expect("a disabled store ignores its cap");
     }
 }

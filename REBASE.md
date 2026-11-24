@@ -19,16 +19,72 @@ removed" below). Only the fork's own workflows (`.github/workflows/nano-*.yml`) 
 
 ## The patch series
 
-Every patch is a self-contained commit (squash-merge each PR), in this order:
+`nano/v0.62` (cut from upstream `v0.62.0`, NAN-5808; `nano/v0.61` from `v0.61.0`, NAN-4904, stays
+the rollback point for `0.61.0-nano.*` images) serves the single-tenant ClickHouse product
+(nanosiem `clickhouse/*`). Every patch is a self-contained commit, in this order:
 
-1. `feat(azure_event_hubs source): …` (NAN-3599): `src/sources/azure_event_hubs/`,
+1. `feat(sources): add azure_event_hubs source` (NAN-3599): `src/sources/azure_event_hubs/`,
    `src/internal_events/azure_event_hubs.rs`, docs (`website/…/azure_event_hubs*`),
    `changelog.d/4261_azure_event_hubs_source.feature.md`, emulator test config in
    `tests/integration/azure/config/`, and small hunks in `Cargo.toml` (dependencies and
-   features), `src/sources/mod.rs` and `src/internal_events/mod.rs`.
-2. `chore(nano): fork tooling`: this file and `distribution/docker/nano/`.
-3. `chore(nano): neutralise upstream workflows` (NAN-3604): deletes every upstream file in
+   features), `src/sources/mod.rs` and `src/internal_events/mod.rs`. Follow-ups on top:
+   initial checkpoint at connect (NAN-3604), deterministic replay test (NAN-3706), refused
+   credentials no longer fail the config build (NAN-3730, Event Hubs half), clippy fixes.
+2. `chore(nano): neutralise upstream workflows` (NAN-3604): deletes every upstream file in
    `.github/workflows/` and `.github/dependabot.yml`. See "Upstream CI is removed".
+3. `ci(nano): build + push fork image to GHCR` + `feat(nano): build only nano's Vector
+   components` + `fix(nano): build kafka again`: `.github/workflows/nano-image.yml`,
+   `distribution/docker/nano/` (Dockerfile, FEATURES, COMPONENTS, scanner, parity).
+4. `feat(splunk_hec, http_server sources): valid_tokens_file` (NAN-3770): hashed, hot-reloaded
+   per-sender ingest tokens. New file `src/common/http/hashed_tokens.rs`; small hunks in
+   `src/common/http/mod.rs`, `src/sources/util/http/prelude.rs`, `src/sources/http_server.rs`
+   and `src/sources/splunk_hec/mod.rs`; parity config `parity/open-ingest-tokens.toml`.
+5. `chore(nano): ClickHouse component set`: FEATURES/COMPONENTS/parity for the CH product.
+6. `feat(gcp): ADC credential types + egress policy` (NAN-4935): `src/gcp/credentials.rs`,
+   `src/gcp/egress.rs` (+ tests), hunks in `src/gcp.rs` and `src/sources/gcp_pubsub.rs`.
+7. `fix(buffers): retry transient EOF behind published disk progress` (NAN-4936; port of
+   vectordotdev/vector#26946, still open upstream at v0.62.0) and `fix(topology): a failed
+   reload's rollback no longer Replaces inputs it Removed` (NAN-4936).
+8. `fix(splunk_hec source): decode gzip indexer-ack queries` (NAN-4976).
+9. `feat(sources): crowdstrike_fdr source` (NAN-5005) and its three follow-ups.
+10. `fix(buffers): disk_v2 acknowledges a record only after it reaches the data file` (NAN-5208)
+    and `fix(buffers): disk_v2 fsyncs before acknowledging, with group commit` (NAN-5285).
+11. `fix(clickhouse sink): retry auth and access refusals` (NAN-5390).
+12. `fix(disk buffer, clickhouse sink): honor finalization status; dead-letter permanent
+    rejections` (NAN-5567).
+13. `fix(topology): pause, don't remove, a re-pointed unchanged input until the new topology
+    connects` (NAN-5874, `0.61.0-nano.14`) and its review follow-ups (no reload deadlock,
+    `ControlMessage::Stop` at shutdown, a held connection with a closed control channel
+    discards as errored; `reload_hazards` and `repointed_reload` tests).
+14. `fix(disk buffer): no finalizer for records the startup seek re-reads` (NAN-5885,
+    `0.61.0-nano.15`). On 0.62 the registration also keeps the NAN-5567 Errored-wins notifier.
+    Upstream `reader.rs` has the same code from at least v0.25.0 through v0.62.0.
+
+On `nano/v0.62` each patch is followed, where upstream's API moved, by a
+`fix(<area>): adapt … to v0.62.0` commit (NAN-5808): `emit!`/`register!` became functions
+(#27085), `unreachable_pub` is denied (#27055), `http_1`/`http_v1`/`client_v1` became `http`
+(#27048, #27021, #26960), `ExtraContext` moved to `vector_lib` (#26912). The NAN-5567 ledger
+hunk was merged by hand into upstream's weak-reference finalizer (#27083).
+
+Consumers moving from a 0.61 image: 0.62 parses the config before interpolating
+(vectordotdev/vector#26475). An unquoted placeholder such as `max_bytes = ${VAR:-52428800}`
+is now a TOML parse error; quote it (`max_bytes = "${VAR:-52428800}"`, coerced to the field's
+type). 0.61 rejects the quoted form, so the config change and the image bump ship together.
+
+Not carried from `nano/v0.59` (it stays the rollback point for the lake images):
+
+| nano/v0.59 patch | Why not on nano/v0.61 |
+| --- | --- |
+| #7 docs: 0.59.0-nano.2 superseded | 0.59-only note. |
+| #8 aws_s3 `s3_event_time` (half of the commit) | Hosted pull point-forward start; adds a field to every aws_s3 event. |
+| #9, #11 release unacknowledged messages on shutdown (gcp_pubsub, aws_sqs, aws_s3) | Upstream rewrote `aws_s3/sqs.rs` and reworked gcp_pubsub shutdown in 0.60-0.61; without it messages redeliver after their visibility timeout / ack deadline (duplicates, no loss). Re-port only if restart duplicates matter. |
+| #12 gcp_pubsub / aws_sqs halves | Built on #9; collides with upstream's 0.61 gcp_pubsub rework. A refused GCP credential fails the config build again, as on upstream. |
+| #14 scanner: hosted pull templates | Hosted pull only. |
+| #15 OTLP encoder `resourceSpans` | Only the OTLP lake sink encoded logs as OTLP. |
+| #16 transform queues bounded by small chunk size | No effect at the default chunk size; served hosted ops collectors. |
+| #17 HTTP scrape bounds | `http_client` / `prometheus_scrape` are not built. |
+| #18 native Prometheus scraping + OTLP sink | Hosted ops metrics (NAN-4028). |
+| #19 aws_s3 sink: Cloudflare edge 409 retry | R2 raw handoff (lake); `aws_s3` sink is not built. |
 
 Rules that keep rebases cheap:
 
@@ -43,10 +99,10 @@ Rules that keep rebases cheap:
 
 ```sh
 git fetch upstream --tags
-OLD=v0.59.0 NEW=v0.60.0                       # example
-git switch -c nano/v0.60 "$NEW"
+OLD=v0.61.0 NEW=v0.62.0                       # example
+git switch -c nano/v0.62 "$NEW"
 # Replay our commits (oldest first) from the previous nano branch:
-git cherry-pick $(git rev-list --reverse "$OLD"..origin/nano/v0.59)
+git cherry-pick $(git rev-list --reverse "$OLD"..origin/nano/v0.61)
 ```
 
 Re-delete upstream CI on the new branch. Replaying the deletion commit stops with
@@ -125,17 +181,145 @@ mirrored branches; see the repository's Actions policy for how that is contained
 
 ## Cutting an image
 
+Images are built by GitHub Actions (`.github/workflows/nano-image.yml`) and pushed to
+`ghcr.io/nano-rs/vector`. Nothing builds on branch pushes or pull requests; an image is cut
+only by pushing an image tag or by a manual dispatch.
+
 `distribution/docker/nano/Dockerfile` builds a drop-in replacement for
 `timberio/vector:<version>-debian`: same Debian base and runtime packages, `/usr/bin/vector`
-as the entrypoint, `/etc/vector` and `/var/lib/vector` present. It compiles the upstream release
-feature set (`target-x86_64-unknown-linux-gnu`), which includes our sources.
+as the entrypoint, `/var/lib/vector` present, and `/etc/vector` holding exactly upstream's
+`examples/` and nothing else. It compiles only nano's component set (`FEATURES`, see
+"Component set" below) with thin LTO and 16 codegen units (`LTO=fat CODEGEN_UNITS=1`
+reproduces upstream's profile). It fails if `vector list` lacks `azure_event_hubs`.
+
+Version scheme: `<upstream version>-nano.<n>`, for example `0.62.0-nano.1`. `<n>` starts at 1
+and increments for every image cut from the same upstream version; the workflow refuses a
+version that does not start with the `Cargo.toml` version or that already exists in GHCR.
+The git tag is `image-<version>` (`image-0.62.0-nano.1`). The `image-` prefix keeps it clear
+of upstream's release tag filters (`v0.*`), which still exist on mirrored branches.
+
+1. Pick `n`: one more than the newest `0.62.0-nano.*` tag at
+   https://github.com/nano-rs/vector/pkgs/container/vector.
+2. Start the build, either way:
+
+   ```sh
+   git tag image-0.62.0-nano.2 origin/nano/v0.62 && git push origin image-0.62.0-nano.2
+   # or
+   gh workflow run nano-image.yml --repo nano-rs/vector --ref nano/v0.62 -f nano_rev=2
+   ```
+
+3. Wait (about 2-4 h; amd64 and arm64 build in parallel on native runners). The jobs:
+   build per arch (pushed untagged, by digest) -> multi-arch index tagged `sha-<12-char sha>`
+   -> parity on amd64 -> promote, which adds `<version>` and `<version>-debian` to the same
+   index. Parity checks that `vector --version` is the plain upstream version (see
+   "Invariants"), that `/etc/vector` is identical to upstream's, that `vector list` equals
+   `distribution/docker/nano/COMPONENTS` exactly, and that every config under
+   `distribution/docker/nano/parity/` passes `vector validate --no-environment` (each
+   top-level `*.toml` / `*.yaml` alone, each subdirectory as one config; this parses, wires
+   and compiles VRL but contacts no source or sink).
+4. Read the digests from the promote job's summary. Never consume a tag; tags are only for
+   humans.
+   - GHCR / Kubernetes: the multi-arch index, `ghcr.io/nano-rs/vector@sha256:…`.
+   - Cloudflare Containers: the **linux/amd64 single-platform manifest** digest, printed
+     separately. Cloudflare needs a linux/amd64 image and its acceptance of an OCI index is
+     undocumented, so nano-main copies and pins the amd64 manifest, not the index.
+
+Cloudflare Containers cannot pull from GHCR. nano-main's roll step copies the pinned amd64
+digest into `registry.cloudflare.com` (`crane copy ghcr.io/nano-rs/vector@sha256:<amd64> …`);
+that step and its credentials belong to nano-main, not to this repository.
+
+## Invariants
+
+- The crate version stays the upstream version (`0.61.0`); the nano suffix exists only in
+  image tags. `vector --version` must keep matching nanosiem's `VECTOR_VERSION_RE`
+  (`^vector \d+\.\d+\.\d+(\s|$)`), which refuses `0.61.0-nano.1`. Never bump `version` in
+  `Cargo.toml`; the image identity goes into `VECTOR_BUILD_DESC` (after the target triple).
+- `/etc/vector` in the image equals upstream's (only `examples/`). nano's entrypoints untar
+  the config bundle there and run `--config-dir /etc/vector`, so a default config in the image
+  would run alongside every tenant pipeline.
+- `vector list` equals `COMPONENTS` exactly. The image is NOT a superset of upstream (Dan,
+  2026-10-11): it builds only what nano ships or renders.
+
+## Component set
+
+Files in `distribution/docker/nano/`:
+
+| File | What |
+| --- | --- |
+| `scan-components.py` | Inventories every component type, codec, framing, compression and buffer in nano's Vector configs: nanosiem (`config/vector`, base bundles, renderer code and tests, compose, deploy), nano-main (pull bundle, region log shipper, fixtures), nano-rs/parsers lanes, and `parity/`. Reads git trees at given refs; never checks anything out. |
+| `FEATURES` | The cargo features (one per line, comments allowed) the Dockerfile builds with `--no-default-features`. |
+| `COMPONENTS` | The exact `vector list` of that build. |
+| `materialise-parity.py` | Regenerates the bundle-derived parity units from nanosiem and nano-main. |
+| `parity/` | One config per renderer family (see `materialise-parity.py`), the base's opt-in templates (`opt-in-templates/`), plus hand-written `pull-*.toml`, `harness.toml` and `enrichment/` (with tiny fixture data in `enrichment/data/`). |
+
+Adding a component (nano starts rendering a new type):
 
 ```sh
-TAG=0.59.0-nano.1-debian                   # <upstream version>-nano.<n>-debian
-docker build -f distribution/docker/nano/Dockerfile -t nano-vector:$TAG .
-docker run --rm nano-vector:$TAG --version
+python3 distribution/docker/nano/scan-components.py \
+  nanosiem=~/Projects/nanosiem@origin/main nano-main=~/Projects/nano-main@origin/main \
+  parsers=<parsers clone>@origin/main vector=.@HEAD --check distribution/docker/nano/COMPONENTS
 ```
 
-`<n>` increments for every image cut from the same upstream version. The Dockerfile runs
-`vector list` during the build and fails if `azure_event_hubs` is missing. Pushing the image to
-a registry is a separate, deliberate step.
+`--check` fails on any shipped or kept type missing from `COMPONENTS`, on any renderer that
+emits a type from a variable the scanner cannot resolve (`RENDERED_DYNAMIC`), on a classic
+generator it cannot fully enumerate (`CLASSIC_SOURCES`), and on any `RETIRED` type rendered
+inside its retired scope (a retired type must fail at render/build time, never at config load
+in the image). Then:
+
+1. Add the feature to `FEATURES` (Cargo.toml names: `sources-<x>`, `transforms-<x>`,
+   `sinks-<x>`; one feature can enable several components, e.g. `sinks-prometheus` gives
+   `prometheus_exporter` and `prometheus_remote_write`).
+2. Regenerate `COMPONENTS` from a build:
+   `cargo-slot build --no-default-features --features "$(sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' distribution/docker/nano/FEATURES | paste -sd, -)" --bin vector`
+   (a dev build with `CARGO_PROFILE_DEV_DEBUG=0` is enough), then `target/debug/vector list > distribution/docker/nano/COMPONENTS`.
+3. Add or refresh a parity unit that uses the type.
+4. Update the vendored `COMPONENTS` copies in nanosiem and nano-main (their guard tests pin
+   this repository's commit; see the comment at the top of each copy).
+
+Types emitted at runtime, not committed as TOML. The classic / open-core source generator
+(nanosiem `source_configs/service.rs` `generate_*_source`) builds configs with `toml::Table`,
+so the scanner reads it from code (`CLASSIC_SOURCES`): every `.insert("type".into(), "<t>".into())`
+in a `generate_*_source` function and every `SUPPORTED_PROVIDERS` credential provider is a
+shipped source type, and every `SourceType::as_str` value must map to one of those, to a system
+listener (`system_intermediary_source`), or to `CLASSIC_ALIASES` (`routed` = http); otherwise
+`--check` fails, so a new variant cannot be missed. That is why `kafka` is built: open-core
+compose runs this image, and a user's classic Kafka source (SASL PLAIN / SCRAM over SASL_SSL)
+would otherwise die with "unknown component type". Parity: `classic-kafka-sasl_ssl.toml`,
+`classic-aws_s3-static.toml`, `classic-gcp_pubsub-credentials.toml`. librdkafka is built with
+cmake (`rdkafka?/cmake_build` in `FEATURES`, as upstream's Linux targets; cmake is in
+`install-debian-build-deps.sh`). GSSAPI is not enabled (nothing offers it), so no libsasl2 link.
+
+Built on purpose although no product config renders them yet:
+
+- Enrichment tables `geoip`, `mmdb` and the built-in `file` (CSV) table: self-hosted
+  geo/ASN/IOC enrichment in VRL. `parity/enrichment/` loads each from committed fixtures and
+  reads it with `get_enrichment_table_record` (the workflow runs a full `vector validate` on
+  that unit so the tables are actually opened). The `memory` table is no longer built.
+- `file`, `syslog` sources: the base bundle's opt-in templates (`sources/*.toml.disabled`, an
+  operator enables one by renaming it). The scanner counts `*.toml.disabled` as shipped;
+  `parity/opt-in-templates/` enables them.
+- `azure_event_hubs` source: this fork's own source (`parity/classic-azure_event_hubs.toml`).
+- `crowdstrike_fdr` source: this fork's own source for CrowdStrike FDR feeds (NAN-5005,
+  `parity/crowdstrike_fdr.toml`); nanosiem does not render it yet.
+
+Deliberately left out, though something still mentions them:
+
+- Customer-side Vector (sender templates, Ludus lab agents and aggregator), which run upstream
+  images.
+- `secrets` (AWS Secrets Manager backend), `dnstap` (and its `parse_dnstap` VRL function): no
+  nano config uses them. The `file` and `exec` secret backends are built in regardless.
+
+Parity configs are sanitised (no secrets, env references replaced by literals). When moving to
+a new upstream release, update `UPSTREAM_IMAGE` (tag and index digest) in the workflow; it is
+still used for the `/etc/vector` comparison.
+
+One-time setup per repository: Actions enabled with an allow-list that
+covers the actions the workflow pins, and the `vector` package's visibility set to public
+(the first push creates it private under the org).
+
+Local build, for debugging the Dockerfile only:
+
+```sh
+docker build -f distribution/docker/nano/Dockerfile -t nano-vector:dev .
+docker run --rm nano-vector:dev --version
+```

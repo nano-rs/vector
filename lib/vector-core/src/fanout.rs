@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt, task::Poll, time::Instant};
 
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, future};
 use futures_util::{pending, poll};
 use indexmap::IndexMap;
 use tokio::sync::mpsc;
@@ -9,7 +9,7 @@ use vector_buffers::topology::channel::BufferSender;
 
 use crate::{
     config::ComponentKey,
-    event::{EventArray, EventContainer},
+    event::{EventArray, EventContainer, EventStatus},
 };
 
 pub enum ControlMessage {
@@ -27,6 +27,13 @@ pub enum ControlMessage {
 
     /// Replaces a paused sink with its new sender.
     Replace(ComponentKey, BufferSender<EventArray>),
+
+    /// The topology is stopping (NAN-5874): no paused sink will ever be replaced and no further
+    /// control message follows. A send waiting on a paused sink then discards its events as
+    /// errored (never acknowledged) instead of waiting for a replacement. Sent explicitly because
+    /// the channel itself may never close: the API's tap watch holds clones of every control
+    /// channel for as long as it runs.
+    Stop,
 }
 
 impl fmt::Debug for ControlMessage {
@@ -37,6 +44,7 @@ impl fmt::Debug for ControlMessage {
             Self::Remove(id) => write!(f, "Remove({id:?})"),
             Self::Pause(id) => write!(f, "Pause({id:?})"),
             Self::Replace(id, _) => write!(f, "Replace({id:?})"),
+            Self::Stop => write!(f, "Stop"),
         }
     }
 }
@@ -48,6 +56,9 @@ pub type ControlChannel = mpsc::UnboundedSender<ControlMessage>;
 pub struct Fanout {
     senders: IndexMap<ComponentKey, Option<Sender>>,
     control_channel: mpsc::UnboundedReceiver<ControlMessage>,
+    /// The control channel returned `None` (the topology dropped its handle: Vector is stopping).
+    control_channel_closed: bool,
+    reported_closed_while_paused: bool,
     upstream_component: ComponentKey,
 }
 
@@ -58,6 +69,8 @@ impl Fanout {
         let fanout = Self {
             senders: IndexMap::default(),
             control_channel: control_rx,
+            control_channel_closed: false,
+            reported_closed_while_paused: false,
             upstream_component,
         };
 
@@ -118,13 +131,54 @@ impl Fanout {
     /// Returns `true` if a message was processed, `false` if the control
     /// channel was closed.
     pub async fn recv_control_message(&mut self) -> bool {
-        match self.control_channel.recv().await {
-            Some(msg) => {
-                self.apply_control_message(msg);
-                true
-            }
-            None => false,
+        if self.control_channel_closed {
+            return false;
         }
+        if let Some(msg) = self.control_channel.recv().await {
+            self.apply_control_message(msg);
+            // `false` once the message was `Stop`: nothing follows it.
+            !self.control_channel_closed
+        } else {
+            self.control_channel_closed = true;
+            false
+        }
+    }
+
+    /// Waits for the next control message and applies it, for a component that is idle (not in
+    /// the middle of a send). Once the control channel is closed this never resolves, so it can sit
+    /// in a `select!` without spinning.
+    ///
+    /// NAN-5874: an idle component must apply its control messages. A reload that pauses or
+    /// removes one of its downstream sinks waits (`wait_for_sinks`) until this fanout drops that
+    /// sink's sender, and the component may receive nothing until the reload completes (its own
+    /// upstream may be paused by the same reload).
+    pub async fn serve_control_message(&mut self) {
+        future::poll_fn(|cx| self.poll_serve_control_message(cx)).await;
+    }
+
+    /// `serve_control_message` as a poll, allocation-free: `Ready` once a control message was
+    /// applied; `Pending` while none is queued, and for good once the channel is closed or the
+    /// topology sent `Stop` (no waker is kept then, so nothing spins).
+    pub fn poll_serve_control_message(&mut self, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        if self.control_channel_closed {
+            return Poll::Pending;
+        }
+        match self.control_channel.poll_recv(cx) {
+            Poll::Ready(Some(message)) => {
+                self.apply_control_message(message);
+                Poll::Ready(())
+            }
+            Poll::Ready(None) => {
+                self.control_channel_closed = true;
+                Poll::Pending
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Whether any sink is paused (a send would wait for its replacement).
+    pub fn has_paused(&self) -> bool {
+        self.senders.values().any(Option::is_none)
     }
 
     /// Apply a control message directly against this instance.
@@ -138,6 +192,7 @@ impl Fanout {
             ControlMessage::Remove(id) => self.remove(&id),
             ControlMessage::Pause(id) => self.pause(&id),
             ControlMessage::Replace(id, sink) => self.replace(&id, sink),
+            ControlMessage::Stop => self.control_channel_closed = true,
         }
     }
 
@@ -145,30 +200,17 @@ impl Fanout {
     ///
     /// Control messages are processed until all senders have been replaced, so it is guaranteed
     /// that when this method returns, all senders are ready for the next send to be triggered.
-    async fn wait_for_replacements(&mut self) {
-        while self.senders.values().any(Option::is_none) {
-            if let Some(msg) = self.control_channel.recv().await {
-                self.apply_control_message(msg);
-            } else {
-                // If the control channel is closed, there's nothing else we can do.
-
-                // TODO: It _seems_ like we should probably panic here, or at least return.
-                //
-                // Essentially, we should only land here if the control channel is closed but we
-                // haven't yet replaced all of the paused sinks... and we shouldn't have any paused
-                // sinks if Vector is stopping normally/gracefully, so like... we'd only get
-                // here during a configuration reload where we panicked in another thread due to
-                // an error of some sort, and the control channel got dropped, closed itself, and
-                // we're never going to be able to recover.
-                //
-                // The flipside is that by leaving it as-is, in the above hypothesized scenario,
-                // we'd avoid emitting additional panics/error logging when the root cause error was
-                // already doing so, like there's little value in knowing the fanout also hit an
-                // unrecoverable state if the whole process is about to come crashing down
-                // anyways... but it still does feel weird to have that encoded here by virtue of
-                // only a comment, and not an actual terminating expression. *shrug*
+    /// Returns `false` if the control channel closed with a sink still paused.
+    async fn wait_for_replacements(&mut self) -> bool {
+        while self.has_paused() {
+            if !self.recv_control_message().await {
+                // NAN-5874: nothing will ever replace the paused sink (Vector is stopping, e.g.
+                // after a reload whose rollback failed). This used to loop on `recv() == None`
+                // without yielding: a worker at 100% CPU until the shutdown deadline.
+                return false;
             }
         }
+        true
     }
 
     /// Send a stream of events to all connected sinks.
@@ -191,10 +233,20 @@ impl Fanout {
         events: impl Stream<Item = (EventArray, Instant)>,
     ) -> crate::Result<()> {
         tokio::pin!(events);
-        while let Some((event_array, send_reference)) = events.next().await {
-            self.send(event_array, Some(send_reference)).await?;
+        loop {
+            // NAN-5874: apply control messages while waiting for the next item (see
+            // `serve_control_message`); a task transform is idle there.
+            tokio::select! {
+                biased;
+                () = self.serve_control_message() => {}
+                item = events.next() => match item {
+                    Some((event_array, send_reference)) => {
+                        self.send(event_array, Some(send_reference)).await?;
+                    }
+                    None => return Ok(()),
+                },
+            }
         }
-        Ok(())
     }
 
     /// Send a batch of events to all connected sinks.
@@ -218,12 +270,34 @@ impl Fanout {
         send_reference: Option<Instant>,
     ) -> crate::Result<()> {
         // First, process any available control messages in a non-blocking fashion.
-        while let Ok(message) = self.control_channel.try_recv() {
-            self.apply_control_message(message);
+        // NAN-5874: nothing after `Stop` (or a closed channel) is applied.
+        while !self.control_channel_closed {
+            match self.control_channel.try_recv() {
+                Ok(message) => self.apply_control_message(message),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.control_channel_closed = true;
+                    break;
+                }
+            }
         }
 
         // Wait for any senders that are paused to be replaced first before continuing with the send.
-        self.wait_for_replacements().await;
+        if !self.wait_for_replacements().await {
+            // The events cannot reach the paused sink. Never finalize them as delivered: an
+            // acknowledging source must not acknowledge them (`Errored` tells it they were not).
+            // The send itself succeeds, so the component keeps draining and stops cleanly.
+            let mut events = events;
+            events.for_each_metadata_mut(|metadata| metadata.update_status(EventStatus::Errored));
+            if !self.reported_closed_while_paused {
+                self.reported_closed_while_paused = true;
+                warn!(
+                    message = "Discarding events, not acknowledged: a downstream component was paused by a reload that never completed and Vector is stopping.",
+                    component_id = %self.upstream_component,
+                );
+            }
+            return Ok(());
+        }
 
         // Drop empty event batches before they reach any downstream buffer, this is technically
         // programmer error. In debug/test builds the `debug_assert!` makes the underlying bug fail
@@ -258,7 +332,7 @@ impl Fanout {
         //
         // In real life this is likely a non-issue, but it can lead to strange behavior in tests if
         // left unhandled.
-        let mut control_channel_open = true;
+        let mut control_channel_open = !self.control_channel_closed;
 
         // Create our send group which arms all senders to send the given events, and handles
         // adding/removing/replacing senders while the send is in-flight.
@@ -289,9 +363,14 @@ impl Fanout {
                         Some(ControlMessage::Replace(id, sink)) => {
                             send_group.replace(&id, Sender::new(sink));
                         },
+                        Some(ControlMessage::Stop) => {
+                            control_channel_open = false;
+                            self.control_channel_closed = true;
+                        },
                         None => {
                             // Control channel is closed, which means Vector is shutting down.
                             control_channel_open = false;
+                            self.control_channel_closed = true;
                         }
                     }
                 }
@@ -505,7 +584,7 @@ impl Sender {
 mod tests {
     use std::{mem, num::NonZeroUsize};
 
-    use futures::poll;
+    use futures::{StreamExt, poll};
     use tokio::sync::mpsc::UnboundedSender;
     use tokio_test::{assert_pending, assert_ready, task::spawn};
     use tracing::Span;
@@ -973,5 +1052,124 @@ mod tests {
 
     fn make_event_array(count: usize) -> EventArray {
         make_events_inner(count).collect::<Vec<_>>().into()
+    }
+
+    // NAN-5874: a send waiting on a paused sink whose control channel closes (Vector stopping
+    // after a reload whose rollback failed) returns promptly, and its events are finalized as
+    // errored, never as delivered.
+    #[tokio::test]
+    async fn a_send_paused_when_the_control_channel_closes_returns_without_delivering() {
+        use crate::event::{BatchNotifier, BatchStatus};
+
+        let (mut fanout, control, _receivers) = fanout_from_senders(&[2, 2]);
+        control
+            .send(ControlMessage::Pause(ComponentKey::from("0")))
+            .unwrap();
+        drop(control);
+
+        let (batch, receiver) = BatchNotifier::new_with_receiver();
+        let event = Event::Log(LogEvent::from("held").with_batch_notifier(&batch));
+        drop(batch);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fanout.send(event.into(), None),
+        )
+        .await
+        .expect("the send returns instead of spinning");
+        assert!(result.is_ok(), "the component keeps draining");
+        assert_eq!(receiver.await, BatchStatus::Errored);
+    }
+
+    // NAN-5874: an idle component's fanout applies its control messages (a reload waits for a
+    // removed sink's sender to be dropped), and once the channel closes it pends without
+    // spinning.
+    #[tokio::test]
+    async fn serve_control_message_applies_messages_then_pends_once_closed() {
+        let (mut fanout, control, mut receivers) = fanout_from_senders(&[2]);
+        remove_sender_from_fanout(&control, 0);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fanout.serve_control_message(),
+        )
+        .await
+        .expect("the message is applied");
+        // The removed sink's sender was dropped, so its receiver ends.
+        let receiver = receivers.remove(0);
+        assert!(receiver.into_stream().next().await.is_none());
+
+        drop(control);
+        let mut served = spawn(fanout.serve_control_message());
+        assert_pending!(served.poll());
+        assert_pending!(served.poll());
+    }
+
+    // NAN-5874: `send_stream` applies control messages while waiting for its next item (a task
+    // transform is idle there).
+    #[tokio::test]
+    async fn send_stream_applies_control_messages_while_idle() {
+        let (mut fanout, control, mut receivers) = fanout_from_senders(&[2]);
+        let (_items_tx, items_rx) =
+            futures::channel::mpsc::unbounded::<(EventArray, std::time::Instant)>();
+        let sending = tokio::spawn(async move {
+            fanout.send_stream(items_rx).await.unwrap();
+        });
+        remove_sender_from_fanout(&control, 0);
+        let receiver = receivers.remove(0);
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            receiver.into_stream().next(),
+        )
+        .await
+        .expect("the idle stream applied the Remove and dropped the sender");
+        assert!(next.is_none());
+        sending.abort();
+    }
+
+    // NAN-5874: no control message after `Stop` is applied, so a `Replace` or `Remove` queued
+    // behind it cannot release a held batch: it is still discarded as errored.
+    #[tokio::test]
+    async fn control_messages_after_stop_are_ignored() {
+        use crate::event::{BatchNotifier, BatchStatus};
+
+        for after in ["replace", "remove"] {
+            let (mut fanout, control, mut receivers) = fanout_from_senders(&[2]);
+            control
+                .send(ControlMessage::Pause(ComponentKey::from("0")))
+                .unwrap();
+            control.send(ControlMessage::Stop).unwrap();
+            let mut replacement = None;
+            if after == "replace" {
+                let (sender, receiver) = build_sender_pair(2);
+                replacement = Some(receiver);
+                control
+                    .send(ControlMessage::Replace(ComponentKey::from("0"), sender))
+                    .unwrap();
+            } else {
+                remove_sender_from_fanout(&control, 0);
+            }
+
+            let (batch, receiver) = BatchNotifier::new_with_receiver();
+            let event = Event::Log(LogEvent::from("held").with_batch_notifier(&batch));
+            drop(batch);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                fanout.send(event.into(), None),
+            )
+            .await
+            .expect("the send returns")
+            .expect("the component keeps draining");
+            assert_eq!(receiver.await, BatchStatus::Errored, "{after}");
+            assert!(
+                !fanout.recv_control_message().await,
+                "{after}: nothing follows Stop"
+            );
+            if let Some(replacement) = replacement {
+                drop(fanout);
+                let next = replacement.into_stream().next().await;
+                assert!(next.is_none(), "the Replace after Stop was not applied");
+            }
+            receivers.clear();
+            drop(control);
+        }
     }
 }

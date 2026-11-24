@@ -288,6 +288,7 @@ where
             BufferType::DiskV2 {
                 max_size: max_size_bytes,
                 when_full,
+                acknowledgement_durability: vector_buffers::AcknowledgementDurability::default(),
             }
         }
         s => panic!(

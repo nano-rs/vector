@@ -694,7 +694,13 @@ impl<'a> Builder<'a> {
                     self.errors.push(format!("Sink \"{key}\": {error}"));
                     return;
                 }
-                Ok((tx, rx)) => (tx, Arc::new(Mutex::new(Some(rx.into_stream())))),
+                Ok((tx, rx)) => {
+                    // nano (NAN-5567): opt-in hold of `Errored` records in a disk buffer.
+                    if sink.inner.hold_errored_in_disk_buffer() {
+                        rx.hold_errored_records();
+                    }
+                    (tx, Arc::new(Mutex::new(Some(rx.into_stream()))))
+                }
             }
         };
 
@@ -708,6 +714,18 @@ impl<'a> Builder<'a> {
             app_name: crate::get_app_name().to_string(),
             app_name_slug: crate::get_slugified_app_name(),
             extra_context: self.extra_context.clone(),
+            key: Some(key.clone()),
+            // nano (NAN-5567, NAN-5808): mirrors `hold_errored_records` above, which holds
+            // `Errored` records in every disk stage (base and overflow) of the buffer (a reused
+            // buffer keeps the hold it was built with). A record is held only if it is finalized
+            // in a disk stage, and a chained buffer with a memory stage cannot say which stage a
+            // batch came from, so this is true only when every stage is a disk stage.
+            buffer_holds_errored: sink.inner.hold_errored_in_disk_buffer()
+                && sink
+                    .buffer
+                    .stages()
+                    .iter()
+                    .all(|stage| matches!(stage, BufferType::DiskV2 { .. })),
         };
 
         let (sink, healthcheck) = match sink.build(cx).await {
@@ -1332,7 +1350,14 @@ impl Runner {
             .filter(move |events| ready(filter_events_type(events, self.input_type)));
 
         self.timer_tx.try_send_start_wait();
-        while let Some(events) = input_rx.next().await {
+        loop {
+            // NAN-5874: apply control messages while idle (see `Fanout::serve_control_message`).
+            let events = tokio::select! {
+                biased;
+                () = self.outputs.serve_control_messages() => continue,
+                events = input_rx.next() => events,
+            };
+            let Some(events) = events else { break };
             self.on_events_received(&events);
             self.transform.transform_all(events, &mut outputs_buf);
             self.send_outputs(&mut outputs_buf)
@@ -1361,6 +1386,12 @@ impl Runner {
         loop {
             tokio::select! {
                 biased;
+
+                // NAN-5874: control messages first (allocation-free), so sustained traffic cannot
+                // starve a reload that waits on one of this transform's sinks (see
+                // `Fanout::serve_control_message`). Disabled once the input ended and nothing is
+                // in flight, so the `else` branch ends the task.
+                () = self.outputs.serve_control_messages(), if !shutting_down || !in_flight.is_empty() => {}
 
                 result = in_flight.next(), if !in_flight.is_empty() => {
                     match result {

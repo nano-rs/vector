@@ -9,6 +9,15 @@ pub use self::noop::NoopTransformConfig;
 mod error_definitions;
 pub use self::error_definitions::ErrorDefinitionTransformConfig;
 
+mod slow_build;
+pub use self::slow_build::SlowBuildTransformConfig;
+
+mod two_port;
+pub use self::two_port::TwoPortTransformConfig;
+
+mod reload_probes;
+pub use self::reload_probes::{FlakyBuildTransformConfig, SlowProcessTransformConfig};
+
 /// Transform types.
 #[configurable_component]
 #[derive(Clone, Debug)]

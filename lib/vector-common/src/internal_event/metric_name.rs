@@ -15,6 +15,9 @@ pub enum CounterName {
     ComponentTimedOutEventsTotal,
     ComponentTimedOutRequestsTotal,
     ComponentLoadShedRequestsTotal,
+    // nano (NAN-5567): events a sink wrote to its dead-letter store, and dead-letter data discarded.
+    ComponentDeadLetteredEventsTotal,
+    ComponentDeadLetterDiscardedEventsTotal,
     BufferReceivedEventsTotal,
     BufferReceivedBytesTotal,
     BufferSentEventsTotal,
@@ -33,6 +36,10 @@ pub enum CounterName {
     CollectCompletedTotal,
     CommandExecutedTotal,
     ConnectionEstablishedTotal,
+    CrowdstrikeFdrBytesFetchedTotal,
+    CrowdstrikeFdrFilesFetchedTotal,
+    CrowdstrikeFdrFilesSkippedTotal,
+    CrowdstrikeFdrManifestsTotal,
     ConnectionSendErrorsTotal,
     ConnectionShutdownTotal,
     ContainerProcessedEventsTotal,
@@ -154,6 +161,7 @@ pub enum HistogramName {
     S3ObjectProcessingSucceededDurationSeconds,
     S3ObjectProcessingFailedDurationSeconds,
     CollectDurationSeconds,
+    CrowdstrikeFdrBatchLagSeconds,
     CommandExecutionDurationSeconds,
     GrpcServerHandlerDurationSeconds,
     HttpServerHandlerDurationSeconds,
@@ -189,6 +197,7 @@ impl HistogramName {
                 "s3_object_processing_failed_duration_seconds"
             }
             Self::CollectDurationSeconds => "collect_duration_seconds",
+            Self::CrowdstrikeFdrBatchLagSeconds => "crowdstrike_fdr_batch_lag_seconds",
             Self::CommandExecutionDurationSeconds => "command_execution_duration_seconds",
             Self::GrpcServerHandlerDurationSeconds => "grpc_server_handler_duration_seconds",
             Self::HttpServerHandlerDurationSeconds => "http_server_handler_duration_seconds",
@@ -205,8 +214,13 @@ impl HistogramName {
 #[strum(serialize_all = "snake_case")]
 pub enum GaugeName {
     ComponentLatencyMeanSeconds,
+    // nano (NAN-5567): bytes currently held in a sink's dead-letter store.
+    ComponentDeadLetterBytes,
     ComponentRequestActive,
     ComponentRequestConcurrencyLimit,
+    CrowdstrikeFdrInflightBytes,
+    CrowdstrikeFdrInflightManifests,
+    CrowdstrikeFdrQueueDepth,
     SourceBufferMaxSizeEvents,
     SourceBufferMaxSizeBytes,
     SourceBufferUtilizationLevel,
@@ -288,8 +302,12 @@ impl GaugeName {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ComponentLatencyMeanSeconds => "component_latency_mean_seconds",
+            Self::ComponentDeadLetterBytes => "component_dead_letter_bytes",
             Self::ComponentRequestActive => "component_request_active",
             Self::ComponentRequestConcurrencyLimit => "component_request_concurrency_limit",
+            Self::CrowdstrikeFdrInflightBytes => "crowdstrike_fdr_inflight_bytes",
+            Self::CrowdstrikeFdrInflightManifests => "crowdstrike_fdr_inflight_manifests",
+            Self::CrowdstrikeFdrQueueDepth => "crowdstrike_fdr_queue_depth",
             Self::SourceBufferMaxSizeEvents => "source_buffer_max_size_events",
             Self::SourceBufferMaxSizeBytes => "source_buffer_max_size_bytes",
             Self::SourceBufferUtilizationLevel => "source_buffer_utilization_level",
@@ -379,6 +397,10 @@ impl CounterName {
             Self::ComponentSentEventBytesTotal => "component_sent_event_bytes_total",
             Self::ComponentSentBytesTotal => "component_sent_bytes_total",
             Self::ComponentDiscardedEventsTotal => "component_discarded_events_total",
+            Self::ComponentDeadLetteredEventsTotal => "component_dead_lettered_events_total",
+            Self::ComponentDeadLetterDiscardedEventsTotal => {
+                "component_dead_letter_discarded_events_total"
+            }
             Self::ComponentErrorsTotal => "component_errors_total",
             Self::ComponentTimedOutEventsTotal => "component_timed_out_events_total",
             Self::ComponentTimedOutRequestsTotal => "component_timed_out_requests_total",
@@ -400,6 +422,10 @@ impl CounterName {
             Self::CollectCompletedTotal => "collect_completed_total",
             Self::CommandExecutedTotal => "command_executed_total",
             Self::ConnectionEstablishedTotal => "connection_established_total",
+            Self::CrowdstrikeFdrBytesFetchedTotal => "crowdstrike_fdr_bytes_fetched_total",
+            Self::CrowdstrikeFdrFilesFetchedTotal => "crowdstrike_fdr_files_fetched_total",
+            Self::CrowdstrikeFdrFilesSkippedTotal => "crowdstrike_fdr_files_skipped_total",
+            Self::CrowdstrikeFdrManifestsTotal => "crowdstrike_fdr_manifests_total",
             Self::ConnectionSendErrorsTotal => "connection_send_errors_total",
             Self::ConnectionShutdownTotal => "connection_shutdown_total",
             Self::ContainerProcessedEventsTotal => "container_processed_events_total",

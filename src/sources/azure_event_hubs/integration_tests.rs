@@ -9,15 +9,22 @@
 //!   --lib sources::azure_event_hubs::integration_tests
 //! ```
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use azure_core::http::Url;
 use azure_messaging_eventhubs::{EventDataBatchOptions, ProducerClient, models::EventData};
 use futures::{Stream, StreamExt};
-use vector_lib::{config::LogNamespace, event::EventStatus, shutdown::ShutdownSignal};
+use vector_lib::{
+    config::LogNamespace, event::EventStatus, finalization::Finalizable, shutdown::ShutdownSignal,
+};
 
 use super::{
     AzureEventHubsSourceConfig, CheckpointStoreConfig, StartPositionConfig,
+    checkpoint::{Checkpointer, Position},
     sas::{EventHubsConnectionString, SasTokenCredential},
 };
 use crate::{
@@ -70,7 +77,10 @@ async fn create_container(name: &str) {
         None,
     )
     .unwrap();
-    client.create(None).await.expect("create checkpoint container");
+    client
+        .create(None)
+        .await
+        .expect("create checkpoint container");
 }
 
 fn config(hub: &str, container: &str) -> AzureEventHubsSourceConfig {
@@ -147,7 +157,7 @@ async fn run_source(
     out: SourceSender,
     rx: impl Stream<Item = Event> + Unpin,
     run: &str,
-    stop: impl Fn(usize) -> bool,
+    stop: impl Fn(&[String]) -> bool,
 ) -> Vec<String> {
     let (trigger, shutdown, done) = ShutdownSignal::new_wired();
     let mut cx = SourceContext::new_test(out, None);
@@ -159,7 +169,7 @@ async fn run_source(
     let mut rx = rx;
     let mut messages = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    while !stop(messages.len()) {
+    while !stop(&messages) {
         match tokio::time::timeout_at(deadline, rx.next()).await {
             Ok(Some(event)) => {
                 let message = message(&event);
@@ -205,7 +215,7 @@ async fn azure_event_hubs_delivers_all_events_and_resumes_from_checkpoints() {
     let first = produce(hub, &run, 200).await;
     let received = assert_source_compliance(&SOURCE_TAGS, async {
         let (tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
-        run_source(&config, tx, rx, &run, |n| n >= first.len()).await
+        run_source(&config, tx, rx, &run, |m| m.len() >= first.len()).await
     })
     .await;
     assert_eq!(received.len(), first.len());
@@ -214,8 +224,37 @@ async fn azure_event_hubs_delivers_all_events_and_resumes_from_checkpoints() {
     // Second pass: after a restart, only the new events are read: the checkpoints hold.
     let second = produce(hub, &run, 100).await;
     let (tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
-    let received = run_source(&config, tx, rx, &run, |n| n >= second.len()).await;
+    let received = run_source(&config, tx, rx, &run, |m| m.len() >= second.len()).await;
     assert_exactly_once(&second, &received);
+}
+
+/// Acknowledges every event as delivered, except the first delivery of `fail`, which errors.
+///
+/// Keyed on the event's content rather than its arrival index: with `start_position = "earliest"`
+/// and a fresh checkpoint container, the source first re-reads whatever earlier runs left in the
+/// hub (the emulator retains events for an hour), so an index would usually hit another run's
+/// event (NAN-3706).
+fn fail_once(
+    rx: impl Stream<Item = Event> + Unpin,
+    fail: String,
+) -> impl Stream<Item = Event> + Unpin {
+    let mut failed = false;
+    rx.map(move |mut event| {
+        let status = if !failed && message(&event) == fail {
+            failed = true;
+            EventStatus::Errored
+        } else {
+            EventStatus::Delivered
+        };
+        event.take_finalizers().update_status(status);
+        event
+    })
+}
+
+/// Whether every one of `expected` is in `received`.
+fn received_all(expected: &[String], received: &[String]) -> bool {
+    let received: HashSet<&String> = received.iter().collect();
+    expected.iter().all(|body| received.contains(body))
 }
 
 #[tokio::test]
@@ -227,33 +266,213 @@ async fn azure_event_hubs_replays_after_failed_delivery() {
     let run = random_string(10);
     let produced = produce(hub, &run, 100).await;
 
-    // The 10th batch fails downstream: its partition is replayed from the last acknowledged event,
-    // so every event still arrives at least once.
-    let (tx, rx) = SourceSender::new_test_errors(|i| i == 10);
-    let received = run_source(&config, tx, rx, &run, |n| n >= produced.len() + 1).await;
-    let distinct: std::collections::HashSet<_> = received.iter().collect();
-    assert_eq!(distinct.len(), produced.len());
+    // One event of this run fails downstream: its partition is replayed from the last
+    // acknowledged event, so the failed event arrives again and every event at least once.
+    // Stop on content, not on a count: replayed duplicates arrive while the other partition is
+    // still delivering, so a count can be reached with events still missing.
+    let fail = produced[10].clone();
+    let (tx, rx) = SourceSender::new_test();
+    let rx = fail_once(rx, fail.clone());
+    let received = run_source(&config, tx, rx, &run, |m| {
+        received_all(&produced, m) && m.iter().filter(|body| **body == fail).count() >= 2
+    })
+    .await;
+    for body in &produced {
+        assert!(received.contains(body), "missing event {body}");
+    }
+    assert!(
+        received.iter().filter(|body| **body == fail).count() >= 2,
+        "the failed event was not replayed"
+    );
 
-    // After a restart nothing is lost and nothing old is re-read beyond what was in flight.
+    // After a restart nothing is lost. Events still in flight at the shutdown above are read
+    // again, so this run can also see some of `produced`.
     let more = produce(hub, &run, 20).await;
     let (tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
-    let received = run_source(&config, tx, rx, &run, |n| n >= more.len()).await;
+    let received = run_source(&config, tx, rx, &run, |m| received_all(&more, m)).await;
     for body in &more {
         assert!(received.contains(body), "missing event {body}");
     }
 }
 
+fn checkpointer(config: &AzureEventHubsSourceConfig, hub: &str) -> Checkpointer {
+    let store = config
+        .checkpoint_store
+        .as_ref()
+        .unwrap()
+        .build(&Default::default())
+        .unwrap();
+    Checkpointer::new(
+        store,
+        &config.connection().unwrap().namespace,
+        hub,
+        &config.consumer_group,
+    )
+}
+
+/// Starts the source with no traffic, waits until every partition has a checkpoint, and shuts it
+/// down. Returns the checkpoints.
+async fn start_idle(
+    config: &AzureEventHubsSourceConfig,
+    checkpointer: &Checkpointer,
+    partitions: usize,
+) -> HashMap<String, Position> {
+    let (trigger, shutdown, done) = ShutdownSignal::new_wired();
+    let (tx, _rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+    let mut cx = SourceContext::new_test(tx, None);
+    cx.shutdown = shutdown;
+    cx.acknowledgements = true;
+    let handle = tokio::spawn(config.build(cx).await.expect("build source"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let checkpoints = loop {
+        let checkpoints = checkpointer.load().await.unwrap();
+        if checkpoints.len() >= partitions {
+            break checkpoints;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for initial checkpoints: {checkpoints:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    drop(trigger);
+    done.await;
+    handle.await.unwrap().expect("source exited cleanly");
+    checkpoints
+}
+
+/// `start_position = "latest"`: the source starts while the partitions are idle and stops before
+/// any event arrives. It wrote an initial checkpoint per partition, so after a restart it reads
+/// every event enqueued while it was down, and none from before its first start.
 #[tokio::test]
-async fn azure_event_hubs_rejects_unknown_event_hub() {
+async fn azure_event_hubs_latest_restart_while_idle_skips_nothing() {
+    let hub = "eh-idle";
+    let container = format!("checkpoints-{}", random_string(8).to_lowercase());
+    create_container(&container).await;
+    let mut config = config(hub, &container);
+    config.start_position = StartPositionConfig::Latest;
+    let checkpointer = checkpointer(&config, hub);
+    let run = random_string(10);
+
+    // History from before the source's first start, tagged with its own run so that its bodies
+    // differ from the later ones: `latest` never reads it.
+    let history_run = format!("{run}-history");
+    let history = produce(hub, &history_run, 20).await;
+    let initial = start_idle(&config, &checkpointer, 2).await;
+    assert_eq!(initial.len(), 2, "{initial:?}");
+
+    let while_down = produce(hub, &run, 60).await;
+    let (tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+    let (history_tx, history_rx) = futures::channel::mpsc::unbounded();
+    // Everything the restarted source reads goes to `rx`; copy the history events aside.
+    let rx = rx.inspect(move |event| {
+        let message = message(event);
+        if message.contains(&format!(r#""run":"{history_run}""#)) {
+            history_tx.unbounded_send(message).unwrap();
+        }
+    });
+    let received = run_source(&config, tx, rx, &run, |m| m.len() >= while_down.len()).await;
+    assert_exactly_once(&while_down, &received);
+    let history_read: Vec<String> = history_rx.collect().await;
+    assert!(
+        history_read.is_empty(),
+        "read {} of {} history events: {history_read:?}",
+        history_read.len(),
+        history.len()
+    );
+
+    // An existing checkpoint is never replaced by an initial one: an idle start leaves the
+    // checkpoints exactly as the previous run committed them.
+    let committed = checkpointer.load().await.unwrap();
+    assert_ne!(committed, initial);
+    assert_eq!(start_idle(&config, &checkpointer, 2).await, committed);
+    assert_eq!(checkpointer.load().await.unwrap(), committed);
+}
+
+/// A missing Event Hub (not found) does not fail the build, which would take down every other
+/// source of the Vector: the source starts, keeps retrying, and shuts down cleanly.
+#[tokio::test]
+async fn azure_event_hubs_unknown_event_hub_does_not_fail_the_build() {
     let container = format!("checkpoints-{}", random_string(8).to_lowercase());
     create_container(&container).await;
     let config = config("does-not-exist", &container);
     let (tx, _rx) = SourceSender::new_test();
-    let error = match config.build(SourceContext::new_test(tx, None)).await {
-        Ok(_) => panic!("building a source for a missing Event Hub must fail"),
-        Err(error) => error.to_string(),
-    };
-    assert!(error.contains("does-not-exist"), "{error}");
+    let (trigger, shutdown, done) = ShutdownSignal::new_wired();
+    let mut cx = SourceContext::new_test(tx, None);
+    cx.shutdown = shutdown;
+    let source = config
+        .build(cx)
+        .await
+        .expect("a missing Event Hub must not fail the build");
+    let handle = tokio::spawn(source);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!handle.is_finished(), "the source gave up");
+    drop(trigger);
+    tokio::time::timeout(Duration::from_secs(13), async {
+        done.await;
+        handle.await.unwrap().expect("source exited cleanly");
+    })
+    .await
+    .expect("shutdown took too long");
+}
+
+/// The checkpoint container does not exist when the source starts (as with a storage account
+/// the credentials cannot read yet). The build succeeds, the source retries, and once the
+/// container exists it receives everything, without a restart.
+#[tokio::test]
+async fn azure_event_hubs_starts_without_its_checkpoints_and_receives_once_they_are_readable() {
+    let hub = "eh-startup";
+    let container = format!("checkpoints-{}", random_string(8).to_lowercase());
+    let config = config(hub, &container);
+    let run = random_string(8);
+    let expected = produce(hub, &run, 20).await;
+
+    let (tx, rx) = SourceSender::new_test();
+    let (trigger, shutdown, done) = ShutdownSignal::new_wired();
+    let mut cx = SourceContext::new_test(tx, None);
+    cx.shutdown = shutdown;
+    cx.acknowledgements = true;
+    let source = config
+        .build(cx)
+        .await
+        .expect("unreadable checkpoints must not fail the build");
+    let handle = tokio::spawn(source);
+    let mut rx = rx.map(|mut event| {
+        event
+            .take_finalizers()
+            .update_status(EventStatus::Delivered);
+        event
+    });
+
+    // Nothing is read while the checkpoints cannot be read: reading from the start position
+    // instead could re-deliver everything already checkpointed.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), rx.next())
+            .await
+            .is_err(),
+        "received events without checkpoints"
+    );
+    assert!(!handle.is_finished(), "the source gave up");
+
+    create_container(&container).await;
+    let mut received = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while !received_all(&expected, &received) {
+        let event = tokio::time::timeout_at(deadline, rx.next())
+            .await
+            .expect("timed out waiting for the events after the checkpoints became readable")
+            .expect("stream ended");
+        let message = message(&event);
+        if message.contains(&format!(r#""run":"{run}""#)) {
+            received.push(message);
+        }
+    }
+    assert_exactly_once(&expected, &received);
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(trigger);
+    done.await;
+    handle.await.unwrap().expect("source exited cleanly");
 }
 
 #[test]

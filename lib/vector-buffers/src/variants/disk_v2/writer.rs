@@ -33,7 +33,7 @@ use super::{
 };
 
 use crate::{
-    Bufferable,
+    AcknowledgementDurability, Bufferable,
     encoding::{AsMetadata, Encodable},
     variants::disk_v2::{
         io::AsyncFile,
@@ -42,6 +42,87 @@ use crate::{
     },
 };
 use vector_common::finalization::{EventFinalizerGroups, EventStatus};
+
+use super::io::DataSync;
+
+/// Records waiting for a sync of the data file they were written to (NAN-5285).
+struct SyncBatch {
+    sync: DataSync,
+    finalizers: Vec<FinalizerGuard>,
+}
+
+/// The group syncer (NAN-5285): acknowledges records once a sync that started after they were
+/// written has completed. While one sync runs, the writer keeps writing and later flushes queue
+/// their records here, so the next sync covers all of them (group commit). Without it every
+/// flush that carries an acknowledged record waited for its own sync, and a source with many
+/// concurrent requests was capped at one request per sync latency.
+///
+/// A failed sync resolves its records and every later one as Errored, and makes the writer's
+/// next flush fail: after a failed `fsync` the kernel may have dropped the dirty pages, so a later
+/// successful sync proves nothing about them.
+#[derive(Clone)]
+struct GroupSyncer {
+    batches: tokio::sync::mpsc::UnboundedSender<SyncBatch>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl fmt::Debug for GroupSyncer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupSyncer").field("failed", &self.failed()).finish()
+    }
+}
+
+impl GroupSyncer {
+    fn spawn() -> Self {
+        let (batches, mut queue) = tokio::sync::mpsc::unbounded_channel::<SyncBatch>();
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_failed = Arc::clone(&failed);
+        tokio::spawn(async move {
+            while let Some(first) = queue.recv().await {
+                let mut ready = vec![first];
+                while let Ok(more) = queue.try_recv() {
+                    ready.push(more);
+                }
+                let mut syncs: Vec<DataSync> = Vec::new();
+                for batch in &ready {
+                    if !syncs.iter().any(|known| known.same_file(&batch.sync)) {
+                        syncs.push(batch.sync.clone());
+                    }
+                }
+                let synced = !task_failed.load(std::sync::atomic::Ordering::Acquire)
+                    && matches!(
+                        tokio::task::spawn_blocking(move || syncs.iter().try_for_each(DataSync::sync))
+                            .await,
+                        Ok(Ok(()))
+                    );
+                if !synced {
+                    task_failed.store(true, std::sync::atomic::Ordering::Release);
+                }
+                for batch in ready {
+                    for finalizers in batch.finalizers {
+                        // Dropping an armed guard resolves its records as Errored.
+                        if synced {
+                            finalizers.disarm();
+                        }
+                    }
+                }
+            }
+        });
+        Self { batches, failed }
+    }
+
+    fn failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn submit(&self, batch: SyncBatch) {
+        // A closed queue (runtime shutting down) hands the batch back; dropping it resolves its
+        // records as Errored.
+        if let Err(unsent) = self.batches.send(batch) {
+            drop(unsent);
+        }
+    }
+}
 
 /// Error that occurred during calls to [`BufferWriter`].
 #[derive(Debug, Snafu)]
@@ -256,6 +337,7 @@ pub enum TryWriteOutcome<T> {
 
 /// RAII guard that resolves finalizers as [`EventStatus::Errored`] on drop unless explicitly
 /// disarmed.
+#[derive(Debug)]
 ///
 /// Used in `try_write_record_inner` so that every `?` exit automatically notifies acking sources
 /// to nack / withhold checkpoints for any record that did not reach durable storage.
@@ -278,6 +360,11 @@ impl FinalizerGuard {
     /// disk — both cases where the upstream source should ack rather than retry.
     fn disarm(mut self) {
         self.error_on_drop = false;
+    }
+
+    /// Whether a source is waiting on these finalizers (see NAN-5285 in `flush_inner`).
+    fn has_finalizers(&self) -> bool {
+        self.finalizers.has_finalizers()
     }
 
     /// Returns the finalizers for reattachment to the recovered record on buffer-full retry.
@@ -331,6 +418,11 @@ struct TrackingBufWriter<W> {
     inner: W,
     buf: Vec<u8>,
     unflushed_events: usize,
+    /// NAN-5208: set by the first failed write or flush. Bytes buffered at that point may be gone
+    /// (`buf` is cleared, and `tokio::fs::File` reports a background write error only once), so
+    /// a later "successful" flush would prove nothing about them. Every later write or flush
+    /// fails until the writer is recreated.
+    poisoned: bool,
 }
 
 impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
@@ -340,7 +432,25 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
             inner,
             buf: Vec::with_capacity(cap),
             unflushed_events: 0,
+            poisoned: false,
         }
+    }
+
+    fn check_poisoned(&self) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "disk buffer writer is poisoned by an earlier write error; records buffered at \
+                 that point may not have reached the data file",
+            ));
+        }
+        Ok(())
+    }
+
+    fn poison_on_error<V>(&mut self, result: io::Result<V>) -> io::Result<V> {
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
 
     /// Writes the given buffer.
@@ -365,12 +475,22 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
     /// If a write to the inner writer occurs, and that write encounters an error, an error variant
     /// will be returned describing the error.
     async fn write(&mut self, event_count: usize, buf: &[u8]) -> io::Result<Option<FlushResult>> {
+        self.check_poisoned()?;
+        let result = self.write_unpoisoned(event_count, buf).await;
+        self.poison_on_error(result)
+    }
+
+    async fn write_unpoisoned(
+        &mut self,
+        event_count: usize,
+        buf: &[u8],
+    ) -> io::Result<Option<FlushResult>> {
         let mut flush_result = None;
 
         // If this write would cause us to exceed our internal buffer capacity, flush whatever we
         // have buffered already.
         if self.buf.len() + buf.len() > self.buf.capacity() {
-            flush_result = self.flush().await?;
+            flush_result = self.flush_unpoisoned().await?;
         }
 
         // If the given buffer is too large to be buffered at all, then bypass the internal buffer.
@@ -402,7 +522,19 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
     /// If a write to the underlying writer occurs, and that write encounters an error, an error variant
     /// will be returned describing the error.
     async fn flush(&mut self) -> io::Result<Option<FlushResult>> {
+        self.check_poisoned()?;
+        let result = self.flush_unpoisoned().await;
+        self.poison_on_error(result)
+    }
+
+    async fn flush_unpoisoned(&mut self) -> io::Result<Option<FlushResult>> {
+        // NAN-5208: always flush the inner writer as well. `tokio::fs::File` is write-behind:
+        // `write_all` returns once the bytes are handed to a blocking-pool task, before `write(2)`
+        // runs, and a record at or above the buffer capacity is written straight through,
+        // bypassing `buf`. Only `flush` waits for that write to complete, and only then are the
+        // bytes in the data file, where they survive a kill of this process.
         if self.buf.is_empty() {
+            self.inner.flush().await?;
             return Ok(None);
         }
 
@@ -412,13 +544,13 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
         let result = self.inner.write_all(&self.buf[..]).await;
         self.unflushed_events = 0;
         self.buf.clear();
+        result?;
+        self.inner.flush().await?;
 
-        result.map(|()| {
-            Some(FlushResult {
-                events_flushed,
-                bytes_flushed,
-            })
-        })
+        Ok(Some(FlushResult {
+            events_flushed,
+            bytes_flushed,
+        }))
     }
 
     /// Gets a reference to the underlying writer.
@@ -442,6 +574,7 @@ impl<W: fmt::Debug> fmt::Debug for TrackingBufWriter<W> {
                 &format_args!("{}/{}", self.buf.len(), self.buf.capacity()),
             )
             .field("unflushed_events", &self.unflushed_events)
+            .field("poisoned", &self.poisoned)
             .finish()
     }
 }
@@ -885,6 +1018,14 @@ where
     data_file_full: bool,
     skip_to_next: bool,
     ready_to_write: bool,
+    /// NAN-5208: finalizers of records accepted into the write buffer but not yet written to the
+    /// data file. They resolve (as `Delivered`) only after the next successful flush, and as
+    /// `Errored` if that flush fails or the writer is dropped first.
+    pending_finalizers: Vec<FinalizerGuard>,
+    /// NAN-5285: syncs the current data file from another thread, when the file supports it.
+    data_sync: Option<DataSync>,
+    /// NAN-5285: started on the first acknowledged record that can be synced off-task.
+    group_syncer: Option<GroupSyncer>,
     _t: PhantomData<T>,
 }
 
@@ -909,6 +1050,9 @@ where
             ready_to_write: false,
             next_record_id,
             unflushed_events: 0,
+            pending_finalizers: Vec::new(),
+            data_sync: None,
+            group_syncer: None,
             _t: PhantomData,
         }
     }
@@ -1632,7 +1776,15 @@ where
 
                 // Make sure the file is flushed to disk, especially if we just created it.
                 data_file.sync_all().await?;
+                // NAN-5285: and its directory entry, so a host crash cannot lose a new data file
+                // whose (fsynced) records were already acknowledged. Once per data file.
+                self.config
+                    .filesystem
+                    .sync_directory(&self.config.data_dir)
+                    .await?;
 
+                // NAN-5285: a handle the group syncer can sync this file through.
+                self.data_sync = data_file.data_sync().await?;
                 self.writer = Some(RecordWriter::new(
                     data_file,
                     data_file_size,
@@ -1646,6 +1798,9 @@ where
                 // file ID now to signal that the writer has moved on.
                 if should_open_next {
                     self.ledger.state().increment_writer_file_id();
+                    // NAN-5285: acknowledged records are about to land in the new file, and a
+                    // recovery only finds them if the ledger names it. Once per data file.
+                    self.ledger.flush()?;
                     self.ledger.notify_writer_waiters();
 
                     // The writer just rolled to a fresh data file, the boundary the
@@ -1822,9 +1977,23 @@ where
             // We always return errors here because flushing the record won't return a recoverable
             // error like `DataFileFull`, as that gets checked during archiving. The guard fires
             // Errored automatically on `?` exit.
-            let result = writer.flush_record(token).await?;
-            // Record is durable on disk; disarm so finalizers resolve as Delivered.
-            record_finalizers.disarm();
+            let result = match writer.flush_record(token).await {
+                Ok(result) => result,
+                Err(error) => {
+                    // NAN-5208: a failed write (including an implicit flush of the write buffer)
+                    // may have discarded earlier buffered records too. Resolve them all as
+                    // Errored now; the poisoned writer fails every later flush, so none of them
+                    // can be acknowledged afterwards.
+                    self.pending_finalizers.clear();
+                    return Err(error);
+                }
+            };
+            // NAN-5208: the record is only in the in-process write buffer here, not in the data
+            // file. A `Delivered` status is what acking sources report to the sender as durable
+            // (a HEC indexer ack of true, an HTTP 2xx), so resolving now acknowledged records
+            // that a kill of this process before the next flush (SIGKILL, OOM, node loss)
+            // silently discarded. Hold the finalizers until `flush` has written the bytes.
+            self.pending_finalizers.push(record_finalizers);
             result
         } else {
             // The record would not fit given the current size of the buffer, so we need to recover it from the
@@ -1924,6 +2093,11 @@ where
 
     #[instrument(skip(self), level = "debug")]
     async fn flush_inner(&mut self, force_full_flush: bool) -> io::Result<()> {
+        if self.group_syncer.as_ref().is_some_and(GroupSyncer::failed) {
+            // NAN-5285: a sync failed; see `GroupSyncer`.
+            self.pending_finalizers.clear();
+            return Err(io::Error::other("disk buffer data file sync failed"));
+        }
         // We always flush the `BufWriter` when this is called, but we don't always flush to disk or
         // flush the ledger.  This is enough for readers on Linux since the file ends up in the page
         // cache, as we don't do any O_DIRECT fanciness, and the new contents can be immediately
@@ -1932,7 +2106,14 @@ where
         // TODO: Windows has a page cache as well, and macOS _should_, but we should verify this
         // behavior works on those platforms as well.
         let flush_result = if let Some(writer) = self.writer.as_mut() {
-            writer.flush().await?
+            match writer.flush().await {
+                Ok(flush_result) => flush_result,
+                Err(error) => {
+                    // Dropping the armed guards resolves the unwritten records as Errored.
+                    self.pending_finalizers.clear();
+                    return Err(error);
+                }
+            }
         } else {
             None
         };
@@ -1942,7 +2123,57 @@ where
             self.publish_flushed_progress(flush_result.events_flushed, flush_result.bytes_flushed);
         }
 
-        if self.ledger.should_flush() || force_full_flush {
+        // NAN-5285: the bytes are in the data file, but only in the kernel page cache. A host
+        // crash (power loss, kernel panic, hard reset) before the periodic `fsync` below (every
+        // `flush_interval`, 500 ms by default) loses them, and a `Delivered` status is what
+        // acking sources report to the sender as durable (an HTTP/OTLP 2xx, a HEC ackId of true).
+        // So when a source is waiting on a pending record, sync the data file and the ledger
+        // before acknowledging it. Every record buffered since the last flush shares this one
+        // sync (group commit); records no source waits on keep the periodic sync.
+        // `acknowledgement_durability = "page_cache"` opts out: acknowledge once in the data file.
+        let synced_for_ack = self.config.acknowledgement_durability
+            == AcknowledgementDurability::Fsync
+            && self
+                .pending_finalizers
+                .iter()
+                .any(FinalizerGuard::has_finalizers);
+        let mut handed_off = false;
+        if synced_for_ack && let Some(sync) = self.data_sync.clone() {
+            // Hand the records to the group syncer: the writer keeps writing while the sync runs,
+            // and the source hears Delivered once it has completed. The periodic data file and
+            // ledger sync below still runs, so a steady stream of acknowledged records cannot
+            // starve the ledger (reader progress, file IDs) of its `flush_interval` msync, nor
+            // skip a forced full flush (data file rollover).
+            let finalizers = std::mem::take(&mut self.pending_finalizers);
+            self.group_syncer
+                .get_or_insert_with(GroupSyncer::spawn)
+                .submit(SyncBatch { sync, finalizers });
+            handed_off = true;
+        }
+        if synced_for_ack && !handed_off {
+            let synced = match self.writer.as_mut() {
+                Some(writer) => writer.sync_all().await,
+                None => Ok(()),
+            }
+            .and_then(|()| self.ledger.flush());
+            if let Err(error) = synced {
+                // The bytes may or may not be durable: resolve them Errored so the sender retries
+                // (at-least-once), never Delivered.
+                self.pending_finalizers.clear();
+                return Err(error);
+            }
+        }
+
+        // NAN-5208: every buffered record is now in the data file (and, per NAN-5285 above,
+        // synced to disk when a source waits on it); acknowledge them.
+        for finalizers in self.pending_finalizers.drain(..) {
+            finalizers.disarm();
+        }
+
+        if synced_for_ack && !handed_off {
+            // This flush already synced the data file and the ledger inline.
+            Ok(())
+        } else if self.ledger.should_flush() || force_full_flush {
             if let Some(writer) = self.writer.as_mut() {
                 writer.sync_all().await?;
             }
@@ -1957,9 +2188,10 @@ where
     ///
     /// This must be called for the reader to be able to make progress.
     ///
-    /// This does not ensure that the data is fully synchronized (i.e. `fsync`) to disk, however it
-    /// may sometimes perform a full synchronization if the time since the last full synchronization
-    /// occurred has exceeded a configured limit.
+    /// When a record written since the last flush carries a finalizer (a source with
+    /// acknowledgements waits on it), the data file and the ledger are fully synchronized
+    /// (`fsync`) before it is acknowledged (NAN-5285). Otherwise this does not synchronize, except
+    /// when the time since the last full synchronization has exceeded the configured limit.
     ///
     /// # Errors
     ///

@@ -1,0 +1,22 @@
+# Build context for distribution/docker/nano/Dockerfile (BuildKit reads <Dockerfile>.dockerignore
+# instead of the root .dockerignore): upstream's list plus config/examples and distribution/debian/vector.yaml for /etc/vector
+# and the FEATURES file the build reads.
+*
+!benches
+!lib
+!proto
+!src
+!tests
+!build.rs
+!Cargo.lock
+!Cargo.toml
+!rust-toolchain.toml
+!scripts
+!vdev
+
+# Exclude target directories to avoid copying build artifacts
+target
+
+!config/examples
+!distribution/debian/vector.yaml
+!distribution/docker/nano/FEATURES

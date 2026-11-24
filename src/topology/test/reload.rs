@@ -205,6 +205,7 @@ async fn topology_disk_buffer_conflict() {
     old_config.sinks[&sink_key].buffer = BufferConfig::Single(BufferType::DiskV2 {
         max_size: NonZeroU64::new(268_435_488).unwrap(),
         when_full: WhenFull::Block,
+        acknowledgement_durability: vector_lib::buffers::AcknowledgementDurability::default(),
     });
 
     let mut new_config = old_config.clone();
@@ -212,6 +213,7 @@ async fn topology_disk_buffer_conflict() {
     new_config.sinks[&sink_key].buffer = BufferConfig::Single(BufferType::DiskV2 {
         max_size: NonZeroU64::new(268_435_488).unwrap(),
         when_full: WhenFull::Block,
+        acknowledgement_durability: vector_lib::buffers::AcknowledgementDurability::default(),
     });
 
     reload_sink_test(
@@ -353,6 +355,7 @@ async fn topology_disk_buffer_config_change_does_not_stall() {
     old_config.sinks[&sink_key].buffer = BufferConfig::Single(BufferType::DiskV2 {
         max_size: NonZeroU64::new(268_435_488).unwrap(),
         when_full: WhenFull::Block,
+        acknowledgement_durability: vector_lib::buffers::AcknowledgementDurability::default(),
     });
 
     // Change only the disk buffer's max_size.
@@ -360,6 +363,7 @@ async fn topology_disk_buffer_config_change_does_not_stall() {
     new_config.sinks[&sink_key].buffer = BufferConfig::Single(BufferType::DiskV2 {
         max_size: NonZeroU64::new(536_870_912).unwrap(),
         when_full: WhenFull::Block,
+        acknowledgement_durability: vector_lib::buffers::AcknowledgementDurability::default(),
     });
 
     let (mut topology, crash) = start_topology(old_config.build().unwrap(), true).await;
@@ -420,6 +424,7 @@ async fn topology_disk_buffer_config_change_chained_does_not_stall() {
         BufferType::DiskV2 {
             max_size: NonZeroU64::new(268_435_488).unwrap(),
             when_full: WhenFull::Block,
+            acknowledgement_durability: vector_lib::buffers::AcknowledgementDurability::default(),
         },
     ]);
 
@@ -430,6 +435,7 @@ async fn topology_disk_buffer_config_change_chained_does_not_stall() {
         BufferType::DiskV2 {
             max_size: NonZeroU64::new(536_870_912).unwrap(),
             when_full: WhenFull::Block,
+            acknowledgement_durability: vector_lib::buffers::AcknowledgementDurability::default(),
         },
     ]);
 

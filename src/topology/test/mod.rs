@@ -55,6 +55,9 @@ mod panic;
     feature = "enrichment-tables-memory",
 ))]
 mod reload;
+mod reload_hazards;
+mod repointed_reload;
+mod rollback;
 #[cfg(all(feature = "sinks-console", feature = "sources-demo_logs"))]
 mod source_finished;
 mod transient_state;
@@ -853,6 +856,7 @@ async fn topology_disk_buffer_flushes_on_idle() {
     sink1_outer.buffer = BufferConfig::Single(BufferType::DiskV2 {
         max_size: std::num::NonZeroU64::new(268_435_488).unwrap(),
         when_full: WhenFull::DropNewest,
+        acknowledgement_durability: vector_lib::buffers::AcknowledgementDurability::default(),
     });
     config.add_sink_outer("out1", sink1_outer);
 

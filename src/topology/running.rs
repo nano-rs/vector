@@ -83,6 +83,20 @@ pub struct RunningTopology {
     pending_reload: Option<HashSet<ComponentKey>>,
     sink_confinement_gauges: HashMap<ComponentKey, Gauge>,
     orphaned_disk_buffer_scanner: OrphanedDiskBufferScanner,
+    /// (component, input) pairs whose fanout entry `remove_inputs` PAUSED (kept, sender taken)
+    /// rather than removed. `setup_inputs` may only send `ControlMessage::Replace` for these;
+    /// every other connection is gone from the fanout and must be re-`Add`ed. Tracking what was
+    /// actually sent, instead of re-deriving it from configs, is what keeps the rollback path of
+    /// a failed reload correct (NAN-4936): there `self.config` is the OLD config, while the
+    /// pauses/removals were decided against the failed NEW config.
+    paused_inputs: HashSet<(ComponentKey, OutputId)>,
+    /// NAN-5874: connections a reload stops using whose upstream keeps running
+    /// (the consumer is removed, or no longer reads that input). They are
+    /// paused like a changed consumer's input until the new topology is
+    /// connected, and removed only then: removing them up front left the
+    /// unchanged upstream with no consumer for the whole build, and every
+    /// event it emitted meanwhile was dropped and finalized as delivered.
+    deferred_removals: HashSet<(ComponentKey, OutputId)>,
 }
 
 impl RunningTopology {
@@ -110,6 +124,8 @@ impl RunningTopology {
             pending_reload: None,
             sink_confinement_gauges: HashMap::new(),
             orphaned_disk_buffer_scanner: OrphanedDiskBufferScanner::new(),
+            paused_inputs: HashSet::new(),
+            deferred_removals: HashSet::new(),
         }
     }
 
@@ -164,6 +180,16 @@ impl RunningTopology {
     /// The returned future resolves to `true` if every component finished on its own before
     /// the graceful shutdown deadline, or `false` if any component had to be forcefully killed.
     pub fn stop(self) -> impl Future<Output = bool> {
+        // NAN-5874: tell every fanout no paused sink will be replaced (a reload whose rollback
+        // failed leaves connections paused), so a send waiting on one discards its events as
+        // errored and its component drains, instead of waiting for the control channel to close.
+        // It may never close: the API's tap watch holds clones of every control channel. The
+        // watch is cleared too, so tap subscribers drop theirs.
+        for output in self.outputs.values() {
+            _ = output.send(ControlMessage::Stop);
+        }
+        _ = self.watch.0.send(TapResource::default());
+
         // Create handy handles collections of all tasks for the subsequent
         // operations.
         let mut wait_handles = Vec::new();
@@ -397,6 +423,22 @@ impl RunningTopology {
             internal_log_rate_limit = false
         );
 
+        // NAN-5874: neither topology could be built, so nothing will replace or remove the
+        // connections `shutdown_diff` paused, and Vector stops next. They stay paused: sending
+        // `Remove` would let their upstreams emit into fanouts with no consumer and finalize those
+        // events as delivered. `stop` then sends every fanout `ControlMessage::Stop`: a send
+        // waiting on a paused connection discards its events marked errored (never acknowledged)
+        // and the component drains and stops.
+        let held = self.deferred_removals.len() + self.paused_inputs.len();
+        if held > 0 {
+            warn!(
+                message = "Connections paused by the failed reload stay paused until Vector stops; events waiting on them are not acknowledged.",
+                connections = held,
+            );
+        }
+        self.deferred_removals.clear();
+        self.paused_inputs.clear();
+
         Err(ReloadError::FailedToRestore)
     }
 
@@ -511,25 +553,36 @@ impl RunningTopology {
         // components, the shutdown of sources they depend on, or the shutdown of transforms they
         // depend on, and thus the closing of their buffer, will naturally cause them to shutdown,
         // which is why we don't do any manual triggering of shutdown here.
+        //
+        // NAN-5874: every changed/removed transform's outputs are dropped BEFORE any of their
+        // inputs are touched, as is already done for sources ahead of transforms and transforms
+        // ahead of sinks. Otherwise `remove_inputs(T2)`, for a chain `T1 -> T2` of changing or
+        // removed transforms (`to_remove` and `to_change` are sets, so in any order), sent
+        // `Remove(T2)` to the OLD `T1`, which then emitted everything it still had buffered or in
+        // flight into a fanout with no senders: dropped, and finalized as delivered. With `T1`'s
+        // outputs gone from `self.outputs` that `Remove` is never sent; the old `T1` keeps its
+        // sender to the old `T2` and drains into it, and the old `T2` drains downstream once its
+        // input closes, as a changed transform feeding a sink always did.
         for key in &diff.transforms.to_remove {
             debug!(component_id = %key, "Removing transform.");
 
             let previous = self.tasks.remove(key).unwrap();
             drop(previous); // detach and forget
 
-            self.remove_inputs(key, diff, new_config);
-            self.remove_outputs(key);
-
             if let Some(registry) = self.utilization_registry.as_ref() {
                 registry.remove_component(key);
             }
         }
-
+        for key in diff.transforms.removed_and_changed() {
+            self.remove_outputs(key);
+        }
+        for key in &diff.transforms.to_remove {
+            self.remove_inputs(key, diff, new_config);
+        }
         for key in &diff.transforms.to_change {
             debug!(component_id = %key, "Changing transform.");
 
             self.remove_inputs(key, diff, new_config);
-            self.remove_outputs(key);
         }
 
         // Now we'll process any changed/removed sinks.
@@ -606,6 +659,9 @@ impl RunningTopology {
             .map(|(_, key)| key.clone());
 
         // For any sink whose buffer configuration didn't change, we can reuse their buffer.
+        // nano (NAN-5567, NAN-5808): the `Errored` hold must not change either. A reused buffer
+        // keeps the hold it was built with, so reusing it across a change of sink type would
+        // leave the buffer and the new sink disagreeing on whether `Errored` records are held.
         let reuse_buffers = diff
             .sinks
             .to_change
@@ -615,14 +671,7 @@ impl RunningTopology {
                 if diff.components_to_reload.contains(key) {
                     return false;
                 }
-                self.config
-                    .sink(key)
-                    .map(|s| s.buffer.clone())
-                    .or_else(|| enrichment_table_sink_buffer(&self.config, key))
-                    == new_config
-                        .sink(key)
-                        .map(|s| s.buffer.clone())
-                        .or_else(|| enrichment_table_sink_buffer(new_config, key))
+                sink_buffer_and_hold(&self.config, key) == sink_buffer_and_hold(new_config, key)
             })
             .cloned()
             .collect::<HashSet<_>>();
@@ -955,6 +1004,16 @@ impl RunningTopology {
         // sources/transforms, to ensure we're connecting components in order.
         self.reattach_severed_inputs(diff);
 
+        // NAN-5874: every consumer of the new topology is connected; only now remove the
+        // connections the new topology no longer uses (paused since `shutdown_diff`). Only an
+        // input absent from the diff is deferred, so its fanout is the one that held them.
+        for (key, input) in std::mem::take(&mut self.deferred_removals) {
+            if let Some(output) = self.outputs.get_mut(&input) {
+                debug!(component_id = %key, fanout_id = %input, "Removing paused component input from fanout.");
+                _ = output.send(ControlMessage::Remove(key));
+            }
+        }
+
         // Broadcast any topology changes to subscribers.
         if !self.watch.0.is_closed() {
             let outputs = self
@@ -1031,21 +1090,21 @@ impl RunningTopology {
     ) {
         let (tx, inputs) = new_pieces.inputs.remove(key).unwrap();
 
-        let old_inputs = self
-            .config
-            .inputs_for_node(key)
-            .into_iter()
-            .flatten()
-            .cloned()
-            .collect::<HashSet<_>>();
-
-        let new_inputs = inputs.iter().cloned().collect::<HashSet<_>>();
-        let inputs_to_add = &new_inputs - &old_inputs;
-
         for input in inputs {
             let output = self.outputs.get_mut(&input).expect("unknown output");
 
-            if diff.contains(&input.component) || inputs_to_add.contains(&input) {
+            // Replace only a connection `remove_inputs` paused. Everything else (a new input, an
+            // input whose component changed, or one `remove_inputs` removed because the config
+            // it was comparing against dropped it) is no longer in the fanout and must be added.
+            // NAN-4936: this used to re-derive "was it paused?" from `self.config`, which is the
+            // OLD config on the rollback path of a failed reload. An input the failed config had
+            // dropped was then sent `Replace` for a sink the fanout had already removed, and
+            // `Fanout::replace` panicked on the next event through that upstream.
+            // NAN-5874: a connection paused for deferred removal that the topology being
+            // connected reads again (the rollback of a failed reload) is resumed in place.
+            let deferred = self.deferred_removals.remove(&(key.clone(), input.clone()));
+            let paused = self.paused_inputs.remove(&(key.clone(), input.clone())) || deferred;
+            if diff.contains(&input.component) || !paused {
                 // If the input we're connecting to is changing, that means its outputs will have been
                 // recreated, so instead of replacing a paused sink, we have to add it to this new
                 // output for the first time, since there's nothing to actually replace at this point.
@@ -1070,6 +1129,21 @@ impl RunningTopology {
             .map(|trigger| self.detach_triggers.insert(key.clone(), trigger.into()));
     }
 
+    /// NAN-5874: whether the new topology connects `input` to a component it does not feed now
+    /// (an added or changed component that reads it). Only an unchanged component's connections
+    /// carry over, and an unchanged component reads exactly what it read before.
+    fn input_gains_a_consumer(input: &OutputId, diff: &ConfigDiff, new_config: &Config) -> bool {
+        diff.transforms
+            .changed_and_added()
+            .chain(diff.sinks.changed_and_added())
+            .chain(diff.enrichment_tables.sinks.changed_and_added())
+            .any(|key| {
+                new_config
+                    .inputs_for_node(key)
+                    .is_some_and(|inputs| inputs.contains(input))
+            })
+    }
+
     fn remove_outputs(&mut self, key: &ComponentKey) {
         self.outputs.retain(|id, _output| &id.component != key);
     }
@@ -1086,8 +1160,26 @@ impl RunningTopology {
             .collect::<HashSet<_>>();
 
         for input in old_inputs {
+            let defer = !diff.contains(&input.component)
+                && (diff.is_removed(key) || !new_inputs.contains(input))
+                && Self::input_gains_a_consumer(input, diff, new_config);
             if let Some(output) = self.outputs.get_mut(input) {
-                if diff.contains(&input.component)
+                if defer {
+                    // NAN-5874: the input itself is not changing, so it keeps running
+                    // through the build, and the new topology connects it to a component that
+                    // does not read it yet (this one re-pointed, or its replacement). Pause this
+                    // connection (its sends wait, as for a changed consumer) and remove it once
+                    // the new topology is connected (`connect_diff`), so whatever the input takes
+                    // in meanwhile reaches the new consumer instead of being dropped as
+                    // delivered. An input that only loses consumers is not held (Case 2/3
+                    // below): the new topology drops those events anyway, and holding them
+                    // would stall its other consumers for the whole build.
+                    debug!(component_id = %key, fanout_id = %input, "Pausing component input in fanout until the new topology is connected.");
+
+                    self.paused_inputs.remove(&(key.clone(), input.clone()));
+                    self.deferred_removals.insert((key.clone(), input.clone()));
+                    _ = output.send(ControlMessage::Pause(key.clone()));
+                } else if diff.contains(&input.component)
                     || diff.is_removed(key)
                     || !new_inputs.contains(input)
                 {
@@ -1103,6 +1195,7 @@ impl RunningTopology {
                     // Case 3: This component is no longer connected to the input from new config.
                     debug!(component_id = %key, fanout_id = %input, "Removing component input from fanout.");
 
+                    self.paused_inputs.remove(&(key.clone(), input.clone()));
                     _ = output.send(ControlMessage::Remove(key.clone()));
                 } else {
                     // We know that if this component is connected to a given input, and it isn't being
@@ -1110,6 +1203,7 @@ impl RunningTopology {
                     // now to pause further sends through that component until we reconnect:
                     debug!(component_id = %key, fanout_id = %input, "Pausing component input in fanout.");
 
+                    self.paused_inputs.insert((key.clone(), input.clone()));
                     _ = output.send(ControlMessage::Pause(key.clone()));
                 }
             }
@@ -1585,6 +1679,27 @@ fn enrichment_table_sink_resources(config: &Config, sink_key: &ComponentKey) -> 
         .unwrap_or_default()
 }
 
+/// nano (NAN-5567, NAN-5808): a sink's buffer configuration and whether its disk buffer holds
+/// `Errored` records. A buffer is reused across a reload only when both are unchanged.
+fn sink_buffer_and_hold(
+    config: &Config,
+    sink_key: &ComponentKey,
+) -> Option<(vector_lib::buffers::BufferConfig, bool)> {
+    config
+        .sink(sink_key)
+        .map(|sink| {
+            (
+                sink.buffer.clone(),
+                sink.inner.hold_errored_in_disk_buffer(),
+            )
+        })
+        .or_else(|| {
+            enrichment_table_sinks(&config.enrichment_tables)
+                .find(|(key, _)| key == sink_key)
+                .map(|(_, sink)| (sink.buffer, sink.inner.hold_errored_in_disk_buffer()))
+        })
+}
+
 fn enrichment_table_sink_buffer(
     config: &Config,
     sink_key: &ComponentKey,
@@ -1660,5 +1775,47 @@ mod tests {
         );
 
         topology.stop().await;
+    }
+
+    /// nano (NAN-5567, NAN-5808), review round 3 P2-2: a buffer is not reused across a reload that
+    /// changes whether the sink holds `Errored` records, even with an identical buffer config.
+    #[cfg(feature = "sinks-clickhouse")]
+    #[test]
+    fn buffer_reuse_requires_the_same_errored_hold() {
+        use crate::sinks::clickhouse::config::ClickhouseConfig;
+
+        let with_sink = |clickhouse: bool| {
+            let mut config = Config::builder();
+            config.add_source("in", basic_source().1);
+            if clickhouse {
+                config.add_sink(
+                    "output",
+                    &["in"],
+                    ClickhouseConfig {
+                        endpoint: "http://localhost:8123"
+                            .parse::<http::Uri>()
+                            .unwrap()
+                            .try_into()
+                            .unwrap(),
+                        table: "logs".try_into().unwrap(),
+                        ..Default::default()
+                    },
+                );
+            } else {
+                config.add_sink("output", &["in"], basic_sink(1).1);
+            }
+            config.build().unwrap()
+        };
+        let key = ComponentKey::from("output");
+        let mock = super::sink_buffer_and_hold(&with_sink(false), &key).unwrap();
+        let clickhouse = super::sink_buffer_and_hold(&with_sink(true), &key).unwrap();
+        assert_eq!(mock.0, clickhouse.0, "same buffer config");
+        assert!(!mock.1 && clickhouse.1);
+        assert_ne!(mock, clickhouse, "the buffer is not reused");
+        assert_eq!(
+            super::sink_buffer_and_hold(&with_sink(true), &key),
+            Some(clickhouse),
+            "an unchanged clickhouse sink still reuses its buffer"
+        );
     }
 }

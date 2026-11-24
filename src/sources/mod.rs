@@ -15,6 +15,8 @@ pub mod aws_s3;
 pub mod aws_sqs;
 #[cfg(feature = "sources-azure_event_hubs")]
 pub mod azure_event_hubs;
+#[cfg(feature = "sources-crowdstrike_fdr")]
+pub mod crowdstrike_fdr;
 #[cfg(feature = "sources-datadog_agent")]
 pub mod datadog_agent;
 #[cfg(feature = "sources-demo_logs")]

@@ -1,0 +1,43 @@
+# Parity config: enrichment tables built into the image for self-hosted geo/ASN/IOC
+# enrichment in VRL. A CSV `file` table, an `mmdb` table and a `geoip` (ASN) table, each read
+# from remap with get_enrichment_table_record. (nano/v0.61 no longer builds the `memory` table.)
+# Fixture data is in data/ (not a config: the workflow loads only this dir's *.toml); the
+# workflow mounts parity/ at /parity and also runs a full `vector validate` on this unit, so the
+# tables are actually loaded (--no-environment only checks names and VRL types).
+
+[enrichment_tables.ioc_csv]
+type = "file"
+file.path = "/parity/enrichment/data/ioc.csv"
+file.encoding.type = "csv"
+schema.indicator = "string"
+schema.verdict = "string"
+
+[enrichment_tables.ip_mmdb]
+type = "mmdb"
+path = "/parity/enrichment/data/custom-type.mmdb"
+
+[enrichment_tables.ip_asn]
+type = "geoip"
+path = "/parity/enrichment/data/GeoLite2-ASN-Test.mmdb"
+
+[sources.parity_in]
+type = "demo_logs"
+format = "json"
+count = 1
+
+[transforms.parity_enrich]
+type = "remap"
+inputs = ["parity_in"]
+source = '''
+.src_ip = "198.51.100.7"
+ioc, err = get_enrichment_table_record("ioc_csv", {"indicator": .src_ip})
+if err == null { .ioc_verdict = ioc.verdict }
+geo, err = get_enrichment_table_record("ip_mmdb", {"ip": .src_ip})
+if err == null { .enriched_src = geo }
+asn, err = get_enrichment_table_record("ip_asn", {"ip": .src_ip})
+if err == null { .enriched_src_asn = asn.autonomous_system_number }
+'''
+
+[sinks.parity_out]
+type = "blackhole"
+inputs = ["parity_enrich"]

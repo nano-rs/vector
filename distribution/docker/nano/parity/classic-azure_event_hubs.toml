@@ -1,0 +1,33 @@
+# Parity config: an Azure Event Hubs source (fork-only component, NAN-3599) as a single-tenant
+# deployment configures it: managed-identity auth plus a blob checkpoint store. Synthetic
+# placeholders only: .invalid hosts, inert credentials. Upstream Vector rejects this file
+# (unknown source type).
+
+[sources.parity_eventhubs_source]
+type = "azure_event_hubs"
+namespace = "parity-ns.servicebus.invalid"
+event_hub_name = "parity-hub"
+consumer_group = "$Default"
+acknowledgements.enabled = true
+
+[sources.parity_eventhubs_source.auth]
+azure_credential_kind = "managed_identity"
+
+[sources.parity_eventhubs_source.checkpoint_store]
+type = "azure_blob"
+account_name = "paritycheckpoints"
+container_name = "nano-checkpoints"
+
+[sources.parity_eventhubs_source.checkpoint_store.auth]
+azure_credential_kind = "managed_identity"
+
+[transforms.parity_eventhubs_route]
+type = "remap"
+inputs = ["parity_eventhubs_source"]
+source = '''
+.source_type = "azure_activity"
+'''
+
+[sinks.parity_out]
+type = "blackhole"
+inputs = ["parity_eventhubs_route"]
