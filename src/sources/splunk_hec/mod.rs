@@ -1299,6 +1299,12 @@ impl<'de, R: JsonRead<'de>> EventIterator<'de, R> {
     ) -> Result<(Vec<Event>, bool), Rejection> {
         self.envelopes_processed += 1;
         let event = self.validate_event_field(&json)?;
+        let event_kind: &'static str = match event {
+            JsonValue::Object(_) => "object",
+            JsonValue::String(_) => "string",
+            JsonValue::Array(_) => "array",
+            _ => "scalar",
+        };
         // Strings are passed as raw bytes so decoders see the bare content
         // (e.g. a JSON string event containing `{"foo":"bar"}` arrives at the
         // decoder as `{"foo":"bar"}`, not `"{\"foo\":\"bar\"}"` ). All other
@@ -1367,6 +1373,15 @@ impl<'de, R: JsonRead<'de>> EventIterator<'de, R> {
         let mut out = Vec::with_capacity(decoded_events.len());
         for mut event in decoded_events {
             if let Event::Log(log) = &mut event {
+                // nano (NAN-5891): mark what the envelope's `event` was, so a
+                // transform can tell an object event (decoded here to its
+                // JSON text) from a string event whose text is JSON. Event
+                // metadata only: the event itself is unchanged.
+                log.metadata_mut().value_mut().insert(
+                    &vrl::path::parse_value_path("splunk_hec.event_kind")
+                        .expect("splunk_hec.event_kind is a valid VRL path"),
+                    Value::from(event_kind),
+                );
                 // channel: envelope value beats header default. Use `InsertIfEmpty`
                 // for legacy event fields, and `try_insert` for the Vector metadata
                 // path so a decoder-produced `%splunk_hec.channel` survives.
@@ -3817,6 +3832,42 @@ mod tests {
             assert_eq!(log[&super::SOURCETYPE], "my-app".into());
         })
         .await;
+    }
+
+    /// nano (NAN-5891): every decoded `/event` event carries
+    /// `%splunk_hec.event_kind`, so a JSON string event and an object event
+    /// (both `bytes`-decoded to JSON text) stay distinguishable.
+    #[tokio::test]
+    async fn decoder_event_endpoint_marks_the_event_kind() {
+        let (source, address, _guard) = source_with_codec(
+            codec_decoding(vector_lib::codecs::BytesDeserializerConfig::new().into()),
+            CodecConfig::default(),
+        )
+        .await;
+        let body = r#"{"event":{"message":"m","k":1}}{"event":"{\"message\":\"m\",\"k\":1}"}{"event":7}"#;
+        assert_eq!(200, post(address, "services/collector/event", body).await);
+        let events = collect_n(source, 3).await;
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|e| {
+                let log = e.as_log();
+                (
+                    log[log_schema().message_key().unwrap().to_string().as_str()].clone(),
+                    log.metadata()
+                        .value()
+                        .get(&vrl::path::parse_value_path("splunk_hec.event_kind").unwrap())
+                        .cloned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (r#"{"message":"m","k":1}"#.into(), Some("object".into())),
+                (r#"{"message":"m","k":1}"#.into(), Some("string".into())),
+                ("7".into(), Some("scalar".into())),
+            ]
+        );
     }
 
     #[tokio::test]
