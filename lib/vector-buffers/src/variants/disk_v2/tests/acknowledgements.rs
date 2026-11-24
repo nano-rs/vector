@@ -324,3 +324,159 @@ async fn errored_record_is_acknowledged_without_opt_in() {
     })
     .await;
 }
+
+/// Copies a buffer's data directory as it is on disk right now: what a restarted process finds
+/// after the old one was killed (`SIGKILL`) without finalizing anything.
+fn snapshot_data_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("snapshot dir");
+    for entry in std::fs::read_dir(from).expect("read buffer dir") {
+        let entry = entry.expect("dir entry");
+        if entry.file_type().expect("file type").is_file() {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).expect("copy buffer file");
+        }
+    }
+}
+
+/// Drives the reader (every record is already read, so `next` only applies pending
+/// acknowledgements and then waits for the writer) until the durable read position reaches
+/// `expected`, then a few more rounds so a position that would overshoot it gets the chance to.
+async fn settle_acknowledgements(
+    reader: &mut crate::variants::disk_v2::BufferReader<SizedRecord, FilesystemUnderTest>,
+    ledger: &Ledger<FilesystemUnderTest>,
+    expected: u64,
+) -> u64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while ledger.state().get_last_reader_record_id() < expected {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "acknowledgements did not reach record {expected} (at {})",
+            ledger.state().get_last_reader_record_id()
+        );
+        let next = tokio::time::timeout(Duration::from_millis(20), reader.next()).await;
+        assert!(next.is_err(), "every record was already read; next must only wait");
+    }
+    for _ in 0..5 {
+        let next = tokio::time::timeout(Duration::from_millis(20), reader.next()).await;
+        assert!(next.is_err(), "every record was already read; next must only wait");
+    }
+    ledger.state().get_last_reader_record_id()
+}
+
+/// NAN-5885: records the sink has read but not finalized (a batch in flight, retrying against a
+/// ClickHouse that is down) when Vector is killed must be the first records read after restart.
+#[tokio::test]
+async fn in_flight_records_are_replayed_after_a_kill() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.join("live");
+        let snapshot_dir = dir.join("after-kill");
+
+        async move {
+            let (mut writer, mut reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(&data_dir).await;
+            for size in [64, 65, 66, 67] {
+                writer
+                    .write_record(SizedRecord::new(size))
+                    .await
+                    .expect("write should not fail");
+            }
+            writer.flush().await.expect("flush should not fail");
+
+            let mut read = Vec::new();
+            for _ in 0..4 {
+                read.push(
+                    reader
+                        .next()
+                        .await
+                        .expect("read should not fail")
+                        .expect("record should be present"),
+                );
+            }
+            let in_flight = read.split_off(1);
+            // The first record was delivered; the rest are in flight.
+            finalize(read.pop().unwrap(), EventStatus::Delivered).await;
+            assert_eq!(settle_acknowledgements(&mut reader, &ledger, 1).await, 1);
+            ledger.flush().expect("ledger flush should not fail");
+
+            // SIGKILL: nothing in flight is ever finalized.
+            snapshot_data_dir(&data_dir, &snapshot_dir);
+            std::mem::forget(in_flight);
+
+            let (_writer, mut reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(&snapshot_dir).await;
+            assert_eq!(ledger.state().get_last_reader_record_id(), 1);
+            for size in [65, 66, 67] {
+                let next = tokio::time::timeout(Duration::from_secs(5), reader.next())
+                    .await
+                    .expect("read should not hang")
+                    .expect("read should not fail")
+                    .expect("an in-flight record must be replayed");
+                assert_eq!(next, SizedRecord::new(size));
+            }
+        }
+    })
+    .await;
+}
+
+/// NAN-5885: after a restart that replays in-flight records, acknowledging some of the replayed
+/// records must advance the durable read position exactly to the last acknowledged record, never
+/// past records that are still in flight. Before the fix, every record the startup seek re-read
+/// left a spare acknowledgement behind (here 5), which acknowledged in-flight records.
+#[tokio::test]
+async fn acknowledgements_after_a_replay_never_pass_in_flight_records() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.join("live");
+        let snapshot_dir = dir.join("after-kill");
+
+        async move {
+            let (mut writer, mut reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(&data_dir).await;
+            for size in 64..74 {
+                writer.write_record(SizedRecord::new(size)).await.expect("write");
+            }
+            writer.flush().await.expect("flush");
+            let mut read = Vec::new();
+            for _ in 0..10 {
+                read.push(reader.next().await.expect("read").expect("record"));
+            }
+            // Records 1..=5 delivered, 6..=10 in flight.
+            let in_flight = read.split_off(5);
+            for record in read {
+                finalize(record, EventStatus::Delivered).await;
+            }
+            assert_eq!(settle_acknowledgements(&mut reader, &ledger, 5).await, 5);
+            ledger.flush().expect("ledger flush");
+            snapshot_data_dir(&data_dir, &snapshot_dir);
+            std::mem::forget(in_flight);
+
+            // Restart: records 6..=10 (sizes 69..=73) are replayed, then four new ones.
+            let (mut writer, mut reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(&snapshot_dir).await;
+            let before = ledger.state().get_last_reader_record_id();
+            assert_eq!(before, 5);
+            for size in 74..78 {
+                writer.write_record(SizedRecord::new(size)).await.expect("write");
+            }
+            writer.flush().await.expect("flush");
+            let mut replayed = Vec::new();
+            for _ in 0..9 {
+                replayed.push(
+                    tokio::time::timeout(Duration::from_secs(5), reader.next())
+                        .await
+                        .expect("read should not hang")
+                        .expect("read")
+                        .expect("record"),
+                );
+            }
+            assert_eq!(replayed[0], SizedRecord::new(69));
+            // Deliver the first two replayed records only; the rest stay in flight.
+            let rest = replayed.split_off(2);
+            for record in replayed {
+                finalize(record, EventStatus::Delivered).await;
+            }
+            let after = settle_acknowledgements(&mut reader, &ledger, before + 2).await;
+            assert_eq!(after, before + 2, "only the two delivered records may be acknowledged");
+            std::mem::forget(rest);
+        }
+    })
+    .await;
+}
