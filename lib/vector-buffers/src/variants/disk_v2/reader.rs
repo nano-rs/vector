@@ -1294,9 +1294,18 @@ where
         };
         self.track_read(record_id, record_bytes, record_events);
 
-        let (batch, receiver) = BatchNotifier::new_with_receiver();
-        record.add_batch_notifier(batch);
-        self.finalizer.add(record_events.get(), receiver);
+        // nano (NAN-5885): during initialization `seek_to_next_record` re-reads records that are
+        // already acknowledged, only to reposition the reader, and drops them. `track_read` adds
+        // no acknowledgement marker for them, so they must get no finalizer either: a dropped
+        // finalizer reports `Delivered`, and each one became an acknowledgement with no marker
+        // behind it. The reader then applied those to the first records it handed to the sink
+        // after the restart, acknowledging them before they were delivered, and a crash while
+        // they were in flight lost them although their senders had been acknowledged.
+        if self.ready_to_read {
+            let (batch, receiver) = BatchNotifier::new_with_receiver();
+            record.add_batch_notifier(batch);
+            self.finalizer.add(record_events.get(), receiver);
+        }
 
         if self.ready_to_read {
             trace!(
