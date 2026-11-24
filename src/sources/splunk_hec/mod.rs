@@ -1298,6 +1298,12 @@ impl<'de, R: JsonRead<'de>> EventIterator<'de, R> {
     ) -> Result<(Vec<Event>, bool), Rejection> {
         self.envelopes_processed += 1;
         let event = self.validate_event_field(&json)?;
+        let event_kind: &'static str = match event {
+            JsonValue::Object(_) => "object",
+            JsonValue::String(_) => "string",
+            JsonValue::Array(_) => "array",
+            _ => "scalar",
+        };
         // Strings are passed as raw bytes so decoders see the bare content
         // (e.g. a JSON string event containing `{"foo":"bar"}` arrives at the
         // decoder as `{"foo":"bar"}`, not `"{\"foo\":\"bar\"}"` ). All other
@@ -1366,6 +1372,16 @@ impl<'de, R: JsonRead<'de>> EventIterator<'de, R> {
         let mut out = Vec::with_capacity(decoded_events.len());
         for mut event in decoded_events {
             if let Event::Log(log) = &mut event {
+                // nano (NAN-5891): mark what the envelope's `event` was, so a
+                // transform can tell an object event (decoded here to its
+                // JSON text) from a string event whose text is JSON. Event
+                // metadata only: the event itself is unchanged.
+                // Written first, before any envelope `fields` key, so a
+                // sender's indexed field cannot set or replace it.
+                log.insert(
+                    metadata_path!(SplunkConfig::NAME, "event_kind"),
+                    Value::from_static_str(event_kind),
+                );
                 // channel: envelope value beats header default. Use `InsertIfEmpty`
                 // for legacy event fields, and `try_insert` for the Vector metadata
                 // path so a decoder-produced `%splunk_hec.channel` survives.
@@ -1922,6 +1938,13 @@ fn raw_event(
     let channel_path = owned_value_path!(CHANNEL);
     for event in &mut events {
         if let Event::Log(log) = event {
+            // nano (NAN-5891): mark a `/raw` body as such, so a transform can
+            // tell it from an `/event` object event (and an image that marks
+            // nothing from one that marks every HEC event).
+            log.insert(
+                metadata_path!(SplunkConfig::NAME, "event_kind"),
+                Value::from_static_str("raw"),
+            );
             // With a decoder configured, defer to anything it produced at the legacy
             // When a decoder is in use, preserve decoder-wins semantics for Vector ns
             // by using `try_insert` on the metadata path (insert_source_metadata for
@@ -3749,6 +3772,19 @@ mod tests {
         SocketAddr,
         PortGuard,
     ) {
+        source_with_codec_ns(event, raw, None).await
+    }
+
+    /// [`source_with_codec`] with an explicit `log_namespace`.
+    async fn source_with_codec_ns(
+        event: CodecConfig,
+        raw: CodecConfig,
+        log_namespace: Option<bool>,
+    ) -> (
+        impl Stream<Item = Event> + Unpin + use<>,
+        SocketAddr,
+        PortGuard,
+    ) {
         let (sender, recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
         let (port_guard, address) = next_addr();
         let cx = SourceContext::new_test(sender, None);
@@ -3761,7 +3797,7 @@ mod tests {
                 tls: None,
                 acknowledgements: HecAcknowledgementsConfig::default(),
                 store_hec_token: false,
-                log_namespace: None,
+                log_namespace,
                 keepalive: KeepaliveConfig::default(),
                 event,
                 raw,
@@ -3818,6 +3854,95 @@ mod tests {
             assert_eq!(log[&super::SOURCETYPE], "my-app".into());
         })
         .await;
+    }
+
+    /// The `%splunk_hec.event_kind` marker of an event, if any.
+    fn event_kind_of(event: &Event) -> Option<Value> {
+        event
+            .as_log()
+            .metadata()
+            .value()
+            .get(&vrl::path::parse_value_path("splunk_hec.event_kind").unwrap())
+            .cloned()
+    }
+
+    /// nano (NAN-5891): every decoded `/event` event carries
+    /// `%splunk_hec.event_kind`, so a JSON string event and an object event
+    /// (both `bytes`-decoded to JSON text) stay distinguishable.
+    #[tokio::test]
+    async fn decoder_event_endpoint_marks_the_event_kind() {
+        let (source, address, _guard) = source_with_codec(
+            codec_decoding(vector_lib::codecs::BytesDeserializerConfig::new().into()),
+            CodecConfig::default(),
+        )
+        .await;
+        let body = r#"{"event":{"message":"m","k":1}}{"event":"{\"message\":\"m\",\"k\":1}"}{"event":7}{"event":[1,2]}"#;
+        assert_eq!(200, post(address, "services/collector/event", body).await);
+        let events = collect_n(source, 4).await;
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|e| {
+                let log = e.as_log();
+                (
+                    log[log_schema().message_key().unwrap().to_string().as_str()].clone(),
+                    event_kind_of(e),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (r#"{"message":"m","k":1}"#.into(), Some("object".into())),
+                (r#"{"message":"m","k":1}"#.into(), Some("string".into())),
+                ("7".into(), Some("scalar".into())),
+                ("[1,2]".into(), Some("array".into())),
+            ]
+        );
+    }
+
+    /// nano (NAN-5891): a `/services/collector/raw` body is marked `raw`, never
+    /// `object`, even with a JSON-object body and with a decoder configured on
+    /// both endpoints.
+    #[tokio::test]
+    async fn raw_endpoint_is_marked_raw() {
+        for raw in [
+            CodecConfig::default(),
+            codec_decoding(vector_lib::codecs::BytesDeserializerConfig::new().into()),
+        ] {
+            let (source, address, _guard) = source_with_codec(
+                codec_decoding(vector_lib::codecs::BytesDeserializerConfig::new().into()),
+                raw,
+            )
+            .await;
+            assert_eq!(
+                200,
+                post(address, "services/collector/raw", r#"{"message":"m"}"#).await
+            );
+            let event = collect_n(source, 1).await.remove(0);
+            assert_eq!(event_kind_of(&event), Some("raw".into()), "{event:?}");
+        }
+    }
+
+    /// nano (NAN-5891): in both log namespaces a sender's indexed field named
+    /// `event_kind` cannot set or replace the marker.
+    #[tokio::test]
+    async fn an_indexed_field_cannot_spoof_the_event_kind() {
+        for log_namespace in [None, Some(true)] {
+            let (source, address, _guard) = source_with_codec_ns(
+                codec_decoding(vector_lib::codecs::BytesDeserializerConfig::new().into()),
+                CodecConfig::default(),
+                log_namespace,
+            )
+            .await;
+            let body = r#"{"event":"{\"message\":\"m\"}","fields":{"event_kind":"object"}}"#;
+            assert_eq!(200, post(address, "services/collector/event", body).await);
+            let event = collect_n(source, 1).await.remove(0);
+            assert_eq!(
+                event_kind_of(&event),
+                Some("string".into()),
+                "{log_namespace:?}: {event:?}"
+            );
+        }
     }
 
     #[tokio::test]
