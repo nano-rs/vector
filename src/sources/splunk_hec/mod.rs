@@ -1938,6 +1938,13 @@ fn raw_event(
     let channel_path = owned_value_path!(CHANNEL);
     for event in &mut events {
         if let Event::Log(log) = event {
+            // nano (NAN-5891): mark a `/raw` body as such, so a transform can
+            // tell it from an `/event` object event (and an image that marks
+            // nothing from one that marks every HEC event).
+            log.insert(
+                metadata_path!(SplunkConfig::NAME, "event_kind"),
+                Value::from_static_str("raw"),
+            );
             // With a decoder configured, defer to anything it produced at the legacy
             // When a decoder is in use, preserve decoder-wins semantics for Vector ns
             // by using `try_insert` on the metadata path (insert_source_metadata for
@@ -3893,10 +3900,11 @@ mod tests {
         );
     }
 
-    /// nano (NAN-5891): `/services/collector/raw` is never marked, even with a
-    /// JSON-object body and with a decoder configured on both endpoints.
+    /// nano (NAN-5891): a `/services/collector/raw` body is marked `raw`, never
+    /// `object`, even with a JSON-object body and with a decoder configured on
+    /// both endpoints.
     #[tokio::test]
-    async fn raw_endpoint_is_never_marked_with_an_event_kind() {
+    async fn raw_endpoint_is_marked_raw() {
         for raw in [
             CodecConfig::default(),
             codec_decoding(vector_lib::codecs::BytesDeserializerConfig::new().into()),
@@ -3911,7 +3919,7 @@ mod tests {
                 post(address, "services/collector/raw", r#"{"message":"m"}"#).await
             );
             let event = collect_n(source, 1).await.remove(0);
-            assert_eq!(event_kind_of(&event), None, "{event:?}");
+            assert_eq!(event_kind_of(&event), Some("raw".into()), "{event:?}");
         }
     }
 
